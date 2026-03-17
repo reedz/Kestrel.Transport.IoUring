@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/AspNetCoreUring.Benchmarks/AspNetCoreUring.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/SampleApp/SampleApp.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/AspNetCoreUring/AspNetCoreUring.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,12 @@
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/obj/Debug/net8.0/AspNetCoreUring.GeneratedMSBuildEditorConfig.editorconfig
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/obj/Debug/net8.0/AspNetCoreUring.AssemblyInfoInputs.cache
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/obj/Debug/net8.0/AspNetCoreUring.AssemblyInfo.cs
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/obj/Debug/net8.0/AspNetCoreUring.csproj.CoreCompileInputs.cache
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/obj/Debug/net8.0/AspNetCoreUring.sourcelink.json
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/bin/Debug/net8.0/AspNetCoreUring.deps.json
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/bin/Debug/net8.0/AspNetCoreUring.dll
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/bin/Debug/net8.0/AspNetCoreUring.pdb
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/obj/Debug/net8.0/AspNetCoreUring.dll
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/obj/Debug/net8.0/refint/AspNetCoreUring.dll
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/obj/Debug/net8.0/AspNetCoreUring.pdb
+/home/runner/work/AspNetCoreUring/AspNetCoreUring/src/AspNetCoreUring/obj/Debug/net8.0/ref/AspNetCoreUring.dll
