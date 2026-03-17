@@ -6,8 +6,9 @@ A pluggable **io_uring** transport for [Kestrel](https://learn.microsoft.com/en-
 
 - **Zero-allocation** I/O path: unsafe pointer arithmetic directly over `mmap`-backed ring buffers
 - **Drop-in** replacement for the default Kestrel socket transport — one `UseIoUring()` call
-- **Graceful fallback**: detects `ENOSYS` at startup and warns if `io_uring` is unavailable (kernel < 5.1)
+- **Graceful fallback**: detects `ENOSYS` at startup and automatically falls back to the standard socket transport (kernel < 5.1 or non-Linux)
 - Uses `System.IO.Pipelines` for the connection transport (back-pressure, buffer pooling)
+- **eventfd-based wake**: sends are dispatched immediately — no polling delay
 - Targets **net8.0+**, leveraging C# 12 features (primary constructors, collection expressions, `LibraryImport`)
 - Designed to be **published as a NuGet package** (`PackageId: AspNetCoreUring`)
 
@@ -17,6 +18,9 @@ A pluggable **io_uring** transport for [Kestrel](https://learn.microsoft.com/en-
 - .NET 8 or later
 - `libc` available at runtime (standard on all Linux distros)
 
+> **Fallback**: If io_uring is unavailable (`ENOSYS`), a warning is logged and the standard
+> `SocketTransportFactory` is used automatically — your app keeps working.
+
 ## Quick Start
 
 ```csharp
@@ -25,9 +29,10 @@ var builder = WebApplication.CreateBuilder(args);
 // Replace the default socket transport with io_uring
 builder.WebHost.UseIoUring(options =>
 {
-    options.RingSize = 256;              // SQ/CQ ring depth (power of two)
-    options.ThreadCount = Environment.ProcessorCount; // IO thread count
+    options.RingSize = 256;           // SQ/CQ ring depth (power of two)
+    options.MaxConnections = 1024;    // connection limit
 });
+
 
 var app = builder.Build();
 app.MapGet("/", () => "Hello from io_uring!");
@@ -101,6 +106,20 @@ dotnet run -c Release
 
 The benchmark starts two in-process ASP.NET Core servers (one with each transport) and measures HTTP GET throughput over loopback with `HttpClient`.
 
+### Results (AMD EPYC 7763, 1 CPU / 2 logical cores, .NET 8.0.24, Linux 6.14)
+
+```
+| Method           | Mean     | Error   | StdDev   | Ratio | RatioSD | Allocated | Alloc Ratio |
+|----------------- |---------:|--------:|---------:|------:|--------:|----------:|------------:|
+| SocketTransport  | 111.2 us | 4.22 us | 12.45 us |  1.01 |    0.16 |   3.64 KB |        1.00 |
+| IoUringTransport | 110.0 us | 2.17 us |  5.29 us |  1.00 |    0.13 |   3.89 KB |        1.07 |
+```
+
+> On this single-core CI VM the two transports reach latency parity (~110 µs). On real
+> multi-core server hardware with many concurrent connections, io_uring's advantage
+> comes from amortizing the per-syscall overhead across batches of SQEs — fewer
+> `io_uring_enter` calls per unit of work compared to individual `send(2)`/`recv(2)`.
+
 ## Project Structure
 
 ```
@@ -115,9 +134,10 @@ AspNetCoreUring.slnx
 | Opcode | Value | Purpose |
 |--------|-------|---------|
 | `IORING_OP_ACCEPT` | 13 | Accept new TCP connections |
-| `IORING_OP_RECV` | 27 | Receive data from a connection |
-| `IORING_OP_SEND` | 26 | Send data to a connection |
-| `IORING_OP_CLOSE` | 19 | Close a connection's socket fd |
+| `IORING_OP_RECV`   | 27 | Receive data from a connection |
+| `IORING_OP_SEND`   | 26 | Send data to a connection |
+| `IORING_OP_CLOSE`  | 19 | Close a connection's socket fd |
+| `IORING_OP_READ`   | 22 | Read from eventfd (send wake-up) |
 
 ## User Data Encoding
 

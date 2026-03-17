@@ -22,6 +22,8 @@ internal static class IoUringConstants
     public const byte IORING_OP_FALLOCATE = 17;
     public const byte IORING_OP_OPENAT = 18;
     public const byte IORING_OP_CLOSE = 19;
+    public const byte IORING_OP_READ = 22;
+    public const byte IORING_OP_WRITE = 23;
     public const byte IORING_OP_SEND = 26;
     public const byte IORING_OP_RECV = 27;
 
@@ -45,4 +47,9 @@ internal static class IoUringConstants
     public const uint IORING_SQ_NEED_WAKEUP = 1u;
 
     public const uint IORING_FEAT_SINGLE_MMAP = 1u;
+
+    public const ulong TIMEOUT_USER_DATA = ulong.MaxValue;
+
+    /// <summary>User-data sentinel for the persistent eventfd READ SQE used to wake the IO loop on sends.</summary>
+    public const ulong EVENTFD_USER_DATA = ulong.MaxValue - 1;
 }
