@@ -19,3 +19,6 @@ nuget.config
 
 ## macOS
 .DS_Store
+
+## BenchmarkDotNet artifacts
+BenchmarkDotNet.Artifacts/
