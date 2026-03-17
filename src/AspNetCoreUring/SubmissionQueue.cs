@@ -86,6 +86,7 @@ internal sealed unsafe class SubmissionQueue : IDisposable
         }
         uint index = _sqeTail & mask;
         sqe = _sqes + index;
+        // io_uring requires unused SQE fields to be zero; zeroing the full struct is the safest approach.
         *sqe = default;
         _sqeTail++;
         return true;

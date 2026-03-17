@@ -64,6 +64,8 @@ internal sealed class IoUringConnection : ConnectionContext
 
     public override CancellationToken ConnectionClosed => _connectionCts.Token;
 
+    // _recvHandle and _sendHandle are only accessed from the single IO loop thread in
+    // IoUringConnectionListener, so no synchronization is required.
     private MemoryHandle _recvHandle;
 
     public unsafe void SubmitRecv()
@@ -78,6 +80,12 @@ internal sealed class IoUringConnection : ConnectionContext
             sqe->AddrOrSpliceOffIn = (ulong)_recvHandle.Pointer;
             sqe->Len = (uint)buffer.Length;
             sqe->UserData = EncodeUserData(_connectionId, OpType.Recv);
+        }
+        else
+        {
+            // No SQE slot available; dispose the handle and skip.
+            _recvHandle.Dispose();
+            _recvHandle = default;
         }
     }
 
@@ -95,11 +103,17 @@ internal sealed class IoUringConnection : ConnectionContext
             sqe->Len = (uint)data.Length;
             sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
         }
+        else
+        {
+            _sendHandle.Dispose();
+            _sendHandle = default;
+        }
     }
 
     public void OnRecvComplete(int bytesRead)
     {
         _recvHandle.Dispose();
+        _recvHandle = default;
 
         if (bytesRead <= 0)
         {
@@ -108,13 +122,22 @@ internal sealed class IoUringConnection : ConnectionContext
         }
 
         _inputPipe.Writer.Advance(bytesRead);
-        // Fire-and-forget flush; backpressure is handled by the pipe's pause/resume mechanism.
-        _ = _inputPipe.Writer.FlushAsync();
+        var flushResult = _inputPipe.Writer.FlushAsync();
+        if (!flushResult.IsCompleted)
+        {
+            // Synchronously wait; we're on the IO loop thread already.
+            flushResult.AsTask().GetAwaiter().GetResult();
+        }
+        else if (flushResult.Result.IsCompleted || flushResult.Result.IsCanceled)
+        {
+            _inputPipe.Writer.Complete();
+        }
     }
 
     public void OnSendComplete(int bytesSent)
     {
         _sendHandle.Dispose();
+        _sendHandle = default;
 
         if (bytesSent < 0)
         {
