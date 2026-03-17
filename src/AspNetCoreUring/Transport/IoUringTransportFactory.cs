@@ -32,8 +32,8 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
 
         var ring = new Ring((uint)_options.RingSize);
         var logger = _loggerFactory.CreateLogger<IoUringConnectionListener>();
-        var listener = new IoUringConnectionListener(endpoint, ring, logger);
-        listener.Bind();
+        var listener = new IoUringConnectionListener(endpoint, ring, _options, logger);
+        listener.Bind(_options.ListenBacklog);
 
         return ValueTask.FromResult<IConnectionListener>(listener);
     }

@@ -28,10 +28,11 @@ internal sealed class IoUringConnection : ConnectionContext
     private readonly int _socketFd;
     private readonly Ring _ring;
     private readonly ILogger _logger;
+    private readonly int _receiveBufferSize;
     private readonly CancellationTokenSource _connectionCts = new();
     private readonly Pipe _inputPipe;
     private readonly Pipe _outputPipe;
-    private bool _disposed;
+    private int _disposed;
 
     public override string ConnectionId { get; set; }
     public override IFeatureCollection Features { get; } = new FeatureCollection();
@@ -41,12 +42,13 @@ internal sealed class IoUringConnection : ConnectionContext
     public int SocketFd => _socketFd;
     public int NumericConnectionId => _connectionId;
 
-    public IoUringConnection(int connectionId, int socketFd, Ring ring, EndPoint? remoteEndPoint, EndPoint? localEndPoint, ILogger logger)
+    public IoUringConnection(int connectionId, int socketFd, Ring ring, EndPoint? remoteEndPoint, EndPoint? localEndPoint, int receiveBufferSize, ILogger logger)
     {
         _connectionId = connectionId;
         _socketFd = socketFd;
         _ring = ring;
         _logger = logger;
+        _receiveBufferSize = receiveBufferSize;
         ConnectionId = $"iouring:{connectionId}";
         RemoteEndPoint = remoteEndPoint;
         LocalEndPoint = localEndPoint;
@@ -70,7 +72,7 @@ internal sealed class IoUringConnection : ConnectionContext
 
     public unsafe void SubmitRecv()
     {
-        Memory<byte> buffer = _inputPipe.Writer.GetMemory(4096);
+        Memory<byte> buffer = _inputPipe.Writer.GetMemory(_receiveBufferSize);
         _recvHandle = buffer.Pin();
 
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
@@ -147,8 +149,9 @@ internal sealed class IoUringConnection : ConnectionContext
 
     public override async ValueTask DisposeAsync()
     {
-        if (_disposed) return;
-        _disposed = true;
+        // Atomically check-and-set to prevent double-dispose from concurrent callers.
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
+            return;
 
         _connectionCts.Cancel();
         _inputPipe.Reader.Complete();

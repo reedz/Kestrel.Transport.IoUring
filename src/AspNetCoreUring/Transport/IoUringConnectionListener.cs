@@ -19,19 +19,23 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private readonly Channel<ConnectionContext> _acceptChannel;
     private readonly ConcurrentDictionary<int, IoUringConnection> _connections = new();
     private readonly CancellationTokenSource _cts = new();
+    private readonly int _maxConnections;
+    private readonly int _receiveBufferSize;
     private int _nextConnectionId;
     private Task? _ioLoopTask;
     private int _listenSocketFd;
 
     public EndPoint EndPoint { get; }
 
-    public IoUringConnectionListener(EndPoint endPoint, Ring ring, ILogger logger)
+    public IoUringConnectionListener(EndPoint endPoint, Ring ring, IoUringTransportOptions options, ILogger logger)
     {
         EndPoint = endPoint;
         _ring = ring;
         _logger = logger;
+        _maxConnections = options.MaxConnections;
+        _receiveBufferSize = options.ReceiveBufferSize;
         _listenSocket = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-        _acceptChannel = Channel.CreateBounded<ConnectionContext>(new BoundedChannelOptions(128)
+        _acceptChannel = Channel.CreateBounded<ConnectionContext>(new BoundedChannelOptions(options.AcceptQueueCapacity)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
@@ -39,11 +43,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         });
     }
 
-    public void Bind()
+    public void Bind(int listenBacklog)
     {
         _listenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _listenSocket.Bind(EndPoint);
-        _listenSocket.Listen(512);
+        _listenSocket.Listen(listenBacklog);
 
         _listenSocketFd = GetSocketFd(_listenSocket);
         SubmitAccept();
@@ -116,7 +120,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         }
     }
 
-    private void HandleAccept(int result)
+    private unsafe void HandleAccept(int result)
     {
         if (result < 0)
         {
@@ -126,18 +130,29 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         else
         {
             int socketFd = result;
-            int connId = Interlocked.Increment(ref _nextConnectionId);
-            var conn = new IoUringConnection(
-                connId,
-                socketFd,
-                _ring,
-                remoteEndPoint: null,
-                localEndPoint: EndPoint,
-                _logger);
 
-            _connections[connId] = conn;
-            conn.SubmitRecv();
-            _acceptChannel.Writer.TryWrite(conn);
+            if (_connections.Count >= _maxConnections)
+            {
+                // Over limit — close the accepted socket and re-arm ACCEPT.
+                _logger.LogWarning("Connection limit ({Limit}) reached; rejecting new connection.", _maxConnections);
+                Libc.close(socketFd);
+            }
+            else
+            {
+                int connId = Interlocked.Increment(ref _nextConnectionId);
+                var conn = new IoUringConnection(
+                    connId,
+                    socketFd,
+                    _ring,
+                    remoteEndPoint: null,
+                    localEndPoint: EndPoint,
+                    _receiveBufferSize,
+                    _logger);
+
+                _connections[connId] = conn;
+                conn.SubmitRecv();
+                _acceptChannel.Writer.TryWrite(conn);
+            }
         }
 
         if (!_cts.IsCancellationRequested)

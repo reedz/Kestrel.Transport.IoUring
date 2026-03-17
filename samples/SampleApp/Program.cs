@@ -4,7 +4,6 @@ var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseIoUring(options =>
 {
     options.RingSize = 256;
-    options.ThreadCount = Environment.ProcessorCount;
 });
 
 var app = builder.Build();
