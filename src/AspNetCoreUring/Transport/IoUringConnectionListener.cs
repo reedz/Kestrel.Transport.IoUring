@@ -204,7 +204,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             {
                 await _ioLoopTask.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
             }
-            catch (TimeoutException) { }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning("IO loop did not complete gracefully within the timeout period.");
+            }
         }
     }
 

@@ -108,9 +108,8 @@ internal sealed class IoUringConnection : ConnectionContext
         }
 
         _inputPipe.Writer.Advance(bytesRead);
-        var result = _inputPipe.Writer.FlushAsync();
-        if (!result.IsCompleted)
-            result.AsTask().GetAwaiter().GetResult();
+        // Fire-and-forget flush; backpressure is handled by the pipe's pause/resume mechanism.
+        _ = _inputPipe.Writer.FlushAsync();
     }
 
     public void OnSendComplete(int bytesSent)
@@ -133,7 +132,8 @@ internal sealed class IoUringConnection : ConnectionContext
         _inputPipe.Writer.Complete();
         _outputPipe.Reader.Complete();
         _outputPipe.Writer.Complete();
-        Libc.close(_socketFd);
+        if (Libc.close(_socketFd) < 0)
+            _logger.LogWarning("close(fd={Fd}) failed with errno {Errno}", _socketFd, Marshal.GetLastPInvokeError());
         _connectionCts.Dispose();
     }
 
