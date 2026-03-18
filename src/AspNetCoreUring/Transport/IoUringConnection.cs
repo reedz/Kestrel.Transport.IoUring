@@ -56,8 +56,6 @@ internal sealed class IoUringConnection : ConnectionContext
 
     // Callback to request a RECV resubmission from the IO loop after async flush completes.
     private Action<long>? _requestRecvResubmit;
-    // Callback to wake the IO loop so it calls io_uring_enter for drain-task SQEs.
-    private Action? _wakeIoLoop;
 
     public override string ConnectionId { get; set; }
     public override IFeatureCollection Features { get; } = new FeatureCollection();
@@ -273,9 +271,8 @@ internal sealed class IoUringConnection : ConnectionContext
 
         if (submitted)
         {
-            // Wake the IO loop to call io_uring_enter — concurrent Enter from drain tasks
-            // causes EEXIST on this kernel. The IO loop is the sole Enter caller.
-            _wakeIoLoop?.Invoke();
+            // Submit outside lock — io_uring_enter is kernel-safe for concurrent calls.
+            _ring.Submit();
             return completion.AsValueTask();
         }
 
@@ -368,10 +365,9 @@ internal sealed class IoUringConnection : ConnectionContext
     /// Starts the background output-drain loop that reads from the application's output pipe
     /// and submits SEND SQEs directly via the ring (no cross-thread queue).
     /// </summary>
-    public void StartOutputDrain(Action<long> requestRecvResubmit, Action wakeIoLoop)
+    public void StartOutputDrain(Action<long> requestRecvResubmit)
     {
         _requestRecvResubmit = requestRecvResubmit;
-        _wakeIoLoop = wakeIoLoop;
         _ = RunOutputDrainAsync();
     }
 

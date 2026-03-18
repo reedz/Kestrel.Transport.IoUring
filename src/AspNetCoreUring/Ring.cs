@@ -281,7 +281,6 @@ public sealed class Ring : IDisposable
     /// </summary>
     private int Enter(uint toSubmit, uint minComplete, uint flags)
     {
-        int eexistRetries = 0;
         int ret;
         while (true)
         {
@@ -296,12 +295,6 @@ public sealed class Ring : IDisposable
             }
             if (err == IoUringConstants.EAGAIN)
                 return 0;
-            // EEXIST (17): concurrent io_uring_enter collision. Retry up to 3 times.
-            if (err == 17 /* EEXIST */)
-            {
-                if (++eexistRetries < 3) continue;
-                return 0; // Give up — SQEs will be picked up next iteration.
-            }
             throw new InvalidOperationException($"io_uring_enter failed with errno {err}");
         }
         return ret;
