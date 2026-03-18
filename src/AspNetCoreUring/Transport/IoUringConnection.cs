@@ -159,7 +159,7 @@ internal sealed class IoUringConnection : ConnectionContext
     /// The kernel will select buffers from the specified group and generate multiple CQEs.
     /// No per-recv Pin() needed — the buffer ring owns the memory.
     /// </summary>
-    public unsafe bool SubmitMultishotRecv(ushort bufferGroupId)
+    public unsafe void SubmitMultishotRecv(ushort bufferGroupId)
     {
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
@@ -173,9 +173,7 @@ internal sealed class IoUringConnection : ConnectionContext
             sqe->UserData = EncodeUserData(_connectionId, OpType.Recv);
             HasRecvInFlight = true;
             UsingMultishotRecv = true;
-            return true;
         }
-        return false;
     }
 
     /// <summary>Completes the input pipe writer (called by listener on recv close).</summary>

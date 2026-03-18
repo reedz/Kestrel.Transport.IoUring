@@ -407,7 +407,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 long connId = Interlocked.Increment(ref _nextConnectionId);
 
                 // Register the accepted socket fd for IOSQE_FIXED_FILE.
-                int fileIndex = (_bufferRing == null && _ring.HasRegisteredFiles) ? _ring.RegisterFd(socketFd) : -1;
+                int fileIndex = _ring.HasRegisteredFiles ? _ring.RegisterFd(socketFd) : -1;
 
                 var conn = new IoUringConnection(
                     connId,
@@ -473,14 +473,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 if (hasBuffer && _bufferRing != null)
                     _bufferRing.RecycleBuffer(bufferId);
 
-                // Any negative result is transient (ENOBUFS, ECANCELED, etc.) — rearm.
-                if (result < 0)
+                // ENOBUFS: buffer ring empty — transient, rearm later.
+                if (result == -ENOBUFS)
                 {
                     _recvRetrySet.Add(connectionId);
                     return false;
                 }
 
-                // result == 0: genuine EOF (peer closed).
                 _inputPipeComplete(conn);
                 BeginCloseConnection(connectionId, conn);
                 return false;
