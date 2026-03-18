@@ -1,5 +1,8 @@
 using System.Diagnostics;
+using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
+using System.Text;
 using AspNetCoreUring;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -8,115 +11,242 @@ using Microsoft.Extensions.Logging;
 namespace AspNetCoreUring.Benchmarks;
 
 /// <summary>
-/// Quick throughput benchmark for iterating on performance changes.
+/// Stress benchmarks targeting conditions where io_uring should outperform sockets:
+///   - Many concurrent connections (batched syscalls)
+///   - Connection churn (accept throughput)
+///   - Many small I/Os (syscall overhead dominates)
+///
 /// Usage: dotnet run -c Release -- quick
 /// </summary>
 public static class QuickBench
 {
     private const int SocketPort = 16080;
     private const int IoUringPort = 16081;
-    private const int WarmupRequests = 500;
-    private const int MeasuredRequests = 10000;
-    private const int Concurrency = 32;
 
     public static async Task RunAsync()
     {
         Console.WriteLine($"io_uring supported: {Ring.IsSupported}");
-        Console.WriteLine($"Warmup: {WarmupRequests} requests, Measured: {MeasuredRequests} requests, Concurrency: {Concurrency}");
+        Console.WriteLine($"CPUs: {Environment.ProcessorCount}");
         Console.WriteLine();
 
-        // Start servers
-        var socketApp = BuildSocketApp();
-        await socketApp.StartAsync();
-
-        WebApplication? iouringApp = null;
-        if (Ring.IsSupported)
+        if (!Ring.IsSupported)
         {
-            iouringApp = BuildIoUringApp();
-            await iouringApp.StartAsync();
+            Console.WriteLine("io_uring not supported — nothing to benchmark.");
+            return;
         }
 
-        using var socketClient = new HttpClient { BaseAddress = new Uri($"http://localhost:{SocketPort}") };
-        using var iouringClient = new HttpClient { BaseAddress = new Uri($"http://localhost:{IoUringPort}") };
+        var socketApp = BuildSocketApp();
+        await socketApp.StartAsync();
+        var iouringApp = BuildIoUringApp();
+        await iouringApp.StartAsync();
 
         try
         {
-            // Socket transport
-            var socketResult = await BenchmarkTransport("Socket", socketClient, WarmupRequests, MeasuredRequests, Concurrency);
-            PrintResult("Socket    ", socketResult);
-
-            // io_uring transport
-            if (Ring.IsSupported)
+            // ── Scenario 1: Connection churn (many short-lived TCP connections) ──
+            Console.WriteLine("═══ Scenario 1: Connection Churn (short-lived connections) ═══");
+            Console.WriteLine("  Each request opens a new TCP connection, sends GET, reads response, closes.");
+            Console.WriteLine();
+            foreach (int count in new[] { 500, 2000 })
             {
-                var iouringResult = await BenchmarkTransport("io_uring", iouringClient, WarmupRequests, MeasuredRequests, Concurrency);
-                PrintResult("io_uring  ", iouringResult);
-
-                Console.WriteLine();
-                double ratio = iouringResult.MeanUs / socketResult.MeanUs;
-                Console.WriteLine($"  io_uring / Socket ratio: {ratio:F3}x (< 1.0 = io_uring faster)");
+                foreach (int concurrency in new[] { 8, 32, 64 })
+                {
+                    var sr = await BenchmarkConnectionChurn(SocketPort, count, concurrency);
+                    var ur = await BenchmarkConnectionChurn(IoUringPort, count, concurrency);
+                    double ratio = ur.MeanUs / sr.MeanUs;
+                    Console.WriteLine($"  {count,5} conns @ {concurrency,3} concurrency | Socket: {sr.ReqPerSec,7:F0} req/s {sr.MeanUs,7:F0}µs | io_uring: {ur.ReqPerSec,7:F0} req/s {ur.MeanUs,7:F0}µs | ratio: {ratio:F3}x");
+                }
             }
-            else
+
+            Console.WriteLine();
+
+            // ── Scenario 2: Many concurrent connections, sustained ──
+            Console.WriteLine("═══ Scenario 2: Many Concurrent Connections (sustained) ═══");
+            Console.WriteLine("  N persistent connections send requests in parallel.");
+            Console.WriteLine();
+            foreach (int connections in new[] { 16, 64, 128, 256 })
             {
-                Console.WriteLine("  io_uring: SKIPPED (not supported)");
+                int requests = 5000;
+                var sr = await BenchmarkManyConcurrentConnections(SocketPort, connections, requests);
+                var ur = await BenchmarkManyConcurrentConnections(IoUringPort, connections, requests);
+                double ratio = ur.MeanUs / sr.MeanUs;
+                Console.WriteLine($"  {connections,4} connections, {requests} reqs | Socket: {sr.ReqPerSec,7:F0} req/s {sr.MeanUs,7:F0}µs gc0:{sr.Gen0Collects} | io_uring: {ur.ReqPerSec,7:F0} req/s {ur.MeanUs,7:F0}µs gc0:{ur.Gen0Collects} | ratio: {ratio:F3}x");
+            }
+
+            Console.WriteLine();
+
+            // ── Scenario 3: Tiny payload high-frequency ──
+            Console.WriteLine("═══ Scenario 3: Tiny Payload High Frequency ═══");
+            Console.WriteLine("  Burst of small requests over pooled connections — measures pure I/O overhead.");
+            Console.WriteLine();
+            foreach (int concurrency in new[] { 16, 64, 128 })
+            {
+                int requests = 20000;
+                var sr = await BenchmarkHighFrequency(SocketPort, requests, concurrency);
+                var ur = await BenchmarkHighFrequency(IoUringPort, requests, concurrency);
+                double ratio = ur.MeanUs / sr.MeanUs;
+                Console.WriteLine($"  {requests,6} reqs @ {concurrency,3} concurrency | Socket: {sr.ReqPerSec,7:F0} req/s gc0:{sr.Gen0Collects} | io_uring: {ur.ReqPerSec,7:F0} req/s gc0:{ur.Gen0Collects} | ratio: {ratio:F3}x");
             }
         }
         finally
         {
-            if (iouringApp != null) await iouringApp.StopAsync();
+            await iouringApp.StopAsync();
             await socketApp.StopAsync();
         }
     }
 
-    private static async Task<BenchResult> BenchmarkTransport(
-        string name, HttpClient client, int warmup, int measured, int concurrency)
+    // ═══════════════════════════════════════════════════════════════════
+    // Scenario 1: Connection churn — new HTTP connection per request
+    // ═══════════════════════════════════════════════════════════════════
+    private static async Task<BenchResult> BenchmarkConnectionChurn(int port, int count, int concurrency)
     {
-        // Warmup
-        for (int i = 0; i < warmup; i++)
-            await client.GetAsync("/");
+        // Each request creates a fresh TCP connection (PooledConnectionLifetime=0).
+        var handler = new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = TimeSpan.Zero,
+            MaxConnectionsPerServer = concurrency,
+        };
+        using var client = new HttpClient(handler)
+        {
+            BaseAddress = new Uri($"http://localhost:{port}"),
+            DefaultRequestVersion = new Version(1, 1),
+        };
 
-        // Force GC before measurement
+        // Warmup
+        for (int i = 0; i < Math.Min(50, count); i++)
+        {
+            var r = await client.GetAsync("/");
+            r.EnsureSuccessStatusCode();
+        }
+
         GC.Collect(2, GCCollectionMode.Aggressive, true, true);
         GC.WaitForPendingFinalizers();
-        long gen0Before = GC.CollectionCount(0);
-        long gen1Before = GC.CollectionCount(1);
+        long g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1);
 
-        // Measured phase — concurrent requests
         var sw = Stopwatch.StartNew();
-        var semaphore = new SemaphoreSlim(concurrency);
-        var tasks = new Task[measured];
-        for (int i = 0; i < measured; i++)
+        var sem = new SemaphoreSlim(concurrency);
+        var tasks = new Task[count];
+        for (int i = 0; i < count; i++)
         {
-            await semaphore.WaitAsync();
+            await sem.WaitAsync();
             tasks[i] = Task.Run(async () =>
             {
                 try
                 {
-                    var resp = await client.GetAsync("/");
-                    resp.EnsureSuccessStatusCode();
+                    var r = await client.GetAsync("/");
+                    r.EnsureSuccessStatusCode();
                 }
-                finally
-                {
-                    semaphore.Release();
-                }
+                finally { sem.Release(); }
             });
         }
         await Task.WhenAll(tasks);
         sw.Stop();
 
-        long gen0After = GC.CollectionCount(0);
-        long gen1After = GC.CollectionCount(1);
-
-        return new BenchResult(
-            measured,
-            sw.Elapsed.TotalMilliseconds,
-            gen0After - gen0Before,
-            gen1After - gen1Before);
+        return new BenchResult(count, sw.Elapsed.TotalMilliseconds,
+            GC.CollectionCount(0) - g0, GC.CollectionCount(1) - g1);
     }
 
-    private static void PrintResult(string label, BenchResult r)
+    // ═══════════════════════════════════════════════════════════════════
+    // Scenario 2: Many concurrent persistent connections
+    // ═══════════════════════════════════════════════════════════════════
+    private static async Task<BenchResult> BenchmarkManyConcurrentConnections(
+        int port, int connectionCount, int totalRequests)
     {
-        Console.WriteLine($"  {label}: {r.MeanUs,8:F1} µs/req | {r.ReqPerSec,8:F0} req/s | Total: {r.TotalMs,8:F1} ms | GC gen0: {r.Gen0Collects}, gen1: {r.Gen1Collects}");
+        // Create N HttpClients each with MaxConnectionsPerServer=1, so each holds one connection.
+        var clients = new HttpClient[connectionCount];
+        for (int i = 0; i < connectionCount; i++)
+        {
+            var handler = new SocketsHttpHandler
+            {
+                MaxConnectionsPerServer = 1,
+                EnableMultipleHttp2Connections = false,
+            };
+            clients[i] = new HttpClient(handler)
+            {
+                BaseAddress = new Uri($"http://localhost:{port}")
+            };
+        }
+
+        try
+        {
+            // Warmup all connections
+            await Task.WhenAll(clients.Select(c => c.GetAsync("/")));
+
+            GC.Collect(2, GCCollectionMode.Aggressive, true, true);
+            GC.WaitForPendingFinalizers();
+            long g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1);
+
+            var sw = Stopwatch.StartNew();
+            var sem = new SemaphoreSlim(connectionCount);
+            var tasks = new Task[totalRequests];
+            for (int i = 0; i < totalRequests; i++)
+            {
+                await sem.WaitAsync();
+                var client = clients[i % connectionCount];
+                tasks[i] = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var r = await client.GetAsync("/");
+                        r.EnsureSuccessStatusCode();
+                    }
+                    finally { sem.Release(); }
+                });
+            }
+            await Task.WhenAll(tasks);
+            sw.Stop();
+
+            return new BenchResult(totalRequests, sw.Elapsed.TotalMilliseconds,
+                GC.CollectionCount(0) - g0, GC.CollectionCount(1) - g1);
+        }
+        finally
+        {
+            foreach (var c in clients) c.Dispose();
+        }
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Scenario 3: High-frequency small requests on pooled connections
+    // ═══════════════════════════════════════════════════════════════════
+    private static async Task<BenchResult> BenchmarkHighFrequency(int port, int count, int concurrency)
+    {
+        var handler = new SocketsHttpHandler
+        {
+            MaxConnectionsPerServer = concurrency,
+        };
+        using var client = new HttpClient(handler) { BaseAddress = new Uri($"http://localhost:{port}") };
+
+        // Warmup
+        var warmupTasks = Enumerable.Range(0, concurrency).Select(_ => client.GetAsync("/"));
+        await Task.WhenAll(warmupTasks);
+
+        GC.Collect(2, GCCollectionMode.Aggressive, true, true);
+        GC.WaitForPendingFinalizers();
+        long g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1);
+
+        var sw = Stopwatch.StartNew();
+        var sem = new SemaphoreSlim(concurrency);
+        var tasks = new Task[count];
+        for (int i = 0; i < count; i++)
+        {
+            await sem.WaitAsync();
+            tasks[i] = Task.Run(async () =>
+            {
+                try
+                {
+                    var r = await client.GetAsync("/");
+                    r.EnsureSuccessStatusCode();
+                }
+                finally { sem.Release(); }
+            });
+        }
+        await Task.WhenAll(tasks);
+        sw.Stop();
+
+        return new BenchResult(count, sw.Elapsed.TotalMilliseconds,
+            GC.CollectionCount(0) - g0, GC.CollectionCount(1) - g1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
 
     private static WebApplication BuildSocketApp()
     {
@@ -124,7 +254,7 @@ public static class QuickBench
         builder.WebHost.UseUrls($"http://localhost:{SocketPort}");
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
         var app = builder.Build();
-        app.MapGet("/", () => "Hello from Socket transport!");
+        app.MapGet("/", () => "OK");
         return app;
     }
 
@@ -133,10 +263,10 @@ public static class QuickBench
         var builder = WebApplication.CreateBuilder();
         builder.WebHost
             .UseUrls($"http://localhost:{IoUringPort}")
-            .UseIoUring(opts => { opts.RingSize = 256; });
+            .UseIoUring();
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
         var app = builder.Build();
-        app.MapGet("/", () => "Hello from io_uring transport!");
+        app.MapGet("/", () => "OK");
         return app;
     }
 
