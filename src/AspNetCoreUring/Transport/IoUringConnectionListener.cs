@@ -118,18 +118,17 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _listenSocketFdRefAdded = refAdded;
         _listenSocketFd = (int)_listenSocket.SafeHandle.DangerousGetHandle();
 
-        // Register fixed file table for IOSQE_FIXED_FILE optimization.
-        // Table size: listen socket + eventfd + maxConnections.
+        // Register file table for listen socket + eventfd.
         if (_ring.InitFileTable(_maxConnections + 2))
         {
             _listenSocketFileIndex = _ring.RegisterFd(_listenSocketFd);
             _eventFdFileIndex = _ring.RegisterFd(_eventFd);
         }
 
-        // Multishot recv + buffer ring disabled. The buffer ring layout and ENOBUFS
-        // handling are correct, but concurrent keep-alive connections stall (~53/100).
-        // Root cause: multishot recv CQE delivery timing interacts poorly with
-        // Kestrel's HTTP pipeline under concurrent load on this 2-core VM.
+        // Multishot recv + buffer ring: root causes fixed (buffer ring layout, SQE flags
+        // overwrite, ENOBUFS handling). Sequential tests pass 100/100. Concurrent
+        // persistent connections via HttpClient still stall (~19/50). Disabled until
+        // the concurrent keep-alive multishot interaction is resolved.
         _bufferRing = null;
 
         lock (_ring.SubmitLock)
