@@ -83,4 +83,20 @@ internal static class IoUringConstants
     // io_uring_register opcodes for buffer rings.
     public const uint IORING_REGISTER_PBUF_RING = 22;
     public const uint IORING_UNREGISTER_PBUF_RING = 23;
+
+    // io_uring_register opcodes for file and ring registration.
+    public const uint IORING_REGISTER_FILES = 2;
+    public const uint IORING_UNREGISTER_FILES = 3;
+    public const uint IORING_REGISTER_RING_FDS = 20;
+    public const uint IORING_UNREGISTER_RING_FDS = 21;
+
+    // io_uring_setup flags.
+    public const uint IORING_SETUP_COOP_TASKRUN = 1u << 8;
+    public const uint IORING_SETUP_SINGLE_ISSUER = 1u << 12;
+
+    // SQE flags for fixed files.
+    public const byte IOSQE_FIXED_FILE = 1 << 0;
+
+    // Send zero-copy.
+    public const byte IORING_OP_SEND_ZC = 53;
 }

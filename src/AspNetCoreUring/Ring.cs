@@ -137,12 +137,29 @@ public sealed class Ring : IDisposable
 
             _sq = new SubmissionQueue(sqRingPtr, sqesPtr, in p);
             _cq = new CompletionQueue(cqRingPtr, in p);
+
+            // Register the ring fd to avoid kernel fd lookup on every io_uring_enter.
+            TryRegisterRingFd();
         }
         catch
         {
             Libc.close(fd);
             throw;
         }
+    }
+
+    private unsafe void TryRegisterRingFd()
+    {
+        // Best-effort: register ring fd for slightly faster io_uring_enter.
+        // Uses a {s32 offset, u32 data} pair. offset=-1 lets kernel pick slot.
+        var regData = stackalloc int[2];
+        regData[0] = -1;
+        regData[1] = _ringFd;
+        IoUringNative.IoUringRegister(
+            _ringFd,
+            IoUringConstants.IORING_REGISTER_RING_FDS,
+            (nint)regData,
+            1);
     }
 
     internal unsafe bool TryGetSqe(out IoUringSqe* sqe) => _sq.TryGetSqe(out sqe);
