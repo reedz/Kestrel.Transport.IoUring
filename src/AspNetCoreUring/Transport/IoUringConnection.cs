@@ -45,6 +45,7 @@ internal sealed class IoUringConnection : ConnectionContext
 
     private readonly long _connectionId;
     private readonly int _socketFd;
+    private readonly int _fileIndex; // registered file index, or -1
     private readonly Ring _ring;
     private readonly ILogger _logger;
     private readonly int _receiveBufferSize;
@@ -79,6 +80,7 @@ internal sealed class IoUringConnection : ConnectionContext
     public IoUringConnection(
         long connectionId,
         int socketFd,
+        int fileIndex,
         Ring ring,
         EndPoint? remoteEndPoint,
         EndPoint? localEndPoint,
@@ -87,6 +89,7 @@ internal sealed class IoUringConnection : ConnectionContext
     {
         _connectionId = connectionId;
         _socketFd = socketFd;
+        _fileIndex = fileIndex;
         _ring = ring;
         _logger = logger;
         _receiveBufferSize = receiveBufferSize;
@@ -110,6 +113,20 @@ internal sealed class IoUringConnection : ConnectionContext
     // _recvHandle is only accessed from the single IO loop thread — no lock needed.
     private MemoryHandle _recvHandle;
 
+    /// <summary>Sets the fd on an SQE, using fixed-file index if registered.</summary>
+    private unsafe void SetSqeFd(IoUringSqe* sqe)
+    {
+        if (_fileIndex >= 0)
+        {
+            sqe->Fd = _fileIndex;
+            sqe->Flags |= IoUringConstants.IOSQE_FIXED_FILE;
+        }
+        else
+        {
+            SetSqeFd(sqe);
+        }
+    }
+
     /// <summary>
     /// Submits a RECV SQE. Returns false if the SQ is full (caller should retry later).
     /// </summary>
@@ -121,7 +138,7 @@ internal sealed class IoUringConnection : ConnectionContext
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
             sqe->Opcode = IoUringConstants.IORING_OP_RECV;
-            sqe->Fd = _socketFd;
+            SetSqeFd(sqe);
             sqe->AddrOrSpliceOffIn = (ulong)_recvHandle.Pointer;
             sqe->Len = (uint)buffer.Length;
             sqe->UserData = EncodeUserData(_connectionId, OpType.Recv);
@@ -144,7 +161,7 @@ internal sealed class IoUringConnection : ConnectionContext
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
             sqe->Opcode = IoUringConstants.IORING_OP_RECV;
-            sqe->Fd = _socketFd;
+            SetSqeFd(sqe);
             sqe->AddrOrSpliceOffIn = 0; // kernel selects buffer
             sqe->Len = 0;              // kernel determines length from buffer ring
             sqe->OpFlags = IoUringConstants.IORING_RECV_MULTISHOT;
@@ -200,7 +217,7 @@ internal sealed class IoUringConnection : ConnectionContext
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
             sqe->Opcode = IoUringConstants.IORING_OP_SEND;
-            sqe->Fd = _socketFd;
+            SetSqeFd(sqe);
             sqe->AddrOrSpliceOffIn = (ulong)pending.Pointer;
             sqe->Len = pending.Length;
             sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
@@ -230,7 +247,7 @@ internal sealed class IoUringConnection : ConnectionContext
             if (_ring.TryGetSqe(out IoUringSqe* sqe))
             {
                 sqe->Opcode = IoUringConstants.IORING_OP_SEND;
-                sqe->Fd = _socketFd;
+                SetSqeFd(sqe);
                 sqe->AddrOrSpliceOffIn = (ulong)handle.Pointer;
                 sqe->Len = (uint)data.Length;
                 sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
@@ -466,6 +483,8 @@ internal sealed class IoUringConnection : ConnectionContext
     /// <summary>Closes the socket fd. Called by the listener after in-flight ops are drained.</summary>
     internal void CloseSocketFd()
     {
+        if (_fileIndex >= 0)
+            _ring.UnregisterFd(_fileIndex);
         if (Libc.close(_socketFd) < 0)
             _logger.LogWarning("close(fd={Fd}) failed with errno {Errno}", _socketFd, Marshal.GetLastPInvokeError());
     }

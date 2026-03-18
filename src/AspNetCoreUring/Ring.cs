@@ -162,6 +162,95 @@ public sealed class Ring : IDisposable
             1);
     }
 
+    // ── Registered files (IOSQE_FIXED_FILE) ──
+    private int[]? _registeredFiles;
+    private int _nextFileSlot;
+    private bool _fileTableRegistered;
+    private readonly Stack<int> _freeFileSlots = new();
+
+    /// <summary>Whether fixed-file descriptors are available.</summary>
+    internal bool HasRegisteredFiles => _fileTableRegistered;
+
+    /// <summary>
+    /// Initializes the registered file table. Call once before accepting connections.
+    /// </summary>
+    internal unsafe bool InitFileTable(int maxFiles)
+    {
+        _registeredFiles = new int[maxFiles];
+        Array.Fill(_registeredFiles, -1);
+        _nextFileSlot = 0;
+
+        fixed (int* p = _registeredFiles)
+        {
+            int ret = IoUringNative.IoUringRegister(
+                _ringFd, IoUringConstants.IORING_REGISTER_FILES, (nint)p, (uint)maxFiles);
+            if (ret < 0)
+            {
+                _registeredFiles = null;
+                return false;
+            }
+        }
+        _fileTableRegistered = true;
+        return true;
+    }
+
+    /// <summary>
+    /// Registers an fd in the next available slot and returns the fixed-file index.
+    /// Returns -1 if full.
+    /// </summary>
+    internal unsafe int RegisterFd(int fd)
+    {
+        if (_registeredFiles == null)
+            return -1;
+
+        int slot;
+        if (_freeFileSlots.Count > 0)
+            slot = _freeFileSlots.Pop();
+        else if (_nextFileSlot < _registeredFiles.Length)
+            slot = _nextFileSlot++;
+        else
+            return -1;
+
+        _registeredFiles[slot] = fd;
+
+        // Update the kernel's table for this single slot.
+        var update = new IoUringFilesUpdate
+        {
+            Offset = (uint)slot,
+            Fds = (ulong)(nint)(&fd),
+        };
+        int ret = IoUringNative.IoUringRegister(
+            _ringFd, 6 /* IORING_REGISTER_FILES_UPDATE */, (nint)(&update), 1);
+        if (ret < 0)
+        {
+            _registeredFiles[slot] = -1;
+            _freeFileSlots.Push(slot);
+            return -1;
+        }
+        return slot;
+    }
+
+    /// <summary>
+    /// Unregisters an fd from its slot (sets to -1).
+    /// </summary>
+    internal unsafe void UnregisterFd(int slot)
+    {
+        if (_registeredFiles == null || slot < 0 || slot >= _registeredFiles.Length)
+            return;
+
+        _registeredFiles[slot] = -1;
+        _freeFileSlots.Push(slot);
+
+        int emptyFd = -1;
+        var update = new IoUringFilesUpdate
+        {
+            Offset = (uint)slot,
+            Fds = (ulong)(nint)(&emptyFd),
+        };
+        IoUringNative.IoUringRegister(
+            _ringFd, 6 /* IORING_REGISTER_FILES_UPDATE */, (nint)(&update), 1);
+    }
+
     internal unsafe bool TryGetSqe(out IoUringSqe* sqe) => _sq.TryGetSqe(out sqe);
 
     /// <summary>The io_uring file descriptor — needed for buffer ring registration.</summary>

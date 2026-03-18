@@ -55,9 +55,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private bool _listenSocketFdRefAdded;
     private uint _lastOverflowCount;
     private bool _acceptMultishotActive;
-    // Multishot accept is implemented but disabled — this kernel returns EINVAL.
-    // Set to true to try multishot accept; falls back automatically on EINVAL.
     private bool _useMultishotAccept = false;
+
+    // Registered file indices for fixed-fd SQEs (-1 = not registered).
+    private int _listenSocketFileIndex = -1;
+    private int _eventFdFileIndex = -1;
 
     public EndPoint EndPoint { get; }
 
@@ -116,11 +118,17 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _listenSocketFdRefAdded = refAdded;
         _listenSocketFd = (int)_listenSocket.SafeHandle.DangerousGetHandle();
 
-        // Provided buffer ring for multishot recv.
-        // Multishot recv with buffer rings is implemented but disabled by default due to
-        // edge cases under high concurrent load (some connections stall). The infrastructure
-        // is in place (ProvidedBufferRing, SubmitMultishotRecv, OnRecvCompleteFromBuffer)
-        // and can be enabled once the remaining CQE lifecycle issues are resolved.
+        // Register fixed file table for IOSQE_FIXED_FILE optimization.
+        // Table size: listen socket + eventfd + maxConnections.
+        if (_ring.InitFileTable(_maxConnections + 2))
+        {
+            _listenSocketFileIndex = _ring.RegisterFd(_listenSocketFd);
+            _eventFdFileIndex = _ring.RegisterFd(_eventFd);
+        }
+
+        // Provided buffer ring for multishot recv — disabled pending lifecycle fixes.
+        // The multishot recv close path disposes connections prematurely while Kestrel
+        // still accesses ConnectionClosed. Enable once the CQE F_MORE lifecycle is resolved.
         _bufferRing = null;
 
         lock (_ring.SubmitLock)
@@ -146,14 +154,21 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
             sqe->Opcode = IoUringConstants.IORING_OP_ACCEPT;
-            sqe->Fd = _listenSocketFd;
             sqe->AddrOrSpliceOffIn = 0;
             sqe->OffOrAddr2 = 0;
             sqe->Len = 0;
             sqe->UserData = IoUringConnection.EncodeUserData(0, IoUringConnection.OpType.Accept);
-            // Try multishot if not already known to be unsupported.
             if (_useMultishotAccept)
                 sqe->OpFlags = IoUringConstants.IORING_ACCEPT_MULTISHOT;
+            if (_listenSocketFileIndex >= 0)
+            {
+                sqe->Fd = _listenSocketFileIndex;
+                sqe->Flags |= IoUringConstants.IOSQE_FIXED_FILE;
+            }
+            else
+            {
+                sqe->Fd = _listenSocketFd;
+            }
             _acceptMultishotActive = _useMultishotAccept;
         }
         else
@@ -162,16 +177,24 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         }
     }
 
-    /// <summary>Submits a READ SQE on the eventfd. When output-drain tasks write to the eventfd this completes.</summary>
+    /// <summary>Submits a READ SQE on the eventfd.</summary>
     private unsafe void SubmitEventFdRead()
     {
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
             sqe->Opcode = IoUringConstants.IORING_OP_READ;
-            sqe->Fd = _eventFd;
             sqe->AddrOrSpliceOffIn = (ulong)(nint)Unsafe.AsPointer(ref _eventFdReadBuf[0]);
             sqe->Len = sizeof(ulong);
             sqe->UserData = IoUringConstants.EVENTFD_USER_DATA;
+            if (_eventFdFileIndex >= 0)
+            {
+                sqe->Fd = _eventFdFileIndex;
+                sqe->Flags |= IoUringConstants.IOSQE_FIXED_FILE;
+            }
+            else
+            {
+                sqe->Fd = _eventFd;
+            }
         }
     }
 
@@ -246,7 +269,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         {
             if (_connections.TryGetValue(connId, out var conn) && !conn.IsClosing && !conn.HasRecvInFlight)
             {
-                if (!conn.SubmitRecv())
+                if (conn.UsingMultishotRecv && _bufferRing != null)
+                    conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID);
+                else if (!conn.SubmitRecv())
                     _recvRetrySet.Add(connId);
             }
         }
@@ -262,12 +287,21 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         {
             if (_connections.TryGetValue(connId, out var conn) && !conn.IsClosing && !conn.HasRecvInFlight)
             {
-                if (conn.SubmitRecv())
-                    retried.Add(connId);
+                bool ok;
+                if (conn.UsingMultishotRecv && _bufferRing != null)
+                {
+                    conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID);
+                    ok = true;
+                }
+                else
+                {
+                    ok = conn.SubmitRecv();
+                }
+                if (ok) retried.Add(connId);
             }
             else
             {
-                retried.Add(connId); // Connection gone, remove from retry set.
+                retried.Add(connId);
             }
         }
         foreach (long id in retried)
@@ -372,9 +406,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 SetTcpNoDelay(socketFd);
                 long connId = Interlocked.Increment(ref _nextConnectionId);
 
+                // Register the accepted socket fd for IOSQE_FIXED_FILE.
+                int fileIndex = _ring.HasRegisteredFiles ? _ring.RegisterFd(socketFd) : -1;
+
                 var conn = new IoUringConnection(
                     connId,
                     socketFd,
+                    fileIndex,
                     _ring,
                     remoteEndPoint: null,
                     EndPoint,
