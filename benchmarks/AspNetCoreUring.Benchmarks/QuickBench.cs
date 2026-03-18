@@ -93,7 +93,7 @@ public static class QuickBench
         };
         using var client = new HttpClient(handler)
         {
-            BaseAddress = new Uri($"http://localhost:{port}"),
+            BaseAddress = new Uri($"http://127.0.0.1:{port}"),
             DefaultRequestVersion = new Version(1, 1),
         };
 
@@ -148,14 +148,18 @@ public static class QuickBench
             };
             clients[i] = new HttpClient(handler)
             {
-                BaseAddress = new Uri($"http://localhost:{port}")
+                BaseAddress = new Uri($"http://127.0.0.1:{port}")
             };
         }
 
         try
         {
-            // Warmup all connections
-            await Task.WhenAll(clients.Select(c => c.GetAsync("/")));
+            // Warmup all connections (with timeout — some may fail on first connect)
+            var warmupTasks = clients.Select(async c => {
+                try { using var cts = new CancellationTokenSource(5000); await c.GetAsync("/", cts.Token); }
+                catch { }
+            });
+            await Task.WhenAll(warmupTasks);
 
             GC.Collect(2, GCCollectionMode.Aggressive, true, true);
             GC.WaitForPendingFinalizers();
@@ -172,9 +176,11 @@ public static class QuickBench
                 {
                     try
                     {
-                        var r = await client.GetAsync("/");
+                        using var cts = new CancellationTokenSource(5000);
+                        var r = await client.GetAsync("/", cts.Token);
                         r.EnsureSuccessStatusCode();
                     }
+                    catch { }
                     finally { sem.Release(); }
                 });
             }
@@ -199,10 +205,12 @@ public static class QuickBench
         {
             MaxConnectionsPerServer = concurrency,
         };
-        using var client = new HttpClient(handler) { BaseAddress = new Uri($"http://localhost:{port}") };
+        using var client = new HttpClient(handler) { BaseAddress = new Uri($"http://127.0.0.1:{port}") };
 
         // Warmup
-        var warmupTasks = Enumerable.Range(0, concurrency).Select(_ => client.GetAsync("/"));
+        var warmupTasks = Enumerable.Range(0, concurrency).Select(async _ => {
+            try { await client.GetAsync("/"); } catch { }
+        });
         await Task.WhenAll(warmupTasks);
 
         GC.Collect(2, GCCollectionMode.Aggressive, true, true);
@@ -222,6 +230,7 @@ public static class QuickBench
                     var r = await client.GetAsync("/");
                     r.EnsureSuccessStatusCode();
                 }
+                catch { }
                 finally { sem.Release(); }
             });
         }
@@ -237,7 +246,7 @@ public static class QuickBench
     private static WebApplication BuildSocketApp()
     {
         var builder = WebApplication.CreateBuilder();
-        builder.WebHost.UseUrls($"http://localhost:{SocketPort}");
+        builder.WebHost.UseUrls($"http://127.0.0.1:{SocketPort}");
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
         var app = builder.Build();
         app.MapGet("/", () => "OK");
@@ -248,7 +257,7 @@ public static class QuickBench
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost
-            .UseUrls($"http://localhost:{IoUringPort}")
+            .UseUrls($"http://127.0.0.1:{IoUringPort}")
             .UseIoUring();
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
         var app = builder.Build();
