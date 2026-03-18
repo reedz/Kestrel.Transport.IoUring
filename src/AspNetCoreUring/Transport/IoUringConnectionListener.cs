@@ -126,11 +126,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             _eventFdFileIndex = _ring.RegisterFd(_eventFd);
         }
 
-        // Multishot recv + buffer ring: works for sequential and burst requests, but
-        // stalls some concurrent keep-alive connections. The ENOBUFS and rearm race fixes
-        // are in place; the remaining issue is likely in the multishot CQE sequencing
-        // when multiple connections share the buffer ring under concurrent load.
-        // Disabled until the concurrent keep-alive stall is debugged.
+        // Multishot recv + buffer ring disabled. The buffer ring layout and ENOBUFS
+        // handling are correct, but concurrent keep-alive connections stall (~53/100).
+        // Root cause: multishot recv CQE delivery timing interacts poorly with
+        // Kestrel's HTTP pipeline under concurrent load on this 2-core VM.
         _bufferRing = null;
 
         lock (_ring.SubmitLock)
