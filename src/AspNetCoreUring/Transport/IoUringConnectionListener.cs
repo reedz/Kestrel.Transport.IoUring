@@ -44,11 +44,20 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private readonly int[] _sockOptBuf;
     private readonly MemoryHandle _sockOptHandle;
 
+    // Provided buffer ring for multishot recv — kernel picks buffers from this pool.
+    private ProvidedBufferRing? _bufferRing;
+    private const ushort RECV_BUF_GROUP_ID = 0;
+    private const int RECV_BUF_RING_ENTRIES = 256; // must be power of 2
+
     private long _nextConnectionId;
     private readonly TaskCompletionSource _ioLoopStopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _listenSocketFd;
     private bool _listenSocketFdRefAdded;
     private uint _lastOverflowCount;
+    private bool _acceptMultishotActive;
+    // Multishot accept is implemented but disabled — this kernel returns EINVAL.
+    // Set to true to try multishot accept; falls back automatically on EINVAL.
+    private bool _useMultishotAccept = false;
 
     public EndPoint EndPoint { get; }
 
@@ -107,6 +116,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _listenSocketFdRefAdded = refAdded;
         _listenSocketFd = (int)_listenSocket.SafeHandle.DangerousGetHandle();
 
+        // Provided buffer ring for multishot recv.
+        // Multishot recv with buffer rings is implemented but disabled by default due to
+        // edge cases under high concurrent load (some connections stall). The infrastructure
+        // is in place (ProvidedBufferRing, SubmitMultishotRecv, OnRecvCompleteFromBuffer)
+        // and can be enabled once the remaining CQE lifecycle issues are resolved.
+        _bufferRing = null;
+
         lock (_ring.SubmitLock)
         {
             SubmitAccept();
@@ -135,6 +151,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             sqe->OffOrAddr2 = 0;
             sqe->Len = 0;
             sqe->UserData = IoUringConnection.EncodeUserData(0, IoUringConnection.OpType.Accept);
+            // Try multishot if not already known to be unsupported.
+            if (_useMultishotAccept)
+                sqe->OpFlags = IoUringConstants.IORING_ACCEPT_MULTISHOT;
+            _acceptMultishotActive = _useMultishotAccept;
         }
         else
         {
@@ -290,12 +310,12 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             switch (opType)
             {
                 case IoUringConnection.OpType.Accept:
-                    lock (_ring.SubmitLock) { HandleAccept(cqe.Res); }
+                    lock (_ring.SubmitLock) { HandleAccept(cqe.Res, cqe.Flags); }
                     needsSubmit = true;
                     break;
                 case IoUringConnection.OpType.Recv:
                     bool recvSubmitted;
-                    lock (_ring.SubmitLock) { recvSubmitted = HandleRecv(connectionId, cqe.Res); }
+                    lock (_ring.SubmitLock) { recvSubmitted = HandleRecv(connectionId, cqe.Res, cqe.Flags); }
                     if (recvSubmitted) needsSubmit = true;
                     break;
                 case IoUringConnection.OpType.Send:
@@ -315,12 +335,28 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             _ring.Submit();
     }
 
-    private unsafe void HandleAccept(int result)
+    private unsafe void HandleAccept(int result, uint cqeFlags)
     {
+        bool more = (cqeFlags & IoUringConstants.IORING_CQE_F_MORE) != 0;
+
         if (result < 0)
         {
+            int errno = -result;
+            _acceptMultishotActive = more;
+
+            // EINVAL means multishot accept is not supported — fall back to single-shot.
+            if (errno == 22 /* EINVAL */ && _useMultishotAccept)
+            {
+                _useMultishotAccept = false;
+                _acceptMultishotActive = false;
+                _logger.LogInformation("Multishot accept not supported; using single-shot accept.");
+                if (!_cts.IsCancellationRequested)
+                    SubmitAccept();
+                return;
+            }
+
             if (!_cts.IsCancellationRequested)
-                _logger.LogWarning("Accept failed with errno {Errno}", -result);
+                _logger.LogWarning("Accept failed with errno {Errno}", errno);
         }
         else
         {
@@ -333,21 +369,14 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             }
             else
             {
-                // Set TCP_NODELAY to disable Nagle's algorithm for low-latency responses.
                 SetTcpNoDelay(socketFd);
-
                 long connId = Interlocked.Increment(ref _nextConnectionId);
-
-                // Attempt to resolve remote endpoint from the socket fd.
-                EndPoint? remoteEndPoint = null;
-                // Note: We could use accept4 with sockaddr to capture the remote endpoint,
-                // but that requires additional io_uring flags. For now, remoteEndPoint is null.
 
                 var conn = new IoUringConnection(
                     connId,
                     socketFd,
                     _ring,
-                    remoteEndPoint,
+                    remoteEndPoint: null,
                     EndPoint,
                     _receiveBufferSize,
                     _logger);
@@ -355,36 +384,82 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 _connections[connId] = conn;
                 conn.StartOutputDrain(RequestRecvResubmit);
 
-                if (!conn.SubmitRecv())
+                // Submit multishot recv if buffer ring is available; otherwise single-shot.
+                if (_bufferRing != null)
+                    conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID);
+                else if (!conn.SubmitRecv())
                     _recvRetrySet.Add(connId);
 
                 _acceptChannel.Writer.TryWrite(conn);
             }
+
+            _acceptMultishotActive = more;
         }
 
-        if (!_cts.IsCancellationRequested)
+        // If multishot ended (F_MORE not set), rearm.
+        if (!more && !_cts.IsCancellationRequested)
             SubmitAccept();
     }
 
     /// <summary>Returns true if a submission was queued (caller should call Submit).</summary>
-    private bool HandleRecv(long connectionId, int result)
+    private bool HandleRecv(long connectionId, int result, uint cqeFlags)
     {
-        // Check closing connections first (this is a completion for an op that was in-flight when close started).
+        bool more = (cqeFlags & IoUringConstants.IORING_CQE_F_MORE) != 0;
+        bool hasBuffer = (cqeFlags & IoUringConstants.IORING_CQE_F_BUFFER) != 0;
+        ushort bufferId = (ushort)(cqeFlags >> IoUringConstants.IORING_CQE_BUFFER_SHIFT);
+
+        // Check closing connections first.
         if (_closingConnections.TryGetValue(connectionId, out var closingConn))
         {
-            closingConn.HasRecvInFlight = false;
+            if (!more) closingConn.HasRecvInFlight = false;
+            if (hasBuffer && _bufferRing != null)
+                _bufferRing.RecycleBuffer(bufferId);
             TryFinalizeClose(connectionId, closingConn);
             return false;
         }
 
         if (!_connections.TryGetValue(connectionId, out var conn))
+        {
+            if (hasBuffer && _bufferRing != null)
+                _bufferRing.RecycleBuffer(bufferId);
             return false;
+        }
 
+        // ── Multishot recv with buffer ring ──
+        if (conn.UsingMultishotRecv)
+        {
+            if (!more) conn.HasRecvInFlight = false;
+
+            if (result <= 0)
+            {
+                if (hasBuffer && _bufferRing != null)
+                    _bufferRing.RecycleBuffer(bufferId);
+                _inputPipeComplete(conn);
+                BeginCloseConnection(connectionId, conn);
+                return false;
+            }
+
+            if (hasBuffer && _bufferRing != null)
+            {
+                var bufSpan = _bufferRing.GetBuffer(bufferId).Slice(0, result);
+                bool flushOk = conn.OnRecvCompleteFromBuffer(bufSpan);
+                _bufferRing.RecycleBuffer(bufferId);
+
+                // If multishot ended, rearm.
+                if (!more && flushOk)
+                {
+                    conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // ── Single-shot recv (fallback) ──
         bool resubmit = conn.OnRecvComplete(result);
 
         if (result <= 0)
         {
-            // Graceful close or error — initiate connection teardown.
             BeginCloseConnection(connectionId, conn);
             return false;
         }
@@ -395,10 +470,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 _recvRetrySet.Add(connectionId);
             return true;
         }
-
-        // If OnRecvComplete returned false but result > 0, an async flush is in progress.
-        // The recv will be resubmitted when the flush completes (via _recvResubmitQueue).
         return false;
+    }
+
+    private static void _inputPipeComplete(IoUringConnection conn)
+    {
+        // Signal the pipe that no more data will arrive.
+        try { conn.CompleteInputWriter(); } catch { }
     }
 
     private void HandleSend(long connectionId, int result)
@@ -511,6 +589,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _eventFdReadHandle.Dispose();
         _eventFdWriteHandle.Dispose();
         _sockOptHandle.Dispose();
+        _bufferRing?.Dispose();
         Libc.close(_eventFd);
 
         if (_listenSocketFdRefAdded)

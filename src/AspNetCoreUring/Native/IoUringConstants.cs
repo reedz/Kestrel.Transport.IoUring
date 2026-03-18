@@ -65,4 +65,22 @@ internal static class IoUringConstants
     public const int EINTR = 4;
     public const int EPERM = 1;
     public const int EAGAIN = 11;
+
+    // Multishot flags — set in the SQE OpFlags field for ACCEPT/RECV.
+    public const uint IORING_ACCEPT_MULTISHOT = 1u << 1;
+    public const uint IORING_RECV_MULTISHOT = 1u << 1;
+
+    // SQE flags for buffer selection.
+    public const byte IOSQE_BUFFER_SELECT = 1 << 3;
+
+    // CQE flags.
+    public const uint IORING_CQE_F_BUFFER = 1u << 0; // CQE has buffer ID in upper flags
+    public const uint IORING_CQE_F_MORE = 1u << 1;   // multishot: more CQEs will follow
+
+    // CQE buffer ID extraction.
+    public const int IORING_CQE_BUFFER_SHIFT = 16;
+
+    // io_uring_register opcodes for buffer rings.
+    public const uint IORING_REGISTER_PBUF_RING = 22;
+    public const uint IORING_UNREGISTER_PBUF_RING = 23;
 }

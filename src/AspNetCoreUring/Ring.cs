@@ -147,6 +147,9 @@ public sealed class Ring : IDisposable
 
     internal unsafe bool TryGetSqe(out IoUringSqe* sqe) => _sq.TryGetSqe(out sqe);
 
+    /// <summary>The io_uring file descriptor — needed for buffer ring registration.</summary>
+    internal int Fd => _ringFd;
+
     public int Submit()
     {
         uint toSubmit;

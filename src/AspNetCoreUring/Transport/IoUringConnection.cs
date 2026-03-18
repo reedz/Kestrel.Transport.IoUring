@@ -73,6 +73,9 @@ internal sealed class IoUringConnection : ConnectionContext
     /// <summary>Set when the connection is shutting down (recv returned ≤0 or abort called).</summary>
     internal bool IsClosing { get; set; }
 
+    /// <summary>True when using multishot recv with buffer ring (no _recvHandle to manage).</summary>
+    internal bool UsingMultishotRecv { get; set; }
+
     public IoUringConnection(
         long connectionId,
         int socketFd,
@@ -128,6 +131,62 @@ internal sealed class IoUringConnection : ConnectionContext
 
         _recvHandle.Dispose();
         _recvHandle = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Submits a multishot RECV SQE with buffer selection from a provided buffer ring.
+    /// The kernel will select buffers from the specified group and generate multiple CQEs.
+    /// No per-recv Pin() needed — the buffer ring owns the memory.
+    /// </summary>
+    public unsafe void SubmitMultishotRecv(ushort bufferGroupId)
+    {
+        if (_ring.TryGetSqe(out IoUringSqe* sqe))
+        {
+            sqe->Opcode = IoUringConstants.IORING_OP_RECV;
+            sqe->Fd = _socketFd;
+            sqe->AddrOrSpliceOffIn = 0; // kernel selects buffer
+            sqe->Len = 0;              // kernel determines length from buffer ring
+            sqe->OpFlags = IoUringConstants.IORING_RECV_MULTISHOT;
+            sqe->Flags = IoUringConstants.IOSQE_BUFFER_SELECT;
+            sqe->BufIndexOrGroup = bufferGroupId;
+            sqe->UserData = EncodeUserData(_connectionId, OpType.Recv);
+            HasRecvInFlight = true;
+            UsingMultishotRecv = true;
+        }
+    }
+
+    /// <summary>Completes the input pipe writer (called by listener on recv close).</summary>
+    internal void CompleteInputWriter()
+    {
+        try { _inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
+    }
+
+    /// Called when a multishot recv CQE completes with data in a provided buffer.
+    /// Copies data from the buffer ring into the pipe and flushes.
+    /// Returns true if flush completed synchronously (ok to continue receiving).
+    /// </summary>
+    public bool OnRecvCompleteFromBuffer(ReadOnlySpan<byte> data)
+    {
+        var dest = _inputPipe.Writer.GetSpan(data.Length);
+        data.CopyTo(dest);
+        _inputPipe.Writer.Advance(data.Length);
+
+        var flushTask = _inputPipe.Writer.FlushAsync();
+
+        if (flushTask.IsCompleted)
+        {
+            var flushResult = flushTask.Result;
+            if (flushResult.IsCompleted || flushResult.IsCanceled)
+            {
+                _inputPipe.Writer.Complete();
+                return false;
+            }
+            return true;
+        }
+
+        // Async flush (back-pressure). Multishot will be rearmed after flush completes.
+        _ = WaitForFlushThenRequestRecv(flushTask);
         return false;
     }
 
