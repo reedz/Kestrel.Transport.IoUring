@@ -126,7 +126,7 @@ internal sealed class IoUringConnection : ConnectionContext
         }
         else
         {
-            sqe->Fd = _socketFd;
+            SetSqeFd(sqe);
         }
     }
 
@@ -168,7 +168,7 @@ internal sealed class IoUringConnection : ConnectionContext
             sqe->AddrOrSpliceOffIn = 0; // kernel selects buffer
             sqe->Len = 0;              // kernel determines length from buffer ring
             sqe->OpFlags = IoUringConstants.IORING_RECV_MULTISHOT;
-            sqe->Flags |= IoUringConstants.IOSQE_BUFFER_SELECT;
+            sqe->Flags = IoUringConstants.IOSQE_BUFFER_SELECT;
             sqe->BufIndexOrGroup = bufferGroupId;
             sqe->UserData = EncodeUserData(_connectionId, OpType.Recv);
             HasRecvInFlight = true;

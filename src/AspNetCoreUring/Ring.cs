@@ -295,6 +295,12 @@ public sealed class Ring : IDisposable
             }
             if (err == IoUringConstants.EAGAIN)
                 return 0;
+            if (err == 17 /* EEXIST: concurrent io_uring_enter collision */)
+            {
+                Thread.Yield();
+                toSubmit = 0;
+                continue;
+            }
             throw new InvalidOperationException($"io_uring_enter failed with errno {err}");
         }
         return ret;
