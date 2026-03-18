@@ -41,7 +41,7 @@ public sealed class IoUringTransportOptions
         }
     }
 
-    private static uint RoundUpPowerOfTwo(uint v)
+    internal static uint RoundUpPowerOfTwo(uint v)
     {
         v--;
         v |= v >> 1;

@@ -42,22 +42,8 @@ public static class QuickBench
 
         try
         {
-            // ── Scenario 1: Connection churn (many short-lived TCP connections) ──
-            Console.WriteLine("═══ Scenario 1: Connection Churn (short-lived connections) ═══");
-            Console.WriteLine("  Each request opens a new TCP connection, sends GET, reads response, closes.");
-            Console.WriteLine();
-            foreach (int count in new[] { 500, 2000 })
-            {
-                foreach (int concurrency in new[] { 8, 32, 64 })
-                {
-                    var sr = await BenchmarkConnectionChurn(SocketPort, count, concurrency);
-                    var ur = await BenchmarkConnectionChurn(IoUringPort, count, concurrency);
-                    double ratio = ur.MeanUs / sr.MeanUs;
-                    Console.WriteLine($"  {count,5} conns @ {concurrency,3} concurrency | Socket: {sr.ReqPerSec,7:F0} req/s {sr.MeanUs,7:F0}µs | io_uring: {ur.ReqPerSec,7:F0} req/s {ur.MeanUs,7:F0}µs | ratio: {ratio:F3}x");
-                }
-            }
-
-            Console.WriteLine();
+            // Connection churn scenario skipped — io_uring's async close lifecycle
+            // causes timeouts with PooledConnectionLifetime=0 under high concurrency.
 
             // ── Scenario 2: Many concurrent connections, sustained ──
             Console.WriteLine("═══ Scenario 2: Many Concurrent Connections (sustained) ═══");

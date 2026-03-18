@@ -77,6 +77,9 @@ internal sealed class IoUringConnection : ConnectionContext
     /// <summary>True when using multishot recv with buffer ring (no _recvHandle to manage).</summary>
     internal bool UsingMultishotRecv { get; set; }
 
+    /// <summary>True when an async flush is pending and will trigger a recv rearm on completion.</summary>
+    internal bool RecvRearmPending { get; set; }
+
     public IoUringConnection(
         long connectionId,
         int socketFd,
@@ -202,7 +205,8 @@ internal sealed class IoUringConnection : ConnectionContext
             return true;
         }
 
-        // Async flush (back-pressure). Multishot will be rearmed after flush completes.
+        // Async flush (back-pressure). Set flag so the !more path doesn't double-rearm.
+        RecvRearmPending = true;
         _ = WaitForFlushThenRequestRecv(flushTask);
         return false;
     }
@@ -330,6 +334,7 @@ internal sealed class IoUringConnection : ConnectionContext
         try
         {
             var result = await flushTask.ConfigureAwait(false);
+            RecvRearmPending = false;
             if (result.IsCompleted || result.IsCanceled)
             {
                 _inputPipe.Writer.Complete();
@@ -341,6 +346,7 @@ internal sealed class IoUringConnection : ConnectionContext
         }
         catch (Exception ex)
         {
+            RecvRearmPending = false;
             _logger.LogDebug(ex, "Flush failed for connection {Id}", _connectionId);
             _inputPipe.Writer.Complete(ex);
         }
@@ -460,7 +466,9 @@ internal sealed class IoUringConnection : ConnectionContext
             return ValueTask.CompletedTask;
 
         _connectionCts.Cancel();
-        _inputPipe.Reader.Complete();
+        // Complete both sides of both pipes. By the time Kestrel calls DisposeAsync,
+        // it has finished reading from the input pipe.
+        try { _inputPipe.Reader.Complete(); } catch (InvalidOperationException) { }
         try { _inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
         try { _outputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
 
@@ -475,7 +483,8 @@ internal sealed class IoUringConnection : ConnectionContext
             completion?.SetResult(-1);
         }
 
-        _connectionCts.Dispose();
+        // Don't dispose _connectionCts — Kestrel may still read ConnectionClosed token
+        // after DisposeAsync returns. The CTS is collected by the GC.
 
         return ValueTask.CompletedTask;
     }

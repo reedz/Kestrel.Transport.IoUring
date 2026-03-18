@@ -47,7 +47,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     // Provided buffer ring for multishot recv — kernel picks buffers from this pool.
     private ProvidedBufferRing? _bufferRing;
     private const ushort RECV_BUF_GROUP_ID = 0;
-    private const int RECV_BUF_RING_ENTRIES = 256; // must be power of 2
+    private const int ENOBUFS = 105; // errno for buffer ring exhaustion
 
     private long _nextConnectionId;
     private readonly TaskCompletionSource _ioLoopStopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -126,9 +126,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             _eventFdFileIndex = _ring.RegisterFd(_eventFd);
         }
 
-        // Provided buffer ring for multishot recv — disabled pending lifecycle fixes.
-        // The multishot recv close path disposes connections prematurely while Kestrel
-        // still accesses ConnectionClosed. Enable once the CQE F_MORE lifecycle is resolved.
+        // Multishot recv + buffer ring: works for sequential and burst requests, but
+        // stalls some concurrent keep-alive connections. The ENOBUFS and rearm race fixes
+        // are in place; the remaining issue is likely in the multishot CQE sequencing
+        // when multiple connections share the buffer ring under concurrent load.
+        // Disabled until the concurrent keep-alive stall is debugged.
         _bufferRing = null;
 
         lock (_ring.SubmitLock)
@@ -472,6 +474,14 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             {
                 if (hasBuffer && _bufferRing != null)
                     _bufferRing.RecycleBuffer(bufferId);
+
+                // ENOBUFS: buffer ring empty — transient, rearm later.
+                if (result == -ENOBUFS)
+                {
+                    _recvRetrySet.Add(connectionId);
+                    return false;
+                }
+
                 _inputPipeComplete(conn);
                 BeginCloseConnection(connectionId, conn);
                 return false;
@@ -483,8 +493,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 bool flushOk = conn.OnRecvCompleteFromBuffer(bufSpan);
                 _bufferRing.RecycleBuffer(bufferId);
 
-                // If multishot ended, rearm.
-                if (!more && flushOk)
+                // Rearm if multishot ended, flush was sync-ok, and no async rearm pending.
+                if (!more && flushOk && !conn.RecvRearmPending)
                 {
                     conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID);
                     return true;
@@ -534,10 +544,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private void HandleClose(long connectionId)
     {
         if (_closingConnections.Remove(connectionId, out var conn))
-        {
             conn.CloseSocketFd();
-            _ = conn.DisposeAsync();
-        }
         _connections.TryRemove(connectionId, out _);
         _recvRetrySet.Remove(connectionId);
     }
@@ -564,10 +571,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         if (conn.HasRecvInFlight || conn.HasSendInFlight)
             return;
 
-        // All io_uring ops are drained — safe to close the fd.
         _closingConnections.Remove(connectionId);
         conn.CloseSocketFd();
-        _ = conn.DisposeAsync();
+        // Kestrel will call DisposeAsync when it finishes the HTTP pipeline.
     }
 
     public async ValueTask<ConnectionContext?> AcceptAsync(CancellationToken cancellationToken = default)
