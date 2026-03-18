@@ -1,0 +1,24 @@
+## .NET Build artifacts
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+## NuGet
+*.nupkg
+*.snupkg
+packages/
+nuget.config
+
+## Rider
+.idea/
+
+## VS Code
+.vscode/
+
+## macOS
+.DS_Store
+
+## BenchmarkDotNet artifacts
+BenchmarkDotNet.Artifacts/
