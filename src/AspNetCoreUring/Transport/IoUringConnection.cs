@@ -14,15 +14,17 @@ namespace AspNetCoreUring.Transport;
 /// <summary>A pending send operation queued from the output-drain task to the IO-loop thread.</summary>
 internal readonly struct PendingSend
 {
-    public readonly int ConnectionId;
+    public readonly long ConnectionId;
     public readonly MemoryHandle Handle;
+    public readonly nint Pointer;
     public readonly uint Length;
     public readonly TaskCompletionSource<int> Completion;
 
-    public PendingSend(int connectionId, MemoryHandle handle, uint length, TaskCompletionSource<int> completion)
+    public PendingSend(long connectionId, MemoryHandle handle, nint pointer, uint length, TaskCompletionSource<int> completion)
     {
         ConnectionId = connectionId;
         Handle = handle;
+        Pointer = pointer;
         Length = length;
         Completion = completion;
     }
@@ -33,15 +35,15 @@ internal sealed class IoUringConnection : ConnectionContext
     private const ulong OpTypeMask = 0xFF;
     private const int ConnectionIdShift = 8;
 
-    public enum OpType : byte { Accept = 0, Recv = 1, Send = 2, Close = 3 }
+    public enum OpType : byte { Accept = 0, Recv = 1, Send = 2, Close = 3, Cancel = 4 }
 
-    public static ulong EncodeUserData(int connectionId, OpType opType) =>
+    public static ulong EncodeUserData(long connectionId, OpType opType) =>
         ((ulong)connectionId << ConnectionIdShift) | (byte)opType;
 
-    public static (int ConnectionId, OpType OpType) DecodeUserData(ulong userData) =>
-        ((int)(userData >> ConnectionIdShift), (OpType)(userData & OpTypeMask));
+    public static (long ConnectionId, OpType OpType) DecodeUserData(ulong userData) =>
+        ((long)(userData >> ConnectionIdShift), (OpType)(userData & OpTypeMask));
 
-    private readonly int _connectionId;
+    private readonly long _connectionId;
     private readonly int _socketFd;
     private readonly Ring _ring;
     private readonly ILogger _logger;
@@ -54,16 +56,28 @@ internal sealed class IoUringConnection : ConnectionContext
     // Callback registered by the listener so the output drain task can enqueue sends.
     private Action<PendingSend>? _enqueueSend;
 
+    // Callback to request a RECV resubmission from the IO loop after async flush completes.
+    private Action<long>? _requestRecvResubmit;
+
     public override string ConnectionId { get; set; }
     public override IFeatureCollection Features { get; } = new FeatureCollection();
     public override IDictionary<object, object?> Items { get; set; } = new Dictionary<object, object?>();
     public override IDuplexPipe Transport { get; set; }
 
     public int SocketFd => _socketFd;
-    public int NumericConnectionId => _connectionId;
+    public long NumericConnectionId => _connectionId;
+
+    /// <summary>Tracks whether a RECV SQE is currently in-flight for this connection.</summary>
+    internal bool HasRecvInFlight { get; set; }
+
+    /// <summary>Tracks whether a SEND SQE is currently in-flight for this connection.</summary>
+    internal bool HasSendInFlight { get; set; }
+
+    /// <summary>Set when the connection is shutting down (recv returned ≤0 or abort called).</summary>
+    internal bool IsClosing { get; set; }
 
     public IoUringConnection(
-        int connectionId,
+        long connectionId,
         int socketFd,
         Ring ring,
         EndPoint? remoteEndPoint,
@@ -96,7 +110,10 @@ internal sealed class IoUringConnection : ConnectionContext
     // _recvHandle is only accessed from the single IO loop thread — no lock needed.
     private MemoryHandle _recvHandle;
 
-    public unsafe void SubmitRecv()
+    /// <summary>
+    /// Submits a RECV SQE. Returns false if the SQ is full (caller should retry later).
+    /// </summary>
+    public unsafe bool SubmitRecv()
     {
         Memory<byte> buffer = _inputPipe.Writer.GetMemory(_receiveBufferSize);
         _recvHandle = buffer.Pin();
@@ -108,71 +125,93 @@ internal sealed class IoUringConnection : ConnectionContext
             sqe->AddrOrSpliceOffIn = (ulong)_recvHandle.Pointer;
             sqe->Len = (uint)buffer.Length;
             sqe->UserData = EncodeUserData(_connectionId, OpType.Recv);
+            HasRecvInFlight = true;
+            return true;
         }
-        else
-        {
-            _recvHandle.Dispose();
-            _recvHandle = default;
-        }
+
+        _recvHandle.Dispose();
+        _recvHandle = default;
+        return false;
     }
 
-    // Called from IO loop thread only.
-    private PendingSend _inFlightSend;
-    private bool _hasSendInFlight;
-
-    public unsafe void SubmitSend(in PendingSend pending)
+    public unsafe bool SubmitSend(in PendingSend pending)
     {
-        _inFlightSend = pending;
-        _hasSendInFlight = true;
-
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
             sqe->Opcode = IoUringConstants.IORING_OP_SEND;
             sqe->Fd = _socketFd;
-            sqe->AddrOrSpliceOffIn = (ulong)pending.Handle.Pointer;
+            sqe->AddrOrSpliceOffIn = (ulong)pending.Pointer;
             sqe->Len = pending.Length;
             sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
+            HasSendInFlight = true;
+            return true;
         }
-        else
-        {
-            // Ring full — complete with 0 so the drain task retries.
-            _hasSendInFlight = false;
-            pending.Handle.Dispose();
-            pending.Completion.TrySetResult(0);
-        }
+
+        // Ring full — complete with 0 so the drain task retries.
+        pending.Handle.Dispose();
+        pending.Completion.TrySetResult(0);
+        return false;
     }
 
-    public bool HasSendInFlight => _hasSendInFlight;
-
-    public void OnRecvComplete(int bytesRead)
+    /// <summary>
+    /// Called on the IO loop thread when a RECV CQE completes.
+    /// Returns true if a new RECV should be immediately resubmitted.
+    /// </summary>
+    public bool OnRecvComplete(int bytesRead)
     {
+        HasRecvInFlight = false;
         _recvHandle.Dispose();
         _recvHandle = default;
 
         if (bytesRead <= 0)
         {
             _inputPipe.Writer.Complete();
-            return;
+            return false;
         }
 
         _inputPipe.Writer.Advance(bytesRead);
-        var flushResult = _inputPipe.Writer.FlushAsync();
-        if (!flushResult.IsCompleted)
+        var flushTask = _inputPipe.Writer.FlushAsync();
+
+        if (flushTask.IsCompleted)
         {
-            // We're on the IO loop thread — synchronously wait for back-pressure.
-            flushResult.AsTask().GetAwaiter().GetResult();
+            var flushResult = flushTask.Result;
+            if (flushResult.IsCompleted || flushResult.IsCanceled)
+            {
+                _inputPipe.Writer.Complete();
+                return false;
+            }
+            return true; // Resubmit RECV immediately.
         }
-        else if (flushResult.Result.IsCompleted || flushResult.Result.IsCanceled)
+
+        // Flush is async (back-pressure). Don't block the IO loop — defer recv resubmission.
+        _ = WaitForFlushThenRequestRecv(flushTask);
+        return false;
+    }
+
+    private async Task WaitForFlushThenRequestRecv(ValueTask<FlushResult> flushTask)
+    {
+        try
         {
-            _inputPipe.Writer.Complete();
+            var result = await flushTask.ConfigureAwait(false);
+            if (result.IsCompleted || result.IsCanceled)
+            {
+                _inputPipe.Writer.Complete();
+                return;
+            }
+
+            // Request the IO loop to resubmit RECV for this connection.
+            _requestRecvResubmit?.Invoke(_connectionId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Flush failed for connection {Id}", _connectionId);
+            _inputPipe.Writer.Complete(ex);
         }
     }
 
-    public void OnSendComplete(int bytesSent)
+    public void OnSendComplete(int bytesSent, PendingSend pending)
     {
-        _hasSendInFlight = false;
-        var pending = _inFlightSend;
-        _inFlightSend = default;
+        HasSendInFlight = false;
         pending.Handle.Dispose();
         pending.Completion.TrySetResult(bytesSent);
     }
@@ -181,9 +220,10 @@ internal sealed class IoUringConnection : ConnectionContext
     /// Starts the background output-drain loop that reads from the application's output pipe
     /// and submits SEND SQEs via <paramref name="enqueueSend"/>.
     /// </summary>
-    public void StartOutputDrain(Action<PendingSend> enqueueSend)
+    public void StartOutputDrain(Action<PendingSend> enqueueSend, Action<long> requestRecvResubmit)
     {
         _enqueueSend = enqueueSend;
+        _requestRecvResubmit = requestRecvResubmit;
         _ = RunOutputDrainAsync();
     }
 
@@ -209,33 +249,49 @@ internal sealed class IoUringConnection : ConnectionContext
                 SequencePosition consumed = buffer.Start;
                 bool error = false;
 
-                // Submit each contiguous segment as a separate SEND and await its completion.
                 foreach (ReadOnlyMemory<byte> segment in buffer)
                 {
                     if (segment.IsEmpty) continue;
 
-                    var sendCompletion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
-                    var handle = segment.Pin();
-                    _enqueueSend!(new PendingSend(_connectionId, handle, (uint)segment.Length, sendCompletion));
+                    // Handle partial sends by retrying the remainder of each segment.
+                    int offset = 0;
+                    int remaining = segment.Length;
 
-                    int sent;
-                    try
+                    while (remaining > 0)
                     {
-                        // WaitAsync ensures a cancellation from DisposeAsync unblocks us.
-                        sent = await sendCompletion.Task.WaitAsync(ct).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        error = true;
-                        break;
+                        var slice = segment.Slice(offset, remaining);
+                        var sendCompletion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        var handle = slice.Pin();
+                        unsafe
+                        {
+                            _enqueueSend!(new PendingSend(
+                                _connectionId, handle, (nint)handle.Pointer,
+                                (uint)remaining, sendCompletion));
+                        }
+
+                        int sent;
+                        try
+                        {
+                            sent = await sendCompletion.Task.WaitAsync(ct).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            error = true;
+                            break;
+                        }
+
+                        if (sent <= 0)
+                        {
+                            error = true;
+                            break;
+                        }
+
+                        offset += sent;
+                        remaining -= sent;
                     }
 
-                    if (sent <= 0)
-                    {
-                        error = true;
-                        break;
-                    }
-                    consumed = buffer.GetPosition(sent, consumed);
+                    if (error) break;
+                    consumed = buffer.GetPosition(segment.Length, consumed);
                 }
 
                 try
@@ -244,7 +300,6 @@ internal sealed class IoUringConnection : ConnectionContext
                 }
                 catch (InvalidOperationException)
                 {
-                    // Reader was completed concurrently (connection disposed). Exit cleanly.
                     return;
                 }
 
@@ -261,33 +316,46 @@ internal sealed class IoUringConnection : ConnectionContext
         }
     }
 
+    public override void Abort(ConnectionAbortedException abortReason)
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+            return;
+        _connectionCts.Cancel();
+        _inputPipe.Writer.Complete(abortReason);
+        _outputPipe.Writer.Complete(abortReason);
+    }
+
     public override ValueTask DisposeAsync()
     {
-        // Atomically check-and-set to prevent double-dispose from concurrent callers.
         if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
             return ValueTask.CompletedTask;
 
         _connectionCts.Cancel();
         _inputPipe.Reader.Complete();
-        _inputPipe.Writer.Complete();
+        try { _inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
         // NOTE: Do NOT complete _outputPipe.Reader here — RunOutputDrainAsync owns it and
         // completes it in its finally block after the cancellation token fires.
-        _outputPipe.Writer.Complete();
+        try { _outputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
 
-        // If a send is still in flight, complete its TCS so the drain task unblocks.
-        if (_hasSendInFlight)
-        {
-            _hasSendInFlight = false;
-            _inFlightSend.Handle.Dispose();
-            _inFlightSend.Completion.TrySetResult(-1);
-            _inFlightSend = default;
-        }
-
-        if (Libc.close(_socketFd) < 0)
-            _logger.LogWarning("close(fd={Fd}) failed with errno {Errno}", _socketFd, Marshal.GetLastPInvokeError());
+        // The socket fd will be closed by the listener after all in-flight io_uring ops complete.
+        // See IoUringConnectionListener.CloseConnection.
         _connectionCts.Dispose();
 
         return ValueTask.CompletedTask;
+    }
+
+    /// <summary>Closes the socket fd. Called by the listener after in-flight ops are drained.</summary>
+    internal void CloseSocketFd()
+    {
+        if (Libc.close(_socketFd) < 0)
+            _logger.LogWarning("close(fd={Fd}) failed with errno {Errno}", _socketFd, Marshal.GetLastPInvokeError());
+    }
+
+    /// <summary>Disposes any pinned recv buffer still held (e.g. during forced shutdown).</summary>
+    internal void CleanupRecvHandle()
+    {
+        _recvHandle.Dispose();
+        _recvHandle = default;
     }
 
     private sealed class DuplexPipe(PipeReader reader, PipeWriter writer) : IDuplexPipe

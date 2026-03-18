@@ -52,4 +52,16 @@ internal static class IoUringConstants
 
     /// <summary>User-data sentinel for the persistent eventfd READ SQE used to wake the IO loop on sends.</summary>
     public const ulong EVENTFD_USER_DATA = ulong.MaxValue - 1;
+
+    // Socket option constants for setsockopt.
+    public const int SOL_SOCKET = 1;
+    public const int SO_REUSEADDR = 2;
+    public const int IPPROTO_TCP = 6;
+    public const int TCP_NODELAY = 1;
+
+    // errno constants.
+    public const int ENOSYS = 38;
+    public const int EINTR = 4;
+    public const int EPERM = 1;
+    public const int EAGAIN = 11;
 }

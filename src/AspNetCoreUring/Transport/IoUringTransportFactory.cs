@@ -44,7 +44,7 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
             return _socketFallback.Value.BindAsync(endpoint, cancellationToken);
         }
 
-        var ring = new Ring((uint)_options.RingSize);
+        var ring = new Ring((uint)_options.EffectiveRingSize);
         var logger = _loggerFactory.CreateLogger<IoUringConnectionListener>();
         var listener = new IoUringConnectionListener(endpoint, ring, _options, logger);
         listener.Bind(_options.ListenBacklog);

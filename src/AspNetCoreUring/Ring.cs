@@ -31,8 +31,8 @@ public sealed class Ring : IDisposable
                     return true;
                 }
                 int err = Marshal.GetLastPInvokeError();
-                // ENOSYS = 38 means syscall not available
-                return err != 38;
+                // ENOSYS = syscall not available; EPERM = blocked by seccomp/permissions.
+                return err != IoUringConstants.ENOSYS && err != IoUringConstants.EPERM;
             }
         }
         catch
@@ -73,10 +73,17 @@ public sealed class Ring : IDisposable
         if (toSubmit == 0)
             return 0;
 
-        int ret = IoUringNative.IoUringEnter(_ringFd, toSubmit, 0, 0);
-        if (ret < 0)
+        int ret;
+        while (true)
         {
+            ret = IoUringNative.IoUringEnter(_ringFd, toSubmit, 0, 0);
+            if (ret >= 0)
+                break;
             int err = Marshal.GetLastPInvokeError();
+            if (err == IoUringConstants.EINTR)
+                continue;
+            if (err == IoUringConstants.EAGAIN)
+                return 0; // SQ ring full; caller should retry later.
             throw new InvalidOperationException($"io_uring_enter (submit) failed with errno {err}");
         }
         return ret;
@@ -89,10 +96,19 @@ public sealed class Ring : IDisposable
         if (_sq.NeedsWakeup)
             flags |= IoUringConstants.IORING_ENTER_SQ_WAKEUP;
 
-        int ret = IoUringNative.IoUringEnter(_ringFd, toSubmit, minComplete, flags);
-        if (ret < 0)
+        int ret;
+        while (true)
         {
+            ret = IoUringNative.IoUringEnter(_ringFd, toSubmit, minComplete, flags);
+            if (ret >= 0)
+                break;
             int err = Marshal.GetLastPInvokeError();
+            if (err == IoUringConstants.EINTR)
+            {
+                // After the first attempt, don't resubmit already-flushed SQEs.
+                toSubmit = 0;
+                continue;
+            }
             throw new InvalidOperationException($"io_uring_enter (wait) failed with errno {err}");
         }
         return ret;
@@ -103,6 +119,9 @@ public sealed class Ring : IDisposable
     public void AdvanceCompletion() => _cq.AdvanceHead();
 
     public uint AvailableCompletions => _cq.Available;
+
+    /// <summary>Returns the kernel's CQ overflow counter. Non-zero means completions were dropped.</summary>
+    internal uint CqOverflowCount => _cq.OverflowCount;
 
     public void Dispose()
     {

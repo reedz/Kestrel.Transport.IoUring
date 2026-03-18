@@ -14,6 +14,7 @@ internal sealed unsafe class CompletionQueue : IDisposable
     private readonly uint* _tail;
     private readonly uint* _ringMask;
     private readonly uint* _ringEntries;
+    private readonly uint* _overflow;
     private readonly IoUringCqe* _cqes;
 
     public CompletionQueue(int ringFd, in IoUringParams p)
@@ -39,6 +40,7 @@ internal sealed unsafe class CompletionQueue : IDisposable
         _tail = (uint*)(ringBase + p.CqOff.Tail);
         _ringMask = (uint*)(ringBase + p.CqOff.RingMask);
         _ringEntries = (uint*)(ringBase + p.CqOff.RingEntries);
+        _overflow = (uint*)(ringBase + p.CqOff.Overflow);
         _cqes = (IoUringCqe*)(ringBase + p.CqOff.Cqes);
     }
 
@@ -65,6 +67,9 @@ internal sealed unsafe class CompletionQueue : IDisposable
     }
 
     public uint Available => Volatile.Read(ref *_tail) - Volatile.Read(ref *_head);
+
+    /// <summary>Returns the kernel's CQ overflow counter (non-zero means completions were lost).</summary>
+    public uint OverflowCount => Volatile.Read(ref *_overflow);
 
     public void Dispose()
     {
