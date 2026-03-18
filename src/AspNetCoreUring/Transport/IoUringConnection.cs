@@ -215,6 +215,8 @@ internal sealed class IoUringConnection : ConnectionContext
     // Safe because io_uring_enter syscall acts as a memory barrier between the two.
     private MemoryHandle _sendHandle;
     private PooledSendCompletion? _sendCompletion;
+    private MemoryHandle _sendZcPendingHandle;
+    internal bool SendZcNotifPending { get; set; }
 
     public unsafe bool SubmitSend(in PendingSend pending)
     {
@@ -250,7 +252,9 @@ internal sealed class IoUringConnection : ConnectionContext
         {
             if (_ring.TryGetSqe(out IoUringSqe* sqe))
             {
-                sqe->Opcode = IoUringConstants.IORING_OP_SEND;
+                sqe->Opcode = data.Length > 4096
+                    ? IoUringConstants.IORING_OP_SEND_ZC
+                    : IoUringConstants.IORING_OP_SEND;
                 SetSqeFd(sqe);
                 sqe->AddrOrSpliceOffIn = (ulong)handle.Pointer;
                 sqe->Len = (uint)data.Length;
@@ -284,10 +288,31 @@ internal sealed class IoUringConnection : ConnectionContext
     /// Called by the IO loop when a SEND CQE completes.
     /// Signals the drain task that submitted this send.
     /// </summary>
-    internal void CompleteSend(int bytesSent)
+    internal void CompleteSend(int bytesSent, uint cqeFlags)
     {
-        HasSendInFlight = false;
-        _sendHandle.Dispose();
+        bool isNotif = (cqeFlags & IoUringConstants.IORING_CQE_F_NOTIF) != 0;
+        if (isNotif)
+        {
+            // NOTIF CQE: zero-copy buffer released. Allow next send.
+            HasSendInFlight = false;
+            _sendZcPendingHandle.Dispose();
+            _sendZcPendingHandle = default;
+            SendZcNotifPending = false;
+            return;
+        }
+        bool hasMore = (cqeFlags & IoUringConstants.IORING_CQE_F_MORE) != 0;
+        if (hasMore)
+        {
+            // SEND_ZC first CQE: keep handle alive until NOTIF.
+            _sendZcPendingHandle = _sendHandle;
+            SendZcNotifPending = true;
+        }
+        else
+        {
+            // Regular SEND: free handle immediately.
+            HasSendInFlight = false;
+            _sendHandle.Dispose();
+        }
         _sendHandle = default;
         var completion = _sendCompletion;
         _sendCompletion = null;
@@ -482,6 +507,8 @@ internal sealed class IoUringConnection : ConnectionContext
             _sendCompletion = null;
             completion?.SetResult(-1);
         }
+
+        if (SendZcNotifPending) { _sendZcPendingHandle.Dispose(); SendZcNotifPending = false; }
 
         // Don't dispose _connectionCts — Kestrel may still read ConnectionClosed token
         // after DisposeAsync returns. The CTS is collected by the GC.

@@ -354,7 +354,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                     if (recvSubmitted) needsSubmit = true;
                     break;
                 case IoUringConnection.OpType.Send:
-                    HandleSend(connectionId, cqe.Res);
+                    HandleSend(connectionId, cqe.Res, cqe.Flags);
                     break;
                 case IoUringConnection.OpType.Close:
                     HandleClose(connectionId);
@@ -526,18 +526,17 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         try { conn.CompleteInputWriter(); } catch { }
     }
 
-    private void HandleSend(long connectionId, int result)
+    private void HandleSend(long connectionId, int result, uint cqeFlags)
     {
-        // Check closing connections first.
+        bool isNotif = (cqeFlags & IoUringConstants.IORING_CQE_F_NOTIF) != 0;
         if (_closingConnections.TryGetValue(connectionId, out var closingConn))
         {
-            closingConn.CompleteSend(-1);
-            TryFinalizeClose(connectionId, closingConn);
+            closingConn.CompleteSend(isNotif ? 0 : -1, cqeFlags);
+            if (!isNotif) TryFinalizeClose(connectionId, closingConn);
             return;
         }
-
         if (_connections.TryGetValue(connectionId, out var conn))
-            conn.CompleteSend(result);
+            conn.CompleteSend(result, cqeFlags);
     }
 
     private void HandleClose(long connectionId)
@@ -567,7 +566,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     /// </summary>
     private unsafe void TryFinalizeClose(long connectionId, IoUringConnection conn)
     {
-        if (conn.HasRecvInFlight || conn.HasSendInFlight)
+        if (conn.HasRecvInFlight || conn.HasSendInFlight || conn.SendZcNotifPending)
             return;
 
         _closingConnections.Remove(connectionId);

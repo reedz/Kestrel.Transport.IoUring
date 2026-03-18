@@ -75,7 +75,8 @@ internal static class IoUringConstants
 
     // CQE flags.
     public const uint IORING_CQE_F_BUFFER = 1u << 0; // CQE has buffer ID in upper flags
-    public const uint IORING_CQE_F_MORE = 1u << 1;   // multishot: more CQEs will follow
+    public const uint IORING_CQE_F_MORE = 1u << 1;
+    public const uint IORING_CQE_F_NOTIF = 1u << 3;   // multishot: more CQEs will follow
 
     // CQE buffer ID extraction.
     public const int IORING_CQE_BUFFER_SHIFT = 16;
@@ -98,5 +99,5 @@ internal static class IoUringConstants
     public const byte IOSQE_FIXED_FILE = 1 << 0;
 
     // Send zero-copy.
-    public const byte IORING_OP_SEND_ZC = 53;
+    public const byte IORING_OP_SEND_ZC = 47;
 }
