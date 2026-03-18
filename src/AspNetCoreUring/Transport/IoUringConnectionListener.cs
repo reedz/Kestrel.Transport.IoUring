@@ -244,6 +244,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 {
                     _ring.SubmitAndWait(1);
                     ProcessCompletions();
+                    // Submit drain-task SQEs that were flushed while we processed CQEs.
+                    _ring.Submit();
                 }
                 catch (OperationCanceledException)
                 {
@@ -420,7 +422,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                     _logger);
 
                 _connections[connId] = conn;
-                conn.StartOutputDrain(RequestRecvResubmit);
+                conn.StartOutputDrain(RequestRecvResubmit, WakeIoLoop);
 
                 // Submit multishot recv if buffer ring is available; otherwise single-shot.
                 if (_bufferRing != null)
