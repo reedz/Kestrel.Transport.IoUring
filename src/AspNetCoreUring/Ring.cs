@@ -18,6 +18,14 @@ public sealed class Ring : IDisposable
     private readonly nuint _cqMapSize;  // 0 when singleMmap
     private readonly bool _singleMmap;
 
+    /// <summary>
+    /// Lock protecting SQ ring access (TryGetSqe, Flush).
+    /// Callers must hold this lock while calling <see cref="TryGetSqe"/> and filling the SQE.
+    /// <see cref="Submit"/> and <see cref="SubmitAndWait"/> acquire it internally for Flush.
+    /// io_uring_enter is called OUTSIDE this lock — the kernel serializes concurrent Enter calls.
+    /// </summary>
+    internal readonly object SubmitLock = new();
+
     private bool _disposed;
 
     public static bool IsSupported { get; private set; }
@@ -141,33 +149,29 @@ public sealed class Ring : IDisposable
 
     public int Submit()
     {
-        uint toSubmit = _sq.Flush();
+        uint toSubmit;
+        lock (SubmitLock) { toSubmit = _sq.Flush(); }
         if (toSubmit == 0)
             return 0;
-
-        int ret;
-        while (true)
-        {
-            ret = IoUringNative.IoUringEnter(_ringFd, toSubmit, 0, 0);
-            if (ret >= 0)
-                break;
-            int err = Marshal.GetLastPInvokeError();
-            if (err == IoUringConstants.EINTR)
-                continue;
-            if (err == IoUringConstants.EAGAIN)
-                return 0; // SQ ring full; caller should retry later.
-            throw new InvalidOperationException($"io_uring_enter (submit) failed with errno {err}");
-        }
-        return ret;
+        return Enter(toSubmit, 0, 0);
     }
 
     public int SubmitAndWait(uint minComplete)
     {
-        uint toSubmit = _sq.Flush();
+        uint toSubmit;
+        lock (SubmitLock) { toSubmit = _sq.Flush(); }
         uint flags = minComplete > 0 ? IoUringConstants.IORING_ENTER_GETEVENTS : 0u;
         if (_sq.NeedsWakeup)
             flags |= IoUringConstants.IORING_ENTER_SQ_WAKEUP;
+        return Enter(toSubmit, minComplete, flags);
+    }
 
+    /// <summary>
+    /// Calls io_uring_enter. Thread-safe — the kernel serializes concurrent calls.
+    /// Called OUTSIDE SubmitLock.
+    /// </summary>
+    private int Enter(uint toSubmit, uint minComplete, uint flags)
+    {
         int ret;
         while (true)
         {
@@ -177,11 +181,12 @@ public sealed class Ring : IDisposable
             int err = Marshal.GetLastPInvokeError();
             if (err == IoUringConstants.EINTR)
             {
-                // After the first attempt, don't resubmit already-flushed SQEs.
                 toSubmit = 0;
                 continue;
             }
-            throw new InvalidOperationException($"io_uring_enter (wait) failed with errno {err}");
+            if (err == IoUringConstants.EAGAIN)
+                return 0;
+            throw new InvalidOperationException($"io_uring_enter failed with errno {err}");
         }
         return ret;
     }

@@ -53,9 +53,6 @@ internal sealed class IoUringConnection : ConnectionContext
     private readonly Pipe _outputPipe;
     private int _disposed;
 
-    // Callback registered by the listener so the output drain task can enqueue sends.
-    private Action<PendingSend>? _enqueueSend;
-
     // Callback to request a RECV resubmission from the IO loop after async flush completes.
     private Action<long>? _requestRecvResubmit;
 
@@ -134,6 +131,11 @@ internal sealed class IoUringConnection : ConnectionContext
         return false;
     }
 
+    // Send state — written by drain task, read by IO loop after CQE arrives.
+    // Safe because io_uring_enter syscall acts as a memory barrier between the two.
+    private MemoryHandle _sendHandle;
+    private PooledSendCompletion? _sendCompletion;
+
     public unsafe bool SubmitSend(in PendingSend pending)
     {
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
@@ -151,6 +153,65 @@ internal sealed class IoUringConnection : ConnectionContext
         pending.Handle.Dispose();
         pending.Completion.SetResult(0);
         return false;
+    }
+
+    /// <summary>
+    /// Submits a SEND SQE directly from the calling thread (output drain task).
+    /// Acquires the ring lock, fills the SQE, flushes, and submits via io_uring_enter.
+    /// Returns a ValueTask that completes when the kernel finishes the SEND.
+    /// </summary>
+    private unsafe ValueTask<int> SubmitSendDirect(ReadOnlyMemory<byte> data)
+    {
+        var completion = PooledSendCompletion.Rent();
+        var handle = data.Pin();
+
+        bool submitted;
+        lock (_ring.SubmitLock)
+        {
+            if (_ring.TryGetSqe(out IoUringSqe* sqe))
+            {
+                sqe->Opcode = IoUringConstants.IORING_OP_SEND;
+                sqe->Fd = _socketFd;
+                sqe->AddrOrSpliceOffIn = (ulong)handle.Pointer;
+                sqe->Len = (uint)data.Length;
+                sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
+
+                _sendHandle = handle;
+                _sendCompletion = completion;
+                HasSendInFlight = true;
+                submitted = true;
+            }
+            else
+            {
+                submitted = false;
+            }
+        }
+
+        if (submitted)
+        {
+            // Submit outside lock — io_uring_enter is kernel-safe for concurrent calls.
+            _ring.Submit();
+            return completion.AsValueTask();
+        }
+
+        // Ring full — caller should retry.
+        handle.Dispose();
+        completion.SetResult(0);
+        return completion.AsValueTask();
+    }
+
+    /// <summary>
+    /// Called by the IO loop when a SEND CQE completes.
+    /// Signals the drain task that submitted this send.
+    /// </summary>
+    internal void CompleteSend(int bytesSent)
+    {
+        HasSendInFlight = false;
+        _sendHandle.Dispose();
+        _sendHandle = default;
+        var completion = _sendCompletion;
+        _sendCompletion = null;
+        completion?.SetResult(bytesSent);
     }
 
     /// <summary>
@@ -218,11 +279,10 @@ internal sealed class IoUringConnection : ConnectionContext
 
     /// <summary>
     /// Starts the background output-drain loop that reads from the application's output pipe
-    /// and submits SEND SQEs via <paramref name="enqueueSend"/>.
+    /// and submits SEND SQEs directly via the ring (no cross-thread queue).
     /// </summary>
-    public void StartOutputDrain(Action<PendingSend> enqueueSend, Action<long> requestRecvResubmit)
+    public void StartOutputDrain(Action<long> requestRecvResubmit)
     {
-        _enqueueSend = enqueueSend;
         _requestRecvResubmit = requestRecvResubmit;
         _ = RunOutputDrainAsync();
     }
@@ -260,19 +320,12 @@ internal sealed class IoUringConnection : ConnectionContext
                     while (remaining > 0)
                     {
                         var slice = segment.Slice(offset, remaining);
-                        var sendCompletion = PooledSendCompletion.Rent();
-                        var handle = slice.Pin();
-                        unsafe
-                        {
-                            _enqueueSend!(new PendingSend(
-                                _connectionId, handle, (nint)handle.Pointer,
-                                (uint)remaining, sendCompletion));
-                        }
 
+                        // Submit SEND directly from this thread — no eventfd round-trip.
                         int sent;
                         try
                         {
-                            sent = await sendCompletion.AsValueTask().ConfigureAwait(false);
+                            sent = await SubmitSendDirect(slice).ConfigureAwait(false);
                         }
                         catch (OperationCanceledException)
                         {
@@ -333,12 +386,19 @@ internal sealed class IoUringConnection : ConnectionContext
         _connectionCts.Cancel();
         _inputPipe.Reader.Complete();
         try { _inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
-        // NOTE: Do NOT complete _outputPipe.Reader here — RunOutputDrainAsync owns it and
-        // completes it in its finally block after the cancellation token fires.
         try { _outputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
 
-        // The socket fd will be closed by the listener after all in-flight io_uring ops complete.
-        // See IoUringConnectionListener.CloseConnection.
+        // If a send is still in flight, complete its awaiter so the drain task unblocks.
+        if (HasSendInFlight)
+        {
+            HasSendInFlight = false;
+            _sendHandle.Dispose();
+            _sendHandle = default;
+            var completion = _sendCompletion;
+            _sendCompletion = null;
+            completion?.SetResult(-1);
+        }
+
         _connectionCts.Dispose();
 
         return ValueTask.CompletedTask;

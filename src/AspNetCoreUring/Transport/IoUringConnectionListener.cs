@@ -24,12 +24,6 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private readonly int _maxConnections;
     private readonly int _receiveBufferSize;
 
-    // Sends are enqueued from background output-drain tasks and dequeued on the IO-loop thread.
-    private readonly ConcurrentQueue<PendingSend> _pendingSendQueue = new();
-
-    // Per-connection in-flight send tracking — only accessed from the IO loop thread.
-    private readonly Dictionary<long, PendingSend> _inFlightSends = [];
-
     // Connections that need RECV resubmitted (after async pipe flush completes).
     private readonly ConcurrentQueue<long> _recvResubmitQueue = new();
 
@@ -39,12 +33,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     // Connections whose RECV failed due to SQ-full; retry on next IO loop iteration.
     private readonly HashSet<long> _recvRetrySet = [];
 
-    // eventfd used to wake the IO loop immediately when a send is enqueued.
+    // eventfd used to wake the IO loop when recv resubmission is needed.
     private readonly int _eventFd;
-    // Pinned read buffer for the eventfd READ SQE (8 bytes per Linux eventfd spec).
     private readonly ulong[] _eventFdReadBuf;
     private readonly MemoryHandle _eventFdReadHandle;
-    // Pinned write buffer for waking the eventfd (value = 1).
     private readonly ulong[] _eventFdWriteBuf;
     private readonly MemoryHandle _eventFdWriteHandle;
 
@@ -115,8 +107,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _listenSocketFdRefAdded = refAdded;
         _listenSocketFd = (int)_listenSocket.SafeHandle.DangerousGetHandle();
 
-        SubmitAccept();
-        SubmitEventFdRead();
+        lock (_ring.SubmitLock)
+        {
+            SubmitAccept();
+            SubmitEventFdRead();
+        }
         _ring.Submit();
 
         var ioThread = new Thread(RunIoLoop)
@@ -162,18 +157,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
     /// <summary>
     /// Wakes the IO loop immediately by writing to the eventfd.
-    /// Called from output-drain task threads (concurrent with IO loop).
+    /// Called from drain task threads when recv resubmission is needed.
     /// </summary>
     private unsafe void WakeIoLoop()
     {
         Libc.write(_eventFd, Unsafe.AsPointer(ref _eventFdWriteBuf[0]), sizeof(ulong));
-    }
-
-    /// <summary>Enqueues a pending send and wakes the IO loop.</summary>
-    private void EnqueueSend(PendingSend pending)
-    {
-        _pendingSendQueue.Enqueue(pending);
-        WakeIoLoop();
     }
 
     /// <summary>Enqueues a RECV resubmission request and wakes the IO loop.</summary>
@@ -228,36 +216,6 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         finally
         {
             _ioLoopStopped.TrySetResult();
-        }
-    }
-
-    /// <summary>Submits SEND SQEs for connections that have data and no in-flight send.</summary>
-    private void DrainPendingSendQueue()
-    {
-        int count = _pendingSendQueue.Count;
-        for (int i = 0; i < count; i++)
-        {
-            if (!_pendingSendQueue.TryDequeue(out var pending))
-                break;
-
-            // Skip connections with an in-flight send — re-enqueue for later.
-            if (_inFlightSends.ContainsKey(pending.ConnectionId))
-            {
-                _pendingSendQueue.Enqueue(pending);
-                continue;
-            }
-
-            if (_connections.TryGetValue(pending.ConnectionId, out var conn) && !conn.IsClosing)
-            {
-                if (conn.SubmitSend(in pending))
-                    _inFlightSends[pending.ConnectionId] = pending;
-            }
-            else
-            {
-                // Connection gone — cancel the send.
-                pending.Handle.Dispose();
-                pending.Completion.SetResult(-1);
-            }
         }
     }
 
@@ -317,9 +275,12 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
             if (cqe.UserData == IoUringConstants.EVENTFD_USER_DATA)
             {
-                DrainPendingSendQueue();
-                DrainRecvResubmitQueue();
-                SubmitEventFdRead();
+                // Eventfd fired — process recv resubmit requests and re-arm.
+                lock (_ring.SubmitLock)
+                {
+                    DrainRecvResubmitQueue();
+                    SubmitEventFdRead();
+                }
                 needsSubmit = true;
                 continue;
             }
@@ -329,27 +290,26 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             switch (opType)
             {
                 case IoUringConnection.OpType.Accept:
-                    HandleAccept(cqe.Res);
+                    lock (_ring.SubmitLock) { HandleAccept(cqe.Res); }
                     needsSubmit = true;
                     break;
                 case IoUringConnection.OpType.Recv:
-                    if (HandleRecv(connectionId, cqe.Res))
-                        needsSubmit = true;
+                    bool recvSubmitted;
+                    lock (_ring.SubmitLock) { recvSubmitted = HandleRecv(connectionId, cqe.Res); }
+                    if (recvSubmitted) needsSubmit = true;
                     break;
                 case IoUringConnection.OpType.Send:
                     HandleSend(connectionId, cqe.Res);
-                    needsSubmit = true;
                     break;
                 case IoUringConnection.OpType.Close:
                     HandleClose(connectionId);
                     break;
                 case IoUringConnection.OpType.Cancel:
-                    // Cancel completion — no action needed, the original op will also complete.
                     break;
             }
         }
 
-        RetryFailedRecvs();
+        lock (_ring.SubmitLock) { RetryFailedRecvs(); }
 
         if (needsSubmit)
             _ring.Submit();
@@ -393,7 +353,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                     _logger);
 
                 _connections[connId] = conn;
-                conn.StartOutputDrain(EnqueueSend, RequestRecvResubmit);
+                conn.StartOutputDrain(RequestRecvResubmit);
 
                 if (!conn.SubmitRecv())
                     _recvRetrySet.Add(connId);
@@ -443,25 +403,16 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
     private void HandleSend(long connectionId, int result)
     {
-        if (_inFlightSends.Remove(connectionId, out var pending))
+        // Check closing connections first.
+        if (_closingConnections.TryGetValue(connectionId, out var closingConn))
         {
-            // Check closing connections first.
-            if (_closingConnections.TryGetValue(connectionId, out var closingConn))
-            {
-                closingConn.HasSendInFlight = false;
-                pending.Handle.Dispose();
-                pending.Completion.SetResult(-1);
-                TryFinalizeClose(connectionId, closingConn);
-                return;
-            }
-
-            if (_connections.TryGetValue(connectionId, out var conn))
-                conn.OnSendComplete(result, pending);
+            closingConn.CompleteSend(-1);
+            TryFinalizeClose(connectionId, closingConn);
+            return;
         }
 
-        // Try to submit the next queued send for any connection.
-        if (_pendingSendQueue.Count > 0)
-            DrainPendingSendQueue();
+        if (_connections.TryGetValue(connectionId, out var conn))
+            conn.CompleteSend(result);
     }
 
     private void HandleClose(long connectionId)
@@ -472,11 +423,6 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             _ = conn.DisposeAsync();
         }
         _connections.TryRemove(connectionId, out _);
-        if (_inFlightSends.Remove(connectionId, out var pending))
-        {
-            pending.Handle.Dispose();
-            pending.Completion.SetResult(-1);
-        }
         _recvRetrySet.Remove(connectionId);
     }
 
@@ -501,13 +447,6 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     {
         if (conn.HasRecvInFlight || conn.HasSendInFlight)
             return;
-
-        // Cancel any pending sends for this connection.
-        if (_inFlightSends.Remove(connectionId, out var pending))
-        {
-            pending.Handle.Dispose();
-            pending.Completion.SetResult(-1);
-        }
 
         // All io_uring ops are drained — safe to close the fd.
         _closingConnections.Remove(connectionId);
@@ -550,21 +489,6 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     public async ValueTask DisposeAsync()
     {
         await UnbindAsync().ConfigureAwait(false);
-
-        // Cancel any pending sends that were never submitted.
-        while (_pendingSendQueue.TryDequeue(out var pending))
-        {
-            pending.Handle.Dispose();
-            pending.Completion.SetResult(-1);
-        }
-
-        // Dispose in-flight send handles (IO loop has exited, CQEs won't be reaped).
-        foreach (var (_, inflight) in _inFlightSends)
-        {
-            inflight.Handle.Dispose();
-            inflight.Completion.SetResult(-1);
-        }
-        _inFlightSends.Clear();
 
         foreach (var conn in _connections.Values)
         {
