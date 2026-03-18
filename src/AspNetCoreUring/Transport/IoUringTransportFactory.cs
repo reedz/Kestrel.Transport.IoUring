@@ -44,6 +44,15 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
             return _socketFallback.Value.BindAsync(endpoint, cancellationToken);
         }
 
+        if (_options.ThreadCount > 1)
+        {
+            _logger.LogInformation(
+                "Starting io_uring transport with {ThreadCount} rings (SO_REUSEPORT).",
+                _options.ThreadCount);
+            var multiListener = new IoUringMultiListener(endpoint, _options, _loggerFactory);
+            return ValueTask.FromResult<IConnectionListener>(multiListener);
+        }
+
         var ring = new Ring((uint)_options.EffectiveRingSize);
         var logger = _loggerFactory.CreateLogger<IoUringConnectionListener>();
         var listener = new IoUringConnectionListener(endpoint, ring, _options, logger);

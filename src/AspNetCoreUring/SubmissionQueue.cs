@@ -5,13 +5,12 @@ using AspNetCoreUring.Native;
 
 namespace AspNetCoreUring;
 
-internal sealed unsafe class SubmissionQueue : IDisposable
+/// <summary>
+/// View over the mmap'd submission queue ring and SQE array.
+/// Memory ownership is held by <see cref="Ring"/> — this type does not mmap or munmap.
+/// </summary>
+internal sealed unsafe class SubmissionQueue
 {
-    private readonly nint _sqRingPtr;
-    private readonly nuint _sqRingSize;
-    private readonly nint _sqesPtr;
-    private readonly nuint _sqesSize;
-
     private readonly uint* _head;
     private readonly uint* _tail;
     private readonly uint* _ringMask;
@@ -23,42 +22,8 @@ internal sealed unsafe class SubmissionQueue : IDisposable
     private uint _sqeTail;
     private uint _sqeHead;
 
-    public SubmissionQueue(int ringFd, in IoUringParams p)
+    public SubmissionQueue(nint sqRingPtr, nint sqesPtr, in IoUringParams p)
     {
-        uint sqEntries = p.SqEntries;
-        nuint sqRingSize = p.SqOff.Array + sqEntries * sizeof(uint);
-        nuint sqesSize = sqEntries * (nuint)sizeof(IoUringSqe);
-
-        nint sqRingPtr = Libc.mmap(
-            nint.Zero,
-            sqRingSize,
-            IoUringConstants.PROT_READ | IoUringConstants.PROT_WRITE,
-            IoUringConstants.MAP_SHARED | IoUringConstants.MAP_POPULATE,
-            ringFd,
-            (long)IoUringConstants.IORING_OFF_SQ_RING);
-
-        if (sqRingPtr == IoUringConstants.MAP_FAILED)
-            throw new InvalidOperationException($"mmap SQ ring failed: {Marshal.GetLastPInvokeError()}");
-
-        nint sqesPtr = Libc.mmap(
-            nint.Zero,
-            sqesSize,
-            IoUringConstants.PROT_READ | IoUringConstants.PROT_WRITE,
-            IoUringConstants.MAP_SHARED | IoUringConstants.MAP_POPULATE,
-            ringFd,
-            (long)IoUringConstants.IORING_OFF_SQES);
-
-        if (sqesPtr == IoUringConstants.MAP_FAILED)
-        {
-            Libc.munmap(sqRingPtr, sqRingSize);
-            throw new InvalidOperationException($"mmap SQEs failed: {Marshal.GetLastPInvokeError()}");
-        }
-
-        _sqRingPtr = sqRingPtr;
-        _sqRingSize = sqRingSize;
-        _sqesPtr = sqesPtr;
-        _sqesSize = sqesSize;
-
         byte* ringBase = (byte*)sqRingPtr;
         _head = (uint*)(ringBase + p.SqOff.Head);
         _tail = (uint*)(ringBase + p.SqOff.Tail);
@@ -113,10 +78,4 @@ internal sealed unsafe class SubmissionQueue : IDisposable
 
     public bool NeedsWakeup =>
         (Volatile.Read(ref *_flags) & IoUringConstants.IORING_SQ_NEED_WAKEUP) != 0;
-
-    public void Dispose()
-    {
-        Libc.munmap(_sqRingPtr, _sqRingSize);
-        Libc.munmap(_sqesPtr, _sqesSize);
-    }
 }

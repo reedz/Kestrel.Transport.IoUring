@@ -18,6 +18,14 @@ public sealed class IoUringTransportOptions
     public int ReceiveBufferSize { get; set; } = 4096;
 
     /// <summary>
+    /// Number of IO threads (each with its own io_uring ring). Defaults to 1.
+    /// When greater than 1, multiple listen sockets with SO_REUSEPORT are created
+    /// and the kernel distributes incoming connections across them.
+    /// On multi-core servers, set to <c>Environment.ProcessorCount</c> for best throughput.
+    /// </summary>
+    public int ThreadCount { get; set; } = 1;
+
+    /// <summary>
     /// Returns the effective ring size, ensuring it is large enough for the configured
     /// <see cref="MaxConnections"/> (at least <c>2 * MaxConnections + 16</c>, rounded up to
     /// the next power of two).

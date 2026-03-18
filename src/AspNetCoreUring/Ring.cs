@@ -8,6 +8,16 @@ public sealed class Ring : IDisposable
     private readonly int _ringFd;
     private readonly SubmissionQueue _sq;
     private readonly CompletionQueue _cq;
+
+    // mmap regions owned by Ring — disposed in Dispose().
+    private readonly nint _sqRingPtr;
+    private readonly nuint _sqRingMapSize;
+    private readonly nint _sqesPtr;
+    private readonly nuint _sqesSize;
+    private readonly nint _cqRingPtr;   // == _sqRingPtr when singleMmap
+    private readonly nuint _cqMapSize;  // 0 when singleMmap
+    private readonly bool _singleMmap;
+
     private bool _disposed;
 
     public static bool IsSupported { get; private set; }
@@ -55,8 +65,70 @@ public sealed class Ring : IDisposable
 
         try
         {
-            _sq = new SubmissionQueue(fd, in p);
-            _cq = new CompletionQueue(fd, in p);
+            _singleMmap = (p.Features & IoUringConstants.IORING_FEAT_SINGLE_MMAP) != 0;
+
+            nuint sqRingSize = p.SqOff.Array + p.SqEntries * (nuint)sizeof(uint);
+            nuint cqRingSize = p.CqOff.Cqes + p.CqEntries * (nuint)sizeof(IoUringCqe);
+            nuint sqesSize = p.SqEntries * (nuint)sizeof(IoUringSqe);
+
+            // When SINGLE_MMAP is supported, SQ and CQ share one mmap region at IORING_OFF_SQ_RING.
+            nuint ringMapSize = _singleMmap ? Math.Max(sqRingSize, cqRingSize) : sqRingSize;
+
+            nint sqRingPtr = Libc.mmap(
+                nint.Zero, ringMapSize,
+                IoUringConstants.PROT_READ | IoUringConstants.PROT_WRITE,
+                IoUringConstants.MAP_SHARED | IoUringConstants.MAP_POPULATE,
+                fd, (long)IoUringConstants.IORING_OFF_SQ_RING);
+
+            if (sqRingPtr == IoUringConstants.MAP_FAILED)
+                throw new InvalidOperationException($"mmap SQ ring failed: {Marshal.GetLastPInvokeError()}");
+
+            nint sqesPtr = Libc.mmap(
+                nint.Zero, sqesSize,
+                IoUringConstants.PROT_READ | IoUringConstants.PROT_WRITE,
+                IoUringConstants.MAP_SHARED | IoUringConstants.MAP_POPULATE,
+                fd, (long)IoUringConstants.IORING_OFF_SQES);
+
+            if (sqesPtr == IoUringConstants.MAP_FAILED)
+            {
+                Libc.munmap(sqRingPtr, ringMapSize);
+                throw new InvalidOperationException($"mmap SQEs failed: {Marshal.GetLastPInvokeError()}");
+            }
+
+            nint cqRingPtr;
+            nuint cqMapSize;
+
+            if (_singleMmap)
+            {
+                cqRingPtr = sqRingPtr; // shared region
+                cqMapSize = 0;
+            }
+            else
+            {
+                cqMapSize = cqRingSize;
+                cqRingPtr = Libc.mmap(
+                    nint.Zero, cqMapSize,
+                    IoUringConstants.PROT_READ | IoUringConstants.PROT_WRITE,
+                    IoUringConstants.MAP_SHARED | IoUringConstants.MAP_POPULATE,
+                    fd, (long)IoUringConstants.IORING_OFF_CQ_RING);
+
+                if (cqRingPtr == IoUringConstants.MAP_FAILED)
+                {
+                    Libc.munmap(sqesPtr, sqesSize);
+                    Libc.munmap(sqRingPtr, ringMapSize);
+                    throw new InvalidOperationException($"mmap CQ ring failed: {Marshal.GetLastPInvokeError()}");
+                }
+            }
+
+            _sqRingPtr = sqRingPtr;
+            _sqRingMapSize = ringMapSize;
+            _sqesPtr = sqesPtr;
+            _sqesSize = sqesSize;
+            _cqRingPtr = cqRingPtr;
+            _cqMapSize = cqMapSize;
+
+            _sq = new SubmissionQueue(sqRingPtr, sqesPtr, in p);
+            _cq = new CompletionQueue(cqRingPtr, in p);
         }
         catch
         {
@@ -127,8 +199,11 @@ public sealed class Ring : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        _sq.Dispose();
-        _cq.Dispose();
+
+        if (!_singleMmap && _cqMapSize > 0)
+            Libc.munmap(_cqRingPtr, _cqMapSize);
+        Libc.munmap(_sqesPtr, _sqesSize);
+        Libc.munmap(_sqRingPtr, _sqRingMapSize);
         Libc.close(_ringFd);
     }
 }

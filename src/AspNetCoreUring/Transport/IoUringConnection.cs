@@ -18,9 +18,9 @@ internal readonly struct PendingSend
     public readonly MemoryHandle Handle;
     public readonly nint Pointer;
     public readonly uint Length;
-    public readonly TaskCompletionSource<int> Completion;
+    public readonly PooledSendCompletion Completion;
 
-    public PendingSend(long connectionId, MemoryHandle handle, nint pointer, uint length, TaskCompletionSource<int> completion)
+    public PendingSend(long connectionId, MemoryHandle handle, nint pointer, uint length, PooledSendCompletion completion)
     {
         ConnectionId = connectionId;
         Handle = handle;
@@ -149,7 +149,7 @@ internal sealed class IoUringConnection : ConnectionContext
 
         // Ring full — complete with 0 so the drain task retries.
         pending.Handle.Dispose();
-        pending.Completion.TrySetResult(0);
+        pending.Completion.SetResult(0);
         return false;
     }
 
@@ -213,7 +213,7 @@ internal sealed class IoUringConnection : ConnectionContext
     {
         HasSendInFlight = false;
         pending.Handle.Dispose();
-        pending.Completion.TrySetResult(bytesSent);
+        pending.Completion.SetResult(bytesSent);
     }
 
     /// <summary>
@@ -260,7 +260,7 @@ internal sealed class IoUringConnection : ConnectionContext
                     while (remaining > 0)
                     {
                         var slice = segment.Slice(offset, remaining);
-                        var sendCompletion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        var sendCompletion = PooledSendCompletion.Rent();
                         var handle = slice.Pin();
                         unsafe
                         {
@@ -272,7 +272,7 @@ internal sealed class IoUringConnection : ConnectionContext
                         int sent;
                         try
                         {
-                            sent = await sendCompletion.Task.WaitAsync(ct).ConfigureAwait(false);
+                            sent = await sendCompletion.AsValueTask().ConfigureAwait(false);
                         }
                         catch (OperationCanceledException)
                         {

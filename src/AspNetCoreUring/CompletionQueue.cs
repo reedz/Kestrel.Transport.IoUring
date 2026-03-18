@@ -1,15 +1,15 @@
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Threading;
 using AspNetCoreUring.Native;
 
 namespace AspNetCoreUring;
 
-internal sealed unsafe class CompletionQueue : IDisposable
+/// <summary>
+/// View over the mmap'd completion queue ring.
+/// Memory ownership is held by <see cref="Ring"/> — this type does not mmap or munmap.
+/// </summary>
+internal sealed unsafe class CompletionQueue
 {
-    private readonly nint _cqRingPtr;
-    private readonly nuint _cqRingSize;
-
     private readonly uint* _head;
     private readonly uint* _tail;
     private readonly uint* _ringMask;
@@ -17,24 +17,8 @@ internal sealed unsafe class CompletionQueue : IDisposable
     private readonly uint* _overflow;
     private readonly IoUringCqe* _cqes;
 
-    public CompletionQueue(int ringFd, in IoUringParams p)
+    public CompletionQueue(nint cqRingPtr, in IoUringParams p)
     {
-        nuint cqRingSize = p.CqOff.Cqes + p.CqEntries * (nuint)sizeof(IoUringCqe);
-
-        nint cqRingPtr = Libc.mmap(
-            nint.Zero,
-            cqRingSize,
-            IoUringConstants.PROT_READ | IoUringConstants.PROT_WRITE,
-            IoUringConstants.MAP_SHARED | IoUringConstants.MAP_POPULATE,
-            ringFd,
-            (long)IoUringConstants.IORING_OFF_CQ_RING);
-
-        if (cqRingPtr == IoUringConstants.MAP_FAILED)
-            throw new InvalidOperationException($"mmap CQ ring failed: {Marshal.GetLastPInvokeError()}");
-
-        _cqRingPtr = cqRingPtr;
-        _cqRingSize = cqRingSize;
-
         byte* ringBase = (byte*)cqRingPtr;
         _head = (uint*)(ringBase + p.CqOff.Head);
         _tail = (uint*)(ringBase + p.CqOff.Tail);
@@ -70,9 +54,4 @@ internal sealed unsafe class CompletionQueue : IDisposable
 
     /// <summary>Returns the kernel's CQ overflow counter (non-zero means completions were lost).</summary>
     public uint OverflowCount => Volatile.Read(ref *_overflow);
-
-    public void Dispose()
-    {
-        Libc.munmap(_cqRingPtr, _cqRingSize);
-    }
 }

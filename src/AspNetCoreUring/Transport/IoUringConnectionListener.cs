@@ -94,9 +94,12 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _sockOptHandle = _sockOptBuf.AsMemory().Pin();
     }
 
-    public void Bind(int listenBacklog)
+    public void Bind(int listenBacklog, bool reusePort = false)
     {
         _listenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+
+        if (reusePort)
+            SetSocketOption(_listenSocket, IoUringConstants.SOL_SOCKET, IoUringConstants.SO_REUSEPORT);
 
         // Enable dual-stack for IPv6 sockets (accept both IPv4 and IPv6 connections),
         // matching the default Kestrel socket transport behavior.
@@ -190,6 +193,15 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             sizeof(int));
     }
 
+    /// <summary>Sets a socket option on a managed Socket using raw setsockopt.</summary>
+    private unsafe void SetSocketOption(Socket socket, int level, int optname)
+    {
+        int fd = (int)socket.SafeHandle.DangerousGetHandle();
+        Libc.setsockopt(fd, level, optname,
+            (nint)Unsafe.AsPointer(ref _sockOptBuf[0]),
+            sizeof(int));
+    }
+
     private void RunIoLoop()
     {
         var token = _cts.Token;
@@ -244,7 +256,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             {
                 // Connection gone — cancel the send.
                 pending.Handle.Dispose();
-                pending.Completion.TrySetResult(-1);
+                pending.Completion.SetResult(-1);
             }
         }
     }
@@ -438,7 +450,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             {
                 closingConn.HasSendInFlight = false;
                 pending.Handle.Dispose();
-                pending.Completion.TrySetResult(-1);
+                pending.Completion.SetResult(-1);
                 TryFinalizeClose(connectionId, closingConn);
                 return;
             }
@@ -463,7 +475,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         if (_inFlightSends.Remove(connectionId, out var pending))
         {
             pending.Handle.Dispose();
-            pending.Completion.TrySetResult(-1);
+            pending.Completion.SetResult(-1);
         }
         _recvRetrySet.Remove(connectionId);
     }
@@ -494,7 +506,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         if (_inFlightSends.Remove(connectionId, out var pending))
         {
             pending.Handle.Dispose();
-            pending.Completion.TrySetResult(-1);
+            pending.Completion.SetResult(-1);
         }
 
         // All io_uring ops are drained — safe to close the fd.
@@ -543,14 +555,14 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         while (_pendingSendQueue.TryDequeue(out var pending))
         {
             pending.Handle.Dispose();
-            pending.Completion.TrySetResult(-1);
+            pending.Completion.SetResult(-1);
         }
 
         // Dispose in-flight send handles (IO loop has exited, CQEs won't be reaped).
         foreach (var (_, inflight) in _inFlightSends)
         {
             inflight.Handle.Dispose();
-            inflight.Completion.TrySetResult(-1);
+            inflight.Completion.SetResult(-1);
         }
         _inFlightSends.Clear();
 

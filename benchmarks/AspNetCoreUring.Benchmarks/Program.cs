@@ -1,4 +1,9 @@
-using BenchmarkDotNet.Running;
 using AspNetCoreUring.Benchmarks;
 
-BenchmarkRunner.Run<HttpBenchmark>();
+if (args.Length > 0 && args[0] == "quick")
+{
+    await QuickBench.RunAsync();
+    return;
+}
+
+BenchmarkDotNet.Running.BenchmarkRunner.Run<HttpBenchmark>();

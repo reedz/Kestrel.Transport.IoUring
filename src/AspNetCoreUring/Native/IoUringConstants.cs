@@ -56,6 +56,7 @@ internal static class IoUringConstants
     // Socket option constants for setsockopt.
     public const int SOL_SOCKET = 1;
     public const int SO_REUSEADDR = 2;
+    public const int SO_REUSEPORT = 15;
     public const int IPPROTO_TCP = 6;
     public const int TCP_NODELAY = 1;
 
