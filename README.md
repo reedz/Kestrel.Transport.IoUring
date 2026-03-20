@@ -1,38 +1,46 @@
-# AspNetCoreUring
+# Kestrel.Transport.IoUring
 
-A pluggable **io_uring** transport for [Kestrel](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/kestrel) / ASP.NET Core that replaces the default socket transport with Linux's high-performance `io_uring` interface.
+[![NuGet](https://img.shields.io/nuget/v/Kestrel.Transport.IoUring.svg)](https://www.nuget.org/packages/Kestrel.Transport.IoUring)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+A high-performance **io_uring** transport for [Kestrel](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/kestrel) / ASP.NET Core that replaces the default socket transport with Linux's `io_uring` interface. **Up to 30% faster** at 128+ concurrent connections.
 
 ## Features
 
-- **Zero-allocation** I/O path: unsafe pointer arithmetic directly over `mmap`-backed ring buffers
-- **Drop-in** replacement for the default Kestrel socket transport — one `UseIoUring()` call
-- **Graceful fallback**: detects `ENOSYS` at startup and automatically falls back to the standard socket transport (kernel < 5.1 or non-Linux)
-- Uses `System.IO.Pipelines` for the connection transport (back-pressure, buffer pooling)
-- **eventfd-based wake**: sends are dispatched immediately — no polling delay
-- Targets **net8.0+**, leveraging C# 12 features (primary constructors, collection expressions, `LibraryImport`)
-- Designed to be **published as a NuGet package** (`PackageId: AspNetCoreUring`)
+- **Drop-in replacement** — one `UseIoUring()` call replaces the socket transport
+- **Multishot recv** with **provided buffer rings** — eliminates per-recv memory pinning and SQE resubmission
+- **Zero-copy send** (`SEND_ZC`) for payloads >4KB — avoids kernel buffer copy
+- **Registered files** (`IOSQE_FIXED_FILE`) — kernel skips fd lookup per SQE
+- **Single-issuer IO loop** — dedicated thread for io_uring_enter, drain tasks submit via eventfd wake
+- **Graceful fallback** — auto-detects `ENOSYS`/`EPERM` and falls back to socket transport
+- **Zero-allocation** hot path with pooled `IValueTaskSource` completions
+- **Multi-ring** support via `SO_REUSEPORT` (opt-in `ThreadCount` option)
+- Targets **net8.0**, **net9.0**, **net10.0**
 
 ## Requirements
 
-- Linux with kernel **5.1+** (io_uring support)
+- Linux with kernel **6.0+** (for multishot recv + buffer rings)
+- Kernel **5.1+** works with reduced features (single-shot recv, no buffer rings)
 - .NET 8 or later
-- `libc` available at runtime (standard on all Linux distros)
 
-> **Fallback**: If io_uring is unavailable (`ENOSYS`), a warning is logged and the standard
-> `SocketTransportFactory` is used automatically — your app keeps working.
+> **Fallback**: On unsupported systems, a warning is logged and the standard `SocketTransportFactory` is used — your app keeps working.
+
+## Installation
+
+```bash
+dotnet add package Kestrel.Transport.IoUring
+```
 
 ## Quick Start
 
 ```csharp
 var builder = WebApplication.CreateBuilder(args);
 
-// Replace the default socket transport with io_uring
 builder.WebHost.UseIoUring(options =>
 {
     options.RingSize = 256;           // SQ/CQ ring depth (power of two)
     options.MaxConnections = 1024;    // connection limit
 });
-
 
 var app = builder.Build();
 app.MapGet("/", () => "Hello from io_uring!");
@@ -95,49 +103,40 @@ Host.CreateDefaultBuilder(args)
 | `Transport/IoUringTransportOptions.cs` | `RingSize`, `ThreadCount`, `MaxConnections` |
 | `WebHostBuilderIoUringExtensions.cs` | `UseIoUring()` for `IWebHostBuilder` and `IHostBuilder` |
 
-## Benchmarks
+## Performance
 
-BenchmarkDotNet benchmarks comparing the standard socket transport against the io_uring transport:
+On a 2-core VM (AMD EPYC 9V74, Linux 6.17, .NET 10):
 
-```
-cd benchmarks/AspNetCoreUring.Benchmarks
-dotnet run -c Release
-```
+| Scenario | Socket | io_uring | Improvement |
+|----------|--------|----------|-------------|
+| 128 persistent connections | 17,897 req/s | **23,488 req/s** | **+31%** |
+| 256 persistent connections | 18,800 req/s | **23,785 req/s** | **+27%** |
+| 20K requests @ 128 concurrency | 30,868 req/s | **35,837 req/s** | **+16%** |
 
-The benchmark starts two in-process ASP.NET Core servers (one with each transport) and measures HTTP GET throughput over loopback with `HttpClient`.
+io_uring's advantage grows with connection count. On multi-core servers, the improvement is larger.
 
-### Results (AMD EPYC 7763, 1 CPU / 2 logical cores, .NET 8.0.24, Linux 6.14)
-
-```
-| Method           | Mean     | Error   | StdDev   | Ratio | RatioSD | Allocated | Alloc Ratio |
-|----------------- |---------:|--------:|---------:|------:|--------:|----------:|------------:|
-| SocketTransport  | 111.2 us | 4.22 us | 12.45 us |  1.01 |    0.16 |   3.64 KB |        1.00 |
-| IoUringTransport | 110.0 us | 2.17 us |  5.29 us |  1.00 |    0.13 |   3.89 KB |        1.07 |
-```
-
-> On this single-core CI VM the two transports reach latency parity (~110 µs). On real
-> multi-core server hardware with many concurrent connections, io_uring's advantage
-> comes from amortizing the per-syscall overhead across batches of SQEs — fewer
-> `io_uring_enter` calls per unit of work compared to individual `send(2)`/`recv(2)`.
+See [BENCHMARKS.md](BENCHMARKS.md) for detailed results and methodology.
 
 ## Project Structure
 
 ```
-AspNetCoreUring.slnx
-├── src/AspNetCoreUring/          ← NuGet library (net8.0)
-├── samples/SampleApp/            ← Minimal ASP.NET Core sample
-└── benchmarks/AspNetCoreUring.Benchmarks/  ← BenchmarkDotNet
+├── src/Kestrel.Transport.IoUring/   ← NuGet library (net8.0/net9.0/net10.0)
+├── samples/SampleApp/                ← Minimal ASP.NET Core sample
+└── benchmarks/                        ← Stress benchmarks
 ```
 
-## io_uring Opcodes Used
+## io_uring Features Used
 
-| Opcode | Value | Purpose |
-|--------|-------|---------|
-| `IORING_OP_ACCEPT` | 13 | Accept new TCP connections |
-| `IORING_OP_RECV`   | 27 | Receive data from a connection |
-| `IORING_OP_SEND`   | 26 | Send data to a connection |
-| `IORING_OP_CLOSE`  | 19 | Close a connection's socket fd |
-| `IORING_OP_READ`   | 22 | Read from eventfd (send wake-up) |
+| Feature | Kernel | Purpose |
+|---------|--------|---------|
+| `IORING_OP_ACCEPT` | 5.1+ | Accept new TCP connections |
+| `IORING_OP_RECV` (multishot) | 6.0+ | Receive data with buffer ring selection |
+| `IORING_OP_SEND` | 5.1+ | Send data (small payloads) |
+| `IORING_OP_SEND_ZC` | 6.0+ | Zero-copy send (payloads >4KB) |
+| `IORING_OP_READ` | 5.1+ | eventfd wake for IO loop |
+| `IORING_REGISTER_FILES` | 5.1+ | Registered file descriptors |
+| `IORING_REGISTER_PBUF_RING` | 5.19+ | Provided buffer ring for recv |
+| `IORING_FEAT_SINGLE_MMAP` | 5.4+ | Shared SQ/CQ mmap region |
 
 ## User Data Encoding
 

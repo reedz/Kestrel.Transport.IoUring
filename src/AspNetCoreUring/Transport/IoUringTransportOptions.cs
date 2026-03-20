@@ -1,5 +1,6 @@
 namespace AspNetCoreUring.Transport;
 
+/// <summary>Configuration options for the io_uring transport.</summary>
 public sealed class IoUringTransportOptions
 {
     /// <summary>Depth of the io_uring submission and completion queues (must be a power of two).</summary>

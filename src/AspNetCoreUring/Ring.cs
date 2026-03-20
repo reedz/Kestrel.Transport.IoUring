@@ -3,6 +3,7 @@ using AspNetCoreUring.Native;
 
 namespace AspNetCoreUring;
 
+/// <summary>Managed wrapper around a Linux io_uring instance.</summary>
 public sealed class Ring : IDisposable
 {
     private readonly int _ringFd;
@@ -28,6 +29,7 @@ public sealed class Ring : IDisposable
 
     private bool _disposed;
 
+    /// <summary>Gets a value indicating whether io_uring is supported on this system.</summary>
     public static bool IsSupported { get; private set; }
 
     static Ring()
@@ -59,6 +61,7 @@ public sealed class Ring : IDisposable
         }
     }
 
+    /// <summary>Initializes a new io_uring instance with the specified queue depth.</summary>
     public unsafe Ring(uint entries)
     {
         IoUringParams p = default;
@@ -137,29 +140,12 @@ public sealed class Ring : IDisposable
 
             _sq = new SubmissionQueue(sqRingPtr, sqesPtr, in p);
             _cq = new CompletionQueue(cqRingPtr, in p);
-
-            // Register the ring fd to avoid kernel fd lookup on every io_uring_enter.
-            TryRegisterRingFd();
         }
         catch
         {
             Libc.close(fd);
             throw;
         }
-    }
-
-    private unsafe void TryRegisterRingFd()
-    {
-        // Best-effort: register ring fd for slightly faster io_uring_enter.
-        // Uses a {s32 offset, u32 data} pair. offset=-1 lets kernel pick slot.
-        var regData = stackalloc int[2];
-        regData[0] = -1;
-        regData[1] = _ringFd;
-        IoUringNative.IoUringRegister(
-            _ringFd,
-            IoUringConstants.IORING_REGISTER_RING_FDS,
-            (nint)regData,
-            1);
     }
 
     // ── Registered files (IOSQE_FIXED_FILE) ──
@@ -256,6 +242,7 @@ public sealed class Ring : IDisposable
     /// <summary>The io_uring file descriptor — needed for buffer ring registration.</summary>
     internal int Fd => _ringFd;
 
+    /// <summary>Flushes pending submission queue entries and submits them to the kernel.</summary>
     public int Submit()
     {
         uint toSubmit;
@@ -265,6 +252,7 @@ public sealed class Ring : IDisposable
         return Enter(toSubmit, 0, 0);
     }
 
+    /// <summary>Submits pending entries and waits for at least <paramref name="minComplete"/> completions.</summary>
     public int SubmitAndWait(uint minComplete)
     {
         uint toSubmit;
@@ -308,13 +296,16 @@ public sealed class Ring : IDisposable
 
     internal bool TryPeekCompletion(out IoUringCqe cqe) => _cq.TryPeekCompletion(out cqe);
 
+    /// <summary>Advances the completion queue head past the last peeked entry.</summary>
     public void AdvanceCompletion() => _cq.AdvanceHead();
 
+    /// <summary>Gets the number of completion queue entries ready to be consumed.</summary>
     public uint AvailableCompletions => _cq.Available;
 
     /// <summary>Returns the kernel's CQ overflow counter. Non-zero means completions were dropped.</summary>
     internal uint CqOverflowCount => _cq.OverflowCount;
 
+    /// <summary>Releases all io_uring resources and unmaps shared memory regions.</summary>
     public void Dispose()
     {
         if (_disposed) return;

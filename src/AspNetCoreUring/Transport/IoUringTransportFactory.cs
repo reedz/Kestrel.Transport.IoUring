@@ -8,6 +8,7 @@ using Microsoft.Extensions.Options;
 
 namespace AspNetCoreUring.Transport;
 
+/// <summary>Kestrel connection listener factory backed by io_uring, with automatic socket fallback.</summary>
 public sealed class IoUringTransportFactory : IConnectionListenerFactory
 {
     private readonly IoUringTransportOptions _options;
@@ -16,6 +17,7 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
     // Lazily-created socket fallback — only used when io_uring is unavailable.
     private readonly Lazy<SocketTransportFactory> _socketFallback;
 
+    /// <summary>Initializes a new instance of the <see cref="IoUringTransportFactory"/> class.</summary>
     public IoUringTransportFactory(
         IOptions<IoUringTransportOptions> options,
         IOptions<SocketTransportOptions> socketOptions,
@@ -34,6 +36,7 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
     /// </summary>
     public static bool IsUsingIoUring => Ring.IsSupported;
 
+    /// <inheritdoc />
     public ValueTask<IConnectionListener> BindAsync(EndPoint endpoint, CancellationToken cancellationToken = default)
     {
         if (!Ring.IsSupported)

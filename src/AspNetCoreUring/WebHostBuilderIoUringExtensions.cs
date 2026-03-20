@@ -7,8 +7,10 @@ using Microsoft.Extensions.Hosting;
 
 namespace AspNetCoreUring;
 
+/// <summary>Extension methods for configuring the io_uring transport on <see cref="IWebHostBuilder"/>.</summary>
 public static class WebHostBuilderIoUringExtensions
 {
+    /// <summary>Configures Kestrel to use the io_uring transport.</summary>
     public static IWebHostBuilder UseIoUring(
         this IWebHostBuilder builder,
         Action<IoUringTransportOptions>? configure = null)
@@ -24,8 +26,10 @@ public static class WebHostBuilderIoUringExtensions
     }
 }
 
+/// <summary>Extension methods for configuring the io_uring transport on <see cref="IHostBuilder"/>.</summary>
 public static class HostBuilderIoUringExtensions
 {
+    /// <summary>Configures Kestrel to use the io_uring transport.</summary>
     public static IHostBuilder UseIoUring(
         this IHostBuilder builder,
         Action<IoUringTransportOptions>? configure = null)

@@ -4,8 +4,10 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace AspNetCoreUring;
 
+/// <summary>Extension methods for registering the io_uring transport on <see cref="IServiceCollection"/>.</summary>
 public static class ServiceCollectionIoUringExtensions
 {
+    /// <summary>Registers the io_uring connection listener factory in the service collection.</summary>
     public static IServiceCollection AddIoUringTransport(
         this IServiceCollection services,
         Action<IoUringTransportOptions>? configure = null)
