@@ -7,6 +7,13 @@
     <LangVersion>latest</LangVersion>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
 
+    <!-- Debugging / Source Link -->
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+
     <!-- NuGet package metadata -->
     <PackageId>Kestrel.Transport.IoUring</PackageId>
     <Version>1.0.0</Version>
@@ -21,6 +28,7 @@
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
     <None Include="../../README.md" Pack="true" PackagePath="/" />
     <None Include="../../LICENSE" Pack="true" PackagePath="/" />
   </ItemGroup>

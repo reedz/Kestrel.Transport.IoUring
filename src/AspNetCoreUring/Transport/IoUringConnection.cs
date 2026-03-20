@@ -182,6 +182,7 @@ internal sealed class IoUringConnection : ConnectionContext
         try { _inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
     }
 
+    /// <summary>
     /// Called when a multishot recv CQE completes with data in a provided buffer.
     /// Copies data from the buffer ring into the pipe and flushes.
     /// Returns true if flush completed synchronously (ok to continue receiving).
