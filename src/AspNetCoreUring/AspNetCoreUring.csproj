@@ -20,8 +20,8 @@
     <Authors>reedz</Authors>
     <Description>High-performance io_uring transport for ASP.NET Core Kestrel. Drop-in replacement for the default socket transport with multishot recv, buffer rings, zero-copy send, and registered files. Up to 30% faster at 128+ concurrent connections on Linux.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/reedz/AspNetCoreUring</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/reedz/AspNetCoreUring</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/reedz/Kestrel.Transport.IoUring</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/reedz/Kestrel.Transport.IoUring</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>io_uring;kestrel;aspnetcore;transport;linux;high-performance;networking;zero-copy</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
