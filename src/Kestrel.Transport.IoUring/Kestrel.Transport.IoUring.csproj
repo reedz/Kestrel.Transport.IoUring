@@ -16,7 +16,7 @@
 
     <!-- NuGet package metadata -->
     <PackageId>Kestrel.Transport.IoUring</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <Authors>reedz</Authors>
     <Description>High-performance io_uring transport for ASP.NET Core Kestrel. Drop-in replacement for the default socket transport with multishot recv, buffer rings, zero-copy send, and registered files. Up to 30% faster at 128+ concurrent connections on Linux.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -25,11 +25,30 @@
     <RepositoryType>git</RepositoryType>
     <PackageTags>io_uring;kestrel;aspnetcore;transport;linux;high-performance;networking;zero-copy</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Copyright>Copyright (c) 2026 reedz</Copyright>
+    <PackageReleaseNotes>
+v1.0.1 — Bug fix
+• Fix IOSQE_BUFFER_SELECT constant: was 1&lt;&lt;3 (0x08), now 1&lt;&lt;5 (0x20)
+  Matches kernel definition. Fixes EFAULT when using buffer rings with recv.
+• Add test project with 10 tests (unit + integration)
+• Add InternalsVisibleTo for test project
+
+v1.0.0 — Initial release
+• Drop-in io_uring transport via UseIoUring()
+• Multishot recv with buffer rings
+• Zero-copy send (SEND_ZC)
+• Registered file descriptors
+• Targets net8.0, net9.0, net10.0
+    </PackageReleaseNotes>
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
     <None Include="../../README.md" Pack="true" PackagePath="/" />
     <None Include="../../LICENSE" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Kestrel.Transport.IoUring.Tests" />
   </ItemGroup>
 </Project>

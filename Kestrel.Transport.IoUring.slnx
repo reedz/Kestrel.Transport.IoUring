@@ -8,4 +8,7 @@
   <Folder Name="/src/">
     <Project Path="src/Kestrel.Transport.IoUring/Kestrel.Transport.IoUring.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Kestrel.Transport.IoUring.Tests/Kestrel.Transport.IoUring.Tests.csproj" />
+  </Folder>
 </Solution>
