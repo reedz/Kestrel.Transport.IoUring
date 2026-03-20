@@ -1,4 +1,4 @@
-using AspNetCoreUring;
+using Kestrel.Transport.IoUring;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseIoUring(options =>

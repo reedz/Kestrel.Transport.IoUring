@@ -44,6 +44,6 @@ Both transports run as in-process ASP.NET Core servers with `app.MapGet("/", () 
 ## Running Benchmarks
 
 ```bash
-cd benchmarks/AspNetCoreUring.Benchmarks
+cd benchmarks/Kestrel.Transport.IoUring.Benchmarks
 dotnet run -c Release -- quick
 ```

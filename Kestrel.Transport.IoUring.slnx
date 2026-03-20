@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Kestrel.Transport.IoUring.Benchmarks/Kestrel.Transport.IoUring.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/SampleApp/SampleApp.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Kestrel.Transport.IoUring/Kestrel.Transport.IoUring.csproj" />
+  </Folder>
+</Solution>
