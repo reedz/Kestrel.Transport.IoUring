@@ -71,7 +71,7 @@ internal static class IoUringConstants
     public const uint IORING_RECV_MULTISHOT = 1u << 1;
 
     // SQE flags for buffer selection.
-    public const byte IOSQE_BUFFER_SELECT = 1 << 3;
+    public const byte IOSQE_BUFFER_SELECT = 1 << 5;
 
     // CQE flags.
     public const uint IORING_CQE_F_BUFFER = 1u << 0; // CQE has buffer ID in upper flags
