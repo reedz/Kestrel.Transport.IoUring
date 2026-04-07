@@ -16,7 +16,7 @@
 
     <!-- NuGet package metadata -->
     <PackageId>Kestrel.Transport.IoUring</PackageId>
-    <Version>1.2.1</Version>
+    <Version>1.3.0</Version>
     <Authors>reedz</Authors>
     <Description>High-performance io_uring transport for ASP.NET Core Kestrel. Drop-in replacement for the default socket transport with multishot recv, buffer rings, zero-copy send, and registered files. Up to 30% faster at 128+ concurrent connections on Linux.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

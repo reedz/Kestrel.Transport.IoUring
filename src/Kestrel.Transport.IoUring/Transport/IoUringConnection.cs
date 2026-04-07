@@ -87,6 +87,10 @@ internal sealed class IoUringConnection : ConnectionContext
     /// <summary>True when an async flush is pending and will trigger a recv rearm on completion.</summary>
     internal bool RecvRearmPending { get; set; }
 
+    // Pre-pinned recv buffer — eliminates Pin()/Dispose() per recv.
+    private readonly byte[] _pinnedRecvBuf;
+    private readonly unsafe byte* _pinnedRecvPtr;
+
     public IoUringConnection(
         long connectionId,
         int socketFd,
@@ -107,8 +111,19 @@ internal sealed class IoUringConnection : ConnectionContext
         RemoteEndPoint = remoteEndPoint;
         LocalEndPoint = localEndPoint;
 
-        var inputOptions = new PipeOptions(useSynchronizationContext: false);
-        var outputOptions = new PipeOptions(useSynchronizationContext: false);
+        // Pre-pin a recv buffer to avoid Pin()/Dispose() on every recv.
+        _pinnedRecvBuf = GC.AllocateArray<byte>(receiveBufferSize, pinned: true);
+        unsafe { fixed (byte* p = _pinnedRecvBuf) _pinnedRecvPtr = p; }
+
+        // Match Kestrel socket transport's PipeOptions thresholds.
+        var inputOptions = new PipeOptions(
+            pauseWriterThreshold: 1024 * 1024,     // 1 MB
+            resumeWriterThreshold: 512 * 1024,      // 512 KB
+            useSynchronizationContext: false);
+        var outputOptions = new PipeOptions(
+            pauseWriterThreshold: 64 * 1024,        // 64 KB
+            resumeWriterThreshold: 32 * 1024,        // 32 KB
+            useSynchronizationContext: false);
         _inputPipe = new Pipe(inputOptions);
         _outputPipe = new Pipe(outputOptions);
 
@@ -138,26 +153,21 @@ internal sealed class IoUringConnection : ConnectionContext
     }
 
     /// <summary>
-    /// Submits a RECV SQE. Returns false if the SQ is full (caller should retry later).
+    /// Submits a RECV SQE using the pre-pinned buffer. Returns false if the SQ is full.
     /// </summary>
     public unsafe bool SubmitRecv()
     {
-        Memory<byte> buffer = _inputPipe.Writer.GetMemory(_receiveBufferSize);
-        _recvHandle = buffer.Pin();
-
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
             sqe->Opcode = IoUringConstants.IORING_OP_RECV;
             SetSqeFd(sqe);
-            sqe->AddrOrSpliceOffIn = (ulong)_recvHandle.Pointer;
-            sqe->Len = (uint)buffer.Length;
+            sqe->AddrOrSpliceOffIn = (ulong)_pinnedRecvPtr;
+            sqe->Len = (uint)_receiveBufferSize;
             sqe->UserData = EncodeUserData(_connectionId, OpType.Recv);
             HasRecvInFlight = true;
             return true;
         }
 
-        _recvHandle.Dispose();
-        _recvHandle = default;
         return false;
     }
 
@@ -264,7 +274,7 @@ internal sealed class IoUringConnection : ConnectionContext
             useZeroCopy: data.Length > 4096);
 
         _pendingSendQueue!.Enqueue(pending);
-        _wakeIoLoop!();
+        // No WakeIoLoop() — the IO loop busy-polls the send queue each iteration.
 
         return completion.AsValueTask();
     }
@@ -335,13 +345,12 @@ internal sealed class IoUringConnection : ConnectionContext
 
     /// <summary>
     /// Called on the IO loop thread when a RECV CQE completes.
+    /// Copies data from the pre-pinned buffer into the pipe.
     /// Returns true if a new RECV should be immediately resubmitted.
     /// </summary>
     public bool OnRecvComplete(int bytesRead)
     {
         HasRecvInFlight = false;
-        _recvHandle.Dispose();
-        _recvHandle = default;
 
         if (bytesRead <= 0)
         {
@@ -349,6 +358,9 @@ internal sealed class IoUringConnection : ConnectionContext
             return false;
         }
 
+        // Copy from pre-pinned recv buffer into the pipe.
+        var dest = _inputPipe.Writer.GetSpan(bytesRead);
+        _pinnedRecvBuf.AsSpan(0, bytesRead).CopyTo(dest);
         _inputPipe.Writer.Advance(bytesRead);
         var flushTask = _inputPipe.Writer.FlushAsync();
 

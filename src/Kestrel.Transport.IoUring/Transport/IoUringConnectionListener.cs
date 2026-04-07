@@ -19,7 +19,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private readonly ILogger _logger;
     private readonly Socket _listenSocket;
     private readonly Channel<ConnectionContext> _acceptChannel;
-    private readonly ConcurrentDictionary<long, IoUringConnection> _connections = new();
+    private readonly IoUringConnection?[] _connectionSlots;
     private readonly CancellationTokenSource _cts = new();
     private readonly int _maxConnections;
     private readonly int _receiveBufferSize;
@@ -54,6 +54,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private const int ENOBUFS = 105; // errno for buffer ring exhaustion
 
     private long _nextConnectionId;
+    private int _activeConnectionCount;
     private readonly TaskCompletionSource _ioLoopStopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _listenSocketFd;
     private bool _listenSocketFdRefAdded;
@@ -75,6 +76,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _maxConnections = options.MaxConnections;
         _receiveBufferSize = options.ReceiveBufferSize;
         _options = options;
+        _connectionSlots = new IoUringConnection?[options.MaxConnections];
         _listenSocket = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         _acceptChannel = Channel.CreateBounded<ConnectionContext>(new BoundedChannelOptions(options.AcceptQueueCapacity)
         {
@@ -166,6 +168,22 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
     private static int GetSocketFd(Socket socket) =>
         (int)socket.SafeHandle.DangerousGetHandle();
+
+    // Connection slot helpers — IO loop is the sole accessor, no synchronization needed.
+    private IoUringConnection? GetConnection(long connId) =>
+        _connectionSlots[connId % _maxConnections];
+
+    private void SetConnection(long connId, IoUringConnection conn)
+    {
+        _connectionSlots[connId % _maxConnections] = conn;
+        _activeConnectionCount++;
+    }
+
+    private void RemoveConnection(long connId)
+    {
+        _connectionSlots[connId % _maxConnections] = null;
+        _activeConnectionCount--;
+    }
 
     private unsafe void SubmitAccept()
     {
@@ -260,11 +278,22 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             {
                 try
                 {
-                    // Drain pending sends before blocking — avoids eventfd round-trip latency.
+                    // Drain pending sends (busy-poll — no eventfd needed).
                     DrainPendingSendQueue();
 
-                    _ring.SubmitAndWait(1);
-                    ProcessCompletions();
+                    // Submit all pending SQEs + wait for completions.
+                    // Use non-blocking submit first, then block only if no work was done.
+                    int submitted = _ring.Submit();
+                    if (_ring.AvailableCompletions > 0 || submitted > 0 || !_pendingSendQueue.IsEmpty)
+                    {
+                        ProcessCompletions();
+                    }
+                    else
+                    {
+                        // No pending work — block until at least 1 completion.
+                        _ring.SubmitAndWait(1);
+                        ProcessCompletions();
+                    }
                 }
                 catch (OperationCanceledException)
                 {
@@ -288,7 +317,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     {
         while (_recvResubmitQueue.TryDequeue(out long connId))
         {
-            if (_connections.TryGetValue(connId, out var conn) && !conn.IsClosing && !conn.HasRecvInFlight)
+            var conn = GetConnection(connId);
+            if (conn != null && !conn.IsClosing && !conn.HasRecvInFlight)
             {
                 if (conn.UsingMultishotRecv && _bufferRing != null)
                     conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID);
@@ -306,7 +336,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         var retried = new List<long>();
         foreach (long connId in _recvRetrySet)
         {
-            if (_connections.TryGetValue(connId, out var conn) && !conn.IsClosing && !conn.HasRecvInFlight)
+            var conn = GetConnection(connId);
+            if (conn != null && !conn.IsClosing && !conn.HasRecvInFlight)
             {
                 bool ok;
                 if (conn.UsingMultishotRecv && _bufferRing != null)
@@ -334,7 +365,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     {
         while (_pendingSendQueue.TryDequeue(out var pending))
         {
-            if (_connections.TryGetValue(pending.ConnectionId, out var conn) && !conn.IsClosing)
+            var conn = GetConnection(pending.ConnectionId);
+            if (conn != null && !conn.IsClosing)
             {
                 conn.SubmitSendFromQueue(in pending);
             }
@@ -427,7 +459,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         {
             int socketFd = result;
 
-            if (_connections.Count >= _maxConnections)
+            if (_activeConnectionCount >= _maxConnections)
             {
                 _logger.LogWarning("Connection limit ({Limit}) reached; rejecting new connection.", _maxConnections);
                 Libc.close(socketFd);
@@ -450,7 +482,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                     _receiveBufferSize,
                     _logger);
 
-                _connections[connId] = conn;
+                SetConnection(connId, conn);
                 conn.StartOutputDrain(RequestRecvResubmit, _pendingSendQueue, WakeIoLoop);
 
                 // Submit multishot recv if buffer ring is available; otherwise single-shot.
@@ -487,7 +519,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             return false;
         }
 
-        if (!_connections.TryGetValue(connectionId, out var conn))
+        var conn = GetConnection(connectionId);
+        if (conn == null)
         {
             if (hasBuffer && _bufferRing != null)
                 _bufferRing.RecycleBuffer(bufferId);
@@ -565,7 +598,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             if (!isNotif) TryFinalizeClose(connectionId, closingConn);
             return;
         }
-        if (_connections.TryGetValue(connectionId, out var conn))
+        var conn = GetConnection(connectionId);
+        if (conn != null)
             conn.CompleteSend(result, cqeFlags);
     }
 
@@ -573,7 +607,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     {
         if (_closingConnections.Remove(connectionId, out var conn))
             conn.CloseSocketFd();
-        _connections.TryRemove(connectionId, out _);
+        RemoveConnection(connectionId);
         _recvRetrySet.Remove(connectionId);
     }
 
@@ -584,7 +618,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private void BeginCloseConnection(long connectionId, IoUringConnection conn)
     {
         conn.IsClosing = true;
-        _connections.TryRemove(connectionId, out _);
+        RemoveConnection(connectionId);
         _recvRetrySet.Remove(connectionId);
         _closingConnections[connectionId] = conn;
 
@@ -640,14 +674,15 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     {
         await UnbindAsync().ConfigureAwait(false);
 
-        foreach (var conn in _connections.Values)
+        foreach (var conn in _connectionSlots)
         {
+            if (conn == null) continue;
             if (conn.HasRecvInFlight)
                 conn.CleanupRecvHandle();
             conn.CloseSocketFd();
             await conn.DisposeAsync().ConfigureAwait(false);
         }
-        _connections.Clear();
+        Array.Clear(_connectionSlots);
 
         foreach (var conn in _closingConnections.Values)
         {
