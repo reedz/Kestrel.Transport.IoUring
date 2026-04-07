@@ -61,10 +61,11 @@ public sealed class Ring : IDisposable
         }
     }
 
-    /// <summary>Initializes a new io_uring instance with the specified queue depth.</summary>
-    public unsafe Ring(uint entries)
+    /// <summary>Initializes a new io_uring instance with the specified queue depth and optional setup flags.</summary>
+    public unsafe Ring(uint entries, uint setupFlags = 0)
     {
         IoUringParams p = default;
+        p.Flags = setupFlags;
         int fd = IoUringNative.IoUringSetup(entries, &p);
         if (fd < 0)
         {

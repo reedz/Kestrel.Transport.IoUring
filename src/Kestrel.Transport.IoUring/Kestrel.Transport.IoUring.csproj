@@ -16,7 +16,7 @@
 
     <!-- NuGet package metadata -->
     <PackageId>Kestrel.Transport.IoUring</PackageId>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Authors>reedz</Authors>
     <Description>High-performance io_uring transport for ASP.NET Core Kestrel. Drop-in replacement for the default socket transport with multishot recv, buffer rings, zero-copy send, and registered files. Up to 30% faster at 128+ concurrent connections on Linux.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -27,6 +27,15 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <Copyright>Copyright (c) 2026 reedz</Copyright>
     <PackageReleaseNotes>
+v1.2.0 — Re-enable buffer ring + SQPOLL mode
+• Re-enable provided buffer ring (multishot recv) — stalling bug fixed
+  on kernel 6.6+. Eliminates per-recv Pin()/Dispose() overhead.
+  Controlled via EnableBufferRing option (default: true).
+• Add SQPOLL mode support (EnableSqPoll option). Kernel polls the SQ ring,
+  eliminating io_uring_enter syscalls. Requires CAP_SYS_NICE or root.
+• Ring constructor now accepts setup flags for SQPOLL and future kernel features.
+• BufferRingSize option for tuning buffer ring depth (default: 256).
+
 v1.1.0 — Performance: lock-free send path
 • Send operations are now enqueued to the IO loop via ConcurrentQueue + eventfd
   instead of acquiring SubmitLock per send. Eliminates 90K+/s lock contentions

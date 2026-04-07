@@ -1,6 +1,7 @@
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using Kestrel.Transport.IoUring.Native;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets;
 using Microsoft.Extensions.Logging;
@@ -56,11 +57,19 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
             return ValueTask.FromResult<IConnectionListener>(multiListener);
         }
 
-        var ring = new Ring((uint)_options.EffectiveRingSize);
+        var ring = new Ring((uint)_options.EffectiveRingSize, GetSetupFlags());
         var logger = _loggerFactory.CreateLogger<IoUringConnectionListener>();
         var listener = new IoUringConnectionListener(endpoint, ring, _options, logger);
         listener.Bind(_options.ListenBacklog);
 
         return ValueTask.FromResult<IConnectionListener>(listener);
+    }
+
+    internal uint GetSetupFlags()
+    {
+        uint flags = 0;
+        if (_options.EnableSqPoll)
+            flags |= IoUringConstants.IORING_SETUP_SQPOLL;
+        return flags;
     }
 }

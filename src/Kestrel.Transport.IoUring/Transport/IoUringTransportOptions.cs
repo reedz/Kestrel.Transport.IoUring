@@ -27,6 +27,22 @@ public sealed class IoUringTransportOptions
     public int ThreadCount { get; set; } = 1;
 
     /// <summary>
+    /// Enable SQPOLL mode: the kernel polls the SQ ring in a dedicated kernel thread,
+    /// eliminating io_uring_enter syscalls for submission. Requires CAP_SYS_NICE or root.
+    /// Each ring consumes one kernel CPU thread.
+    /// </summary>
+    public bool EnableSqPoll { get; set; }
+
+    /// <summary>
+    /// Enable provided buffer rings for multishot recv. Eliminates per-recv memory pinning
+    /// and SQE resubmission. Requires kernel 6.0+. Defaults to true.
+    /// </summary>
+    public bool EnableBufferRing { get; set; } = true;
+
+    /// <summary>Number of buffers in the provided buffer ring (must be power of two).</summary>
+    public int BufferRingSize { get; set; } = 256;
+
+    /// <summary>
     /// Returns the effective ring size, ensuring it is large enough for the configured
     /// <see cref="MaxConnections"/> (at least <c>2 * MaxConnections + 16</c>, rounded up to
     /// the next power of two).

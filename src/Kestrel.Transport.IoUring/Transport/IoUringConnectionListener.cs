@@ -23,6 +23,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private readonly CancellationTokenSource _cts = new();
     private readonly int _maxConnections;
     private readonly int _receiveBufferSize;
+    private readonly IoUringTransportOptions _options;
 
     // Connections that need RECV resubmitted (after async pipe flush completes).
     private readonly ConcurrentQueue<long> _recvResubmitQueue = new();
@@ -73,6 +74,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _logger = logger;
         _maxConnections = options.MaxConnections;
         _receiveBufferSize = options.ReceiveBufferSize;
+        _options = options;
         _listenSocket = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         _acceptChannel = Channel.CreateBounded<ConnectionContext>(new BoundedChannelOptions(options.AcceptQueueCapacity)
         {
@@ -129,11 +131,26 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             _eventFdFileIndex = _ring.RegisterFd(_eventFd);
         }
 
-        // Multishot recv + buffer ring disabled. The buffer ring layout and ENOBUFS
-        // handling are correct, but concurrent keep-alive connections stall (~53/100).
-        // Root cause: multishot recv CQE delivery timing interacts poorly with
-        // Kestrel's HTTP pipeline under concurrent load on this 2-core VM.
-        _bufferRing = null;
+        // Provided buffer ring for multishot recv — eliminates per-recv Pin()/Dispose().
+        if (_options.EnableBufferRing)
+        {
+            try
+            {
+                _bufferRing = new ProvidedBufferRing(
+                    _ring.Fd, RECV_BUF_GROUP_ID,
+                    _options.BufferRingSize, _receiveBufferSize);
+                _useMultishotAccept = false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to register buffer ring — falling back to single-shot recv.");
+                _bufferRing = null;
+            }
+        }
+        else
+        {
+            _bufferRing = null;
+        }
 
         SubmitAccept();
         SubmitEventFdRead();

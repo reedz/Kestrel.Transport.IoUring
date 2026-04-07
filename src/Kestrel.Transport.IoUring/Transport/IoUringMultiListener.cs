@@ -2,6 +2,7 @@ using System.Net;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using Kestrel.Transport.IoUring.Native;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.Extensions.Logging;
 
@@ -47,7 +48,15 @@ internal sealed class IoUringMultiListener : IConnectionListener
             AcceptQueueCapacity = options.AcceptQueueCapacity,
             ReceiveBufferSize = options.ReceiveBufferSize,
             ThreadCount = 1, // each worker is single-threaded
+            EnableSqPoll = options.EnableSqPoll,
+            EnableBufferRing = options.EnableBufferRing,
+            BufferRingSize = options.BufferRingSize,
         };
+
+        // Compute setup flags once for all workers.
+        uint setupFlags = 0;
+        if (options.EnableSqPoll)
+            setupFlags |= IoUringConstants.IORING_SETUP_SQPOLL;
 
         _workers = new IoUringConnectionListener[threadCount];
         _forwardTasks = new Task[threadCount];
@@ -56,7 +65,7 @@ internal sealed class IoUringMultiListener : IConnectionListener
 
         for (int i = 0; i < threadCount; i++)
         {
-            var ring = new Ring((uint)perWorkerOptions.EffectiveRingSize);
+            var ring = new Ring((uint)perWorkerOptions.EffectiveRingSize, setupFlags);
             var worker = new IoUringConnectionListener(endPoint, ring, perWorkerOptions, logger);
             worker.Bind(options.ListenBacklog, reusePort: true);
             _workers[i] = worker;
