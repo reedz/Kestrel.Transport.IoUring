@@ -54,7 +54,8 @@ internal sealed class IoUringMultiListener : IConnectionListener
         };
 
         // Compute setup flags once for all workers.
-        uint setupFlags = 0;
+        uint setupFlags = IoUringConstants.IORING_SETUP_SINGLE_ISSUER
+                        | IoUringConstants.IORING_SETUP_COOP_TASKRUN;
         if (options.EnableSqPoll)
             setupFlags |= IoUringConstants.IORING_SETUP_SQPOLL;
 

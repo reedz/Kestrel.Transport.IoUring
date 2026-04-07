@@ -260,6 +260,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             {
                 try
                 {
+                    // Drain pending sends before blocking — avoids eventfd round-trip latency.
+                    DrainPendingSendQueue();
+
                     _ring.SubmitAndWait(1);
                     ProcessCompletions();
                 }

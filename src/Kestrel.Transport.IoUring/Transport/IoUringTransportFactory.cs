@@ -67,7 +67,8 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
 
     internal uint GetSetupFlags()
     {
-        uint flags = 0;
+        uint flags = IoUringConstants.IORING_SETUP_SINGLE_ISSUER
+                   | IoUringConstants.IORING_SETUP_COOP_TASKRUN;
         if (_options.EnableSqPoll)
             flags |= IoUringConstants.IORING_SETUP_SQPOLL;
         return flags;

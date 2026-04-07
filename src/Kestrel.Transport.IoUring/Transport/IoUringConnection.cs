@@ -133,7 +133,7 @@ internal sealed class IoUringConnection : ConnectionContext
         }
         else
         {
-            SetSqeFd(sqe);
+            sqe->Fd = _socketFd;
         }
     }
 

@@ -70,7 +70,21 @@ public sealed class Ring : IDisposable
         if (fd < 0)
         {
             int err = Marshal.GetLastPInvokeError();
-            throw new InvalidOperationException($"io_uring_setup failed with errno {err}");
+            // EINVAL may mean unsupported flags — retry without optional flags.
+            if (err == 22 /* EINVAL */ && setupFlags != 0)
+            {
+                p = default;
+                fd = IoUringNative.IoUringSetup(entries, &p);
+                if (fd < 0)
+                {
+                    err = Marshal.GetLastPInvokeError();
+                    throw new InvalidOperationException($"io_uring_setup failed with errno {err}");
+                }
+            }
+            else
+            {
+                throw new InvalidOperationException($"io_uring_setup failed with errno {err}");
+            }
         }
 
         _ringFd = fd;
