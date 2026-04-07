@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.IO.Pipelines;
 using System.Net;
 using System.Runtime.InteropServices;
@@ -19,14 +20,16 @@ internal readonly struct PendingSend
     public readonly nint Pointer;
     public readonly uint Length;
     public readonly PooledSendCompletion Completion;
+    public readonly bool UseZeroCopy;
 
-    public PendingSend(long connectionId, MemoryHandle handle, nint pointer, uint length, PooledSendCompletion completion)
+    public PendingSend(long connectionId, MemoryHandle handle, nint pointer, uint length, PooledSendCompletion completion, bool useZeroCopy = false)
     {
         ConnectionId = connectionId;
         Handle = handle;
         Pointer = pointer;
         Length = length;
         Completion = completion;
+        UseZeroCopy = useZeroCopy;
     }
 }
 
@@ -56,6 +59,10 @@ internal sealed class IoUringConnection : ConnectionContext
 
     // Callback to request a RECV resubmission from the IO loop after async flush completes.
     private Action<long>? _requestRecvResubmit;
+
+    // Shared send queue + IO loop wakeup for lock-free send submission.
+    private ConcurrentQueue<PendingSend>? _pendingSendQueue;
+    private Action? _wakeIoLoop;
 
     public override string ConnectionId { get; set; }
     public override IFeatureCollection Features { get; } = new FeatureCollection();
@@ -239,8 +246,8 @@ internal sealed class IoUringConnection : ConnectionContext
     }
 
     /// <summary>
-    /// Submits a SEND SQE directly from the calling thread (output drain task).
-    /// Acquires the ring lock, fills the SQE, flushes, and submits via io_uring_enter.
+    /// Enqueues a SEND to the IO loop's send queue and wakes it via eventfd.
+    /// No lock is acquired — the IO loop is the sole SQ producer.
     /// Returns a ValueTask that completes when the kernel finishes the SEND.
     /// </summary>
     private unsafe ValueTask<int> SubmitSendDirect(ReadOnlyMemory<byte> data)
@@ -248,41 +255,47 @@ internal sealed class IoUringConnection : ConnectionContext
         var completion = PooledSendCompletion.Rent();
         var handle = data.Pin();
 
-        bool submitted;
-        lock (_ring.SubmitLock)
-        {
-            if (_ring.TryGetSqe(out IoUringSqe* sqe))
-            {
-                sqe->Opcode = data.Length > 4096
-                    ? IoUringConstants.IORING_OP_SEND_ZC
-                    : IoUringConstants.IORING_OP_SEND;
-                SetSqeFd(sqe);
-                sqe->AddrOrSpliceOffIn = (ulong)handle.Pointer;
-                sqe->Len = (uint)data.Length;
-                sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
+        var pending = new PendingSend(
+            _connectionId,
+            handle,
+            (nint)handle.Pointer,
+            (uint)data.Length,
+            completion,
+            useZeroCopy: data.Length > 4096);
 
-                _sendHandle = handle;
-                _sendCompletion = completion;
-                HasSendInFlight = true;
-                submitted = true;
-            }
-            else
-            {
-                submitted = false;
-            }
-        }
+        _pendingSendQueue!.Enqueue(pending);
+        _wakeIoLoop!();
 
-        if (submitted)
-        {
-            // Submit outside lock — io_uring_enter is kernel-safe for concurrent calls.
-            _ring.Submit();
-            return completion.AsValueTask();
-        }
-
-        // Ring full — caller should retry.
-        handle.Dispose();
-        completion.SetResult(0);
         return completion.AsValueTask();
+    }
+
+    /// <summary>
+    /// Called by the IO loop to submit a SEND SQE from a queued PendingSend.
+    /// IO loop is the sole SQ producer — no lock needed.
+    /// Returns true if the SQE was successfully filled.
+    /// </summary>
+    internal unsafe bool SubmitSendFromQueue(in PendingSend pending)
+    {
+        if (_ring.TryGetSqe(out IoUringSqe* sqe))
+        {
+            sqe->Opcode = pending.UseZeroCopy
+                ? IoUringConstants.IORING_OP_SEND_ZC
+                : IoUringConstants.IORING_OP_SEND;
+            SetSqeFd(sqe);
+            sqe->AddrOrSpliceOffIn = (ulong)pending.Pointer;
+            sqe->Len = pending.Length;
+            sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
+
+            _sendHandle = pending.Handle;
+            _sendCompletion = pending.Completion;
+            HasSendInFlight = true;
+            return true;
+        }
+
+        // Ring full — complete with 0 so the drain task retries.
+        pending.Handle.Dispose();
+        pending.Completion.SetResult(0);
+        return false;
     }
 
     /// <summary>
@@ -387,11 +400,13 @@ internal sealed class IoUringConnection : ConnectionContext
 
     /// <summary>
     /// Starts the background output-drain loop that reads from the application's output pipe
-    /// and submits SEND SQEs directly via the ring (no cross-thread queue).
+    /// and enqueues SEND operations to the IO loop's send queue (no lock needed).
     /// </summary>
-    public void StartOutputDrain(Action<long> requestRecvResubmit)
+    public void StartOutputDrain(Action<long> requestRecvResubmit, ConcurrentQueue<PendingSend> sendQueue, Action wakeIoLoop)
     {
         _requestRecvResubmit = requestRecvResubmit;
+        _pendingSendQueue = sendQueue;
+        _wakeIoLoop = wakeIoLoop;
         _ = RunOutputDrainAsync();
     }
 

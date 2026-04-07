@@ -27,6 +27,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     // Connections that need RECV resubmitted (after async pipe flush completes).
     private readonly ConcurrentQueue<long> _recvResubmitQueue = new();
 
+    // Pending sends from drain tasks, processed by the IO loop (lock-free cross-thread path).
+    private readonly ConcurrentQueue<PendingSend> _pendingSendQueue = new();
+
     // Connections awaiting close after in-flight ops drain.
     private readonly Dictionary<long, IoUringConnection> _closingConnections = [];
 
@@ -132,11 +135,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         // Kestrel's HTTP pipeline under concurrent load on this 2-core VM.
         _bufferRing = null;
 
-        lock (_ring.SubmitLock)
-        {
-            SubmitAccept();
-            SubmitEventFdRead();
-        }
+        SubmitAccept();
+        SubmitEventFdRead();
         _ring.Submit();
 
         var ioThread = new Thread(RunIoLoop)
@@ -309,6 +309,24 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             _recvRetrySet.Remove(id);
     }
 
+    /// <summary>Drains pending sends from drain tasks and fills SEND SQEs.</summary>
+    private void DrainPendingSendQueue()
+    {
+        while (_pendingSendQueue.TryDequeue(out var pending))
+        {
+            if (_connections.TryGetValue(pending.ConnectionId, out var conn) && !conn.IsClosing)
+            {
+                conn.SubmitSendFromQueue(in pending);
+            }
+            else
+            {
+                // Connection gone — complete with error so drain task stops.
+                pending.Handle.Dispose();
+                pending.Completion.SetResult(-1);
+            }
+        }
+    }
+
     private void ProcessCompletions()
     {
         // Check for CQ overflow — indicates completions were lost by the kernel.
@@ -322,21 +340,16 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             _lastOverflowCount = overflow;
         }
 
-        bool needsSubmit = false;
-
         while (_ring.TryPeekCompletion(out var cqe))
         {
             _ring.AdvanceCompletion();
 
             if (cqe.UserData == IoUringConstants.EVENTFD_USER_DATA)
             {
-                // Eventfd fired — process recv resubmit requests and re-arm.
-                lock (_ring.SubmitLock)
-                {
-                    DrainRecvResubmitQueue();
-                    SubmitEventFdRead();
-                }
-                needsSubmit = true;
+                // Eventfd fired — drain pending sends and recv resubmits, re-arm.
+                DrainPendingSendQueue();
+                DrainRecvResubmitQueue();
+                SubmitEventFdRead();
                 continue;
             }
 
@@ -345,13 +358,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             switch (opType)
             {
                 case IoUringConnection.OpType.Accept:
-                    lock (_ring.SubmitLock) { HandleAccept(cqe.Res, cqe.Flags); }
-                    needsSubmit = true;
+                    HandleAccept(cqe.Res, cqe.Flags);
                     break;
                 case IoUringConnection.OpType.Recv:
-                    bool recvSubmitted;
-                    lock (_ring.SubmitLock) { recvSubmitted = HandleRecv(connectionId, cqe.Res, cqe.Flags); }
-                    if (recvSubmitted) needsSubmit = true;
+                    HandleRecv(connectionId, cqe.Res, cqe.Flags);
                     break;
                 case IoUringConnection.OpType.Send:
                     HandleSend(connectionId, cqe.Res, cqe.Flags);
@@ -364,10 +374,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             }
         }
 
-        lock (_ring.SubmitLock) { RetryFailedRecvs(); }
+        RetryFailedRecvs();
 
-        if (needsSubmit)
-            _ring.Submit();
+        // Single batched submit for all pending SQEs (accepts, recvs, sends).
+        _ring.Submit();
     }
 
     private unsafe void HandleAccept(int result, uint cqeFlags)
@@ -421,7 +431,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                     _logger);
 
                 _connections[connId] = conn;
-                conn.StartOutputDrain(RequestRecvResubmit);
+                conn.StartOutputDrain(RequestRecvResubmit, _pendingSendQueue, WakeIoLoop);
 
                 // Submit multishot recv if buffer ring is available; otherwise single-shot.
                 if (_bufferRing != null)

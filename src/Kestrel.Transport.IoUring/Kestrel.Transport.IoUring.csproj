@@ -16,7 +16,7 @@
 
     <!-- NuGet package metadata -->
     <PackageId>Kestrel.Transport.IoUring</PackageId>
-    <Version>1.0.1</Version>
+    <Version>1.1.0</Version>
     <Authors>reedz</Authors>
     <Description>High-performance io_uring transport for ASP.NET Core Kestrel. Drop-in replacement for the default socket transport with multishot recv, buffer rings, zero-copy send, and registered files. Up to 30% faster at 128+ concurrent connections on Linux.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -27,6 +27,14 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <Copyright>Copyright (c) 2026 reedz</Copyright>
     <PackageReleaseNotes>
+v1.1.0 — Performance: lock-free send path
+• Send operations are now enqueued to the IO loop via ConcurrentQueue + eventfd
+  instead of acquiring SubmitLock per send. Eliminates 90K+/s lock contentions
+  on multi-core machines.
+• IO loop is now the sole SQ producer — all submissions are batched into a
+  single io_uring_enter per loop iteration.
+• Reduces per-send syscalls from 1 each to 0 (batched with recv/accept work).
+
 v1.0.1 — Bug fix
 • Fix IOSQE_BUFFER_SELECT constant: was 1&lt;&lt;3 (0x08), now 1&lt;&lt;5 (0x20)
   Matches kernel definition. Fixes EFAULT when using buffer rings with recv.
