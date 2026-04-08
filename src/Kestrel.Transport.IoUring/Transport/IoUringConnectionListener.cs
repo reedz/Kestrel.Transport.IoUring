@@ -20,6 +20,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private readonly Socket _listenSocket;
     private readonly Channel<ConnectionContext> _acceptChannel;
     private readonly IoUringConnection?[] _connectionSlots;
+    private readonly ushort[] _slotGenerations;
     private readonly CancellationTokenSource _cts = new();
     private readonly int _maxConnections;
     private readonly int _receiveBufferSize;
@@ -78,6 +79,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _receiveBufferSize = options.ReceiveBufferSize;
         _options = options;
         _connectionSlots = new IoUringConnection?[options.MaxConnections];
+        _slotGenerations = new ushort[options.MaxConnections];
         _listenSocket = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         _acceptChannel = Channel.CreateBounded<ConnectionContext>(new BoundedChannelOptions(options.AcceptQueueCapacity)
         {
@@ -178,7 +180,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
     private void SetConnection(long connId, IoUringConnection conn)
     {
-        _connectionSlots[connId % _maxConnections] = conn;
+        int slot = (int)(connId % _maxConnections);
+        _slotGenerations[slot]++;
+        conn.Generation = _slotGenerations[slot];
+        _connectionSlots[slot] = conn;
         _activeConnectionCount++;
     }
 
@@ -196,7 +201,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             sqe->AddrOrSpliceOffIn = 0;
             sqe->OffOrAddr2 = 0;
             sqe->Len = 0;
-            sqe->UserData = IoUringConnection.EncodeUserData(0, IoUringConnection.OpType.Accept);
+            sqe->UserData = IoUringConnection.EncodeUserData(0, 0, IoUringConnection.OpType.Accept);
             if (_useMultishotAccept)
                 sqe->OpFlags = IoUringConstants.IORING_ACCEPT_MULTISHOT;
             if (_listenSocketFileIndex >= 0)
@@ -366,6 +371,65 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             _recvRetrySet.Remove(id);
     }
 
+    /// <summary>
+    /// Recovers from CQ overflow by scanning all connections and force-cleaning
+    /// those with stale in-flight operations. Lost CQEs mean HasSendInFlight /
+    /// HasRecvInFlight will never be cleared normally, so we must do it forcibly.
+    /// </summary>
+    private void RecoverFromCqOverflow()
+    {
+        int recovered = 0;
+
+        // Scan active connections for stale in-flight ops.
+        for (int i = 0; i < _connectionSlots.Length; i++)
+        {
+            var conn = _connectionSlots[i];
+            if (conn == null) continue;
+
+            bool hadStaleOps = false;
+
+            if (conn.HasRecvInFlight)
+            {
+                _logger.LogWarning("CQ overflow recovery: clearing stale recv for connection {Id}", conn.NumericConnectionId);
+                conn.HasRecvInFlight = false;
+                hadStaleOps = true;
+                // Resubmit recv to resume receiving on this connection.
+                if (!conn.IsClosing)
+                {
+                    if (!conn.SubmitRecv())
+                        _recvRetrySet.Add(conn.NumericConnectionId);
+                }
+            }
+
+            if (conn.HasSendInFlight)
+            {
+                _logger.LogWarning("CQ overflow recovery: clearing stale send for connection {Id}", conn.NumericConnectionId);
+                conn.HasSendInFlight = false;
+                conn.CleanupSendHandle();
+                hadStaleOps = true;
+                // Signal the send loop to retry (sent = -1 means error).
+                try { conn.CompleteSendOverflowRecovery(); } catch { }
+            }
+
+            if (hadStaleOps) recovered++;
+        }
+
+        // Also scan closing connections.
+        foreach (var (connId, conn) in _closingConnections)
+        {
+            if (conn.HasRecvInFlight || conn.HasSendInFlight)
+            {
+                conn.HasRecvInFlight = false;
+                conn.HasSendInFlight = false;
+                conn.CleanupSendHandle();
+                TryFinalizeClose(connId, conn);
+                recovered++;
+            }
+        }
+
+        _logger.LogCritical("CQ overflow recovery complete: {Count} connections recovered.", recovered);
+    }
+
 
     private void ProcessCompletions()
     {
@@ -373,11 +437,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         uint overflow = _ring.CqOverflowCount;
         if (overflow != _lastOverflowCount)
         {
+            uint lost = overflow - _lastOverflowCount;
             _logger.LogCritical(
                 "io_uring CQ overflow detected ({Count} completions lost). " +
-                "Increase RingSize to prevent resource leaks.",
-                overflow - _lastOverflowCount);
+                "Recovering by force-cleaning stale connections.",
+                lost);
             _lastOverflowCount = overflow;
+            RecoverFromCqOverflow();
         }
 
         while (_ring.TryPeekCompletion(out var cqe))
@@ -393,7 +459,19 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 continue;
             }
 
-            var (connectionId, opType) = IoUringConnection.DecodeUserData(cqe.UserData);
+            var (connectionId, generation, opType) = IoUringConnection.DecodeUserData(cqe.UserData);
+
+            // Validate generation to detect stale CQEs from previous connections
+            // that occupied the same slot.
+            if (opType != IoUringConnection.OpType.Accept)
+            {
+                var conn = GetConnection(connectionId);
+                if (conn != null && conn.Generation != generation)
+                {
+                    // Stale CQE from a previous connection — discard silently.
+                    continue;
+                }
+            }
 
             switch (opType)
             {

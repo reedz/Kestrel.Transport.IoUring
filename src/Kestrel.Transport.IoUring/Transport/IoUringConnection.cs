@@ -18,15 +18,19 @@ namespace Kestrel.Transport.IoUring.Transport;
 internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<int>
 {
     private const ulong OpTypeMask = 0xFF;
-    private const int ConnectionIdShift = 8;
+    private const ulong GenerationMask = 0xFFFF;
+    private const int GenerationShift = 8;
+    private const int ConnectionIdShift = 24;
 
     public enum OpType : byte { Accept = 0, Recv = 1, Send = 2, Close = 3, Cancel = 4 }
 
-    public static ulong EncodeUserData(long connectionId, OpType opType) =>
-        ((ulong)connectionId << ConnectionIdShift) | (byte)opType;
+    public static ulong EncodeUserData(long connectionId, ushort generation, OpType opType) =>
+        ((ulong)connectionId << ConnectionIdShift) | ((ulong)generation << GenerationShift) | (byte)opType;
 
-    public static (long ConnectionId, OpType OpType) DecodeUserData(ulong userData) =>
-        ((long)(userData >> ConnectionIdShift), (OpType)(userData & OpTypeMask));
+    public static (long ConnectionId, ushort Generation, OpType OpType) DecodeUserData(ulong userData) =>
+        ((long)(userData >> ConnectionIdShift),
+         (ushort)((userData >> GenerationShift) & GenerationMask),
+         (OpType)(userData & OpTypeMask));
 
     private readonly long _connectionId;
     private readonly int _socketFd;
@@ -38,6 +42,11 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     private readonly Pipe _inputPipe;
     private readonly Pipe _outputPipe;
     private int _disposed;
+    private volatile bool _disposing;
+
+    /// <summary>Generation counter — incremented on each connection using this slot.
+    /// Encoded into UserData to detect stale CQEs from previous connections.</summary>
+    internal ushort Generation { get; set; }
 
     // Callback to request a RECV resubmission from the IO loop after async flush completes.
     private Action<long>? _requestRecvResubmit;
@@ -168,7 +177,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             SetSqeFd(sqe);
             sqe->AddrOrSpliceOffIn = (ulong)_pinnedRecvPtr;
             sqe->Len = (uint)_receiveBufferSize;
-            sqe->UserData = EncodeUserData(_connectionId, OpType.Recv);
+            sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Recv);
             HasRecvInFlight = true;
             return true;
         }
@@ -192,7 +201,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             sqe->OpFlags = IoUringConstants.IORING_RECV_MULTISHOT;
             sqe->Flags = IoUringConstants.IOSQE_BUFFER_SELECT;
             sqe->BufIndexOrGroup = bufferGroupId;
-            sqe->UserData = EncodeUserData(_connectionId, OpType.Recv);
+            sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Recv);
             HasRecvInFlight = true;
             UsingMultishotRecv = true;
         }
@@ -244,6 +253,9 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     /// </summary>
     internal void CompleteSend(int bytesSent, uint cqeFlags)
     {
+        // Check if connection is being disposed from another thread — skip if so.
+        if (_disposing) return;
+
         bool isNotif = (cqeFlags & IoUringConstants.IORING_CQE_F_NOTIF) != 0;
         if (isNotif)
         {
@@ -389,7 +401,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
                             SetSqeFd(sqe);
                             sqe->AddrOrSpliceOffIn = (ulong)_sendHandle.Pointer;
                             sqe->Len = (uint)slice.Length;
-                            sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
+                            sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Send);
                             HasSendInFlight = true;
                             submitted = true;
                         }
@@ -441,6 +453,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
             return ValueTask.CompletedTask;
 
+        _disposing = true;
         _connectionCts.Cancel();
         // Complete both sides of both pipes. By the time Kestrel calls DisposeAsync,
         // it has finished reading from the input pipe.
@@ -479,6 +492,22 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     {
         _recvHandle.Dispose();
         _recvHandle = default;
+    }
+
+    /// <summary>Disposes any pinned send handle (for CQ overflow recovery).</summary>
+    internal void CleanupSendHandle()
+    {
+        _sendHandle.Dispose();
+        _sendHandle = default;
+    }
+
+    /// <summary>
+    /// Signals the send loop with an error result after CQ overflow recovery.
+    /// The send loop will see sent=-1 and break out of its loop.
+    /// </summary>
+    internal void CompleteSendOverflowRecovery()
+    {
+        try { _sendTcs.SetResult(-1); } catch { }
     }
 
     private sealed class DuplexPipe(PipeReader reader, PipeWriter writer) : IDuplexPipe
