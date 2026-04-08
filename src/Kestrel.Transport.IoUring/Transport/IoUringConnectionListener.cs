@@ -278,22 +278,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             {
                 try
                 {
-                    // Drain pending sends (busy-poll — no eventfd needed).
+                    // Drain pending sends before blocking.
                     DrainPendingSendQueue();
 
-                    // Submit all pending SQEs + wait for completions.
-                    // Use non-blocking submit first, then block only if no work was done.
-                    int submitted = _ring.Submit();
-                    if (_ring.AvailableCompletions > 0 || submitted > 0 || !_pendingSendQueue.IsEmpty)
-                    {
-                        ProcessCompletions();
-                    }
-                    else
-                    {
-                        // No pending work — block until at least 1 completion.
-                        _ring.SubmitAndWait(1);
-                        ProcessCompletions();
-                    }
+                    _ring.SubmitAndWait(1);
+                    ProcessCompletions();
                 }
                 catch (OperationCanceledException)
                 {

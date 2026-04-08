@@ -274,7 +274,7 @@ internal sealed class IoUringConnection : ConnectionContext
             useZeroCopy: data.Length > 4096);
 
         _pendingSendQueue!.Enqueue(pending);
-        // No WakeIoLoop() — the IO loop busy-polls the send queue each iteration.
+        _wakeIoLoop!(); // Wake IO loop to process the enqueued send.
 
         return completion.AsValueTask();
     }
