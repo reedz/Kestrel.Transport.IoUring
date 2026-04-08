@@ -22,3 +22,5 @@ nuget.config
 
 ## BenchmarkDotNet artifacts
 BenchmarkDotNet.Artifacts/
+
+artifacts/publish/

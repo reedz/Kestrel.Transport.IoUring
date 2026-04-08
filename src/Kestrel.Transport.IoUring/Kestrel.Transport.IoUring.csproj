@@ -16,9 +16,9 @@
 
     <!-- NuGet package metadata -->
     <PackageId>Kestrel.Transport.IoUring</PackageId>
-    <Version>1.3.1</Version>
+    <Version>2.0.0</Version>
     <Authors>reedz</Authors>
-    <Description>High-performance io_uring transport for ASP.NET Core Kestrel. Drop-in replacement for the default socket transport with multishot recv, buffer rings, zero-copy send, and registered files. Up to 30% faster at 128+ concurrent connections on Linux.</Description>
+    <Description>High-performance io_uring transport for ASP.NET Core Kestrel. Drop-in replacement for the default socket transport. Up to 15% faster than sockets at 1024+ connections on Linux with thread-per-core architecture, zero-alloc send path, and inline HTTP processing.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/reedz/Kestrel.Transport.IoUring</PackageProjectUrl>
     <RepositoryUrl>https://github.com/reedz/Kestrel.Transport.IoUring</RepositoryUrl>
@@ -27,6 +27,26 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <Copyright>Copyright (c) 2026 reedz</Copyright>
     <PackageReleaseNotes>
+v2.0.0 — Architecture overhaul: beats sockets by 15%
+• IoUringPipeScheduler: custom PipeScheduler runs all pipe continuations on
+  the IO loop thread. Eliminates ThreadPool hops for both recv and send paths.
+• Inline HTTP processing: Kestrel HTTP pipeline runs on the IO thread
+  (like UnsafePreferInlineScheduling). Zero cross-thread signaling.
+• Non-blocking send: IValueTaskSource-based send completion. Send loop yields
+  after SQE submit, resumes inline on CQE. Zero-alloc send path.
+• Connection slot array: replaces ConcurrentDictionary with O(1) direct index.
+• Pre-pinned recv buffer: eliminates per-recv Pin()/Dispose().
+• Fix SetSqeFd infinite recursion bug (stack overflow when fd registration fails).
+• Coalesced PipeScheduler wakeups: flag-based eventfd dedup.
+
+Benchmark: json scenario, 56-core Intel Xeon Gold 6330, kernel 6.8.0
+  256c: 2,043K RPS (+9% vs sockets)
+  512c: 2,499K RPS (+13% vs sockets)
+  1024c: 2,829K RPS (+15% vs sockets)
+  CPU usage: 50% (sockets: 90%) — 1.9x more efficient per CPU cycle
+  Lock contention: 50/s (sockets: 1,994/s)
+  GC time: 0% | Allocation rate: 3.8M B/s (below sockets)
+
 v1.2.0 — Re-enable buffer ring + SQPOLL mode
 • Re-enable provided buffer ring (multishot recv) — stalling bug fixed
   on kernel 6.6+. Eliminates per-recv Pin()/Dispose() overhead.

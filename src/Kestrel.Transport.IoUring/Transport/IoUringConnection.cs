@@ -5,6 +5,7 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Threading.Tasks.Sources;
 using Kestrel.Transport.IoUring.Native;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Http.Features;
@@ -33,7 +34,7 @@ internal readonly struct PendingSend
     }
 }
 
-internal sealed class IoUringConnection : ConnectionContext
+internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<int>
 {
     private const ulong OpTypeMask = 0xFF;
     private const int ConnectionIdShift = 8;
@@ -60,9 +61,21 @@ internal sealed class IoUringConnection : ConnectionContext
     // Callback to request a RECV resubmission from the IO loop after async flush completes.
     private Action<long>? _requestRecvResubmit;
 
-    // Shared send queue + IO loop wakeup for lock-free send submission.
-    private ConcurrentQueue<PendingSend>? _pendingSendQueue;
-    private Action? _wakeIoLoop;
+    // Zero-alloc send completion: connection itself is the IValueTaskSource.
+    // Send loop awaits this; IO loop sets result on CQE → send loop resumes inline.
+    private ManualResetValueTaskSourceCore<int> _sendTcs;
+
+    // IValueTaskSource<int> implementation — used by send loop to await send CQE.
+    int IValueTaskSource<int>.GetResult(short token) => _sendTcs.GetResult(token);
+    ValueTaskSourceStatus IValueTaskSource<int>.GetStatus(short token) => _sendTcs.GetStatus(token);
+    void IValueTaskSource<int>.OnCompleted(Action<object?> c, object? s, short t, ValueTaskSourceOnCompletedFlags f) =>
+        _sendTcs.OnCompleted(c, s, t, f);
+
+    private ValueTask<int> AwaitSendCompletion()
+    {
+        _sendTcs.Reset();
+        return new ValueTask<int>(this, _sendTcs.Version);
+    }
 
     public override string ConnectionId { get; set; }
     public override IFeatureCollection Features { get; } = new FeatureCollection();
@@ -99,6 +112,7 @@ internal sealed class IoUringConnection : ConnectionContext
         EndPoint? remoteEndPoint,
         EndPoint? localEndPoint,
         int receiveBufferSize,
+        IoUringPipeScheduler transportScheduler,
         ILogger logger)
     {
         _connectionId = connectionId;
@@ -111,18 +125,24 @@ internal sealed class IoUringConnection : ConnectionContext
         RemoteEndPoint = remoteEndPoint;
         LocalEndPoint = localEndPoint;
 
-        // Pre-pin a recv buffer to avoid Pin()/Dispose() on every recv.
+        // Pre-pin recv buffer to avoid Pin()/Dispose() on every recv.
         _pinnedRecvBuf = GC.AllocateArray<byte>(receiveBufferSize, pinned: true);
         unsafe { fixed (byte* p = _pinnedRecvBuf) _pinnedRecvPtr = p; }
 
-        // Match Kestrel socket transport's PipeOptions thresholds.
+        // PipeOptions: inline mode — ALL continuations run on the IO loop thread.
+        // Kestrel HTTP processing runs inline on the IO thread (like UnsafePreferInlineScheduling).
+        // This eliminates cross-thread hops: recv → HTTP → send all on one thread.
         var inputOptions = new PipeOptions(
-            pauseWriterThreshold: 1024 * 1024,     // 1 MB
-            resumeWriterThreshold: 512 * 1024,      // 512 KB
+            writerScheduler: transportScheduler,
+            readerScheduler: transportScheduler,  // Kestrel reads inline on IO thread
+            pauseWriterThreshold: 1024 * 1024,
+            resumeWriterThreshold: 512 * 1024,
             useSynchronizationContext: false);
         var outputOptions = new PipeOptions(
-            pauseWriterThreshold: 64 * 1024,        // 64 KB
-            resumeWriterThreshold: 32 * 1024,        // 32 KB
+            writerScheduler: PipeScheduler.ThreadPool,
+            readerScheduler: transportScheduler,
+            pauseWriterThreshold: 64 * 1024,
+            resumeWriterThreshold: 32 * 1024,
             useSynchronizationContext: false);
         _inputPipe = new Pipe(inputOptions);
         _outputPipe = new Pipe(outputOptions);
@@ -229,95 +249,19 @@ internal sealed class IoUringConnection : ConnectionContext
         return false;
     }
 
-    // Send state — written by drain task, read by IO loop after CQE arrives.
-    // Safe because io_uring_enter syscall acts as a memory barrier between the two.
+    // Send state — only accessed from the IO loop thread (via pipe scheduler).
     private MemoryHandle _sendHandle;
-    private PooledSendCompletion? _sendCompletion;
     private MemoryHandle _sendZcPendingHandle;
     internal bool SendZcNotifPending { get; set; }
 
-    public unsafe bool SubmitSend(in PendingSend pending)
-    {
-        if (_ring.TryGetSqe(out IoUringSqe* sqe))
-        {
-            sqe->Opcode = IoUringConstants.IORING_OP_SEND;
-            SetSqeFd(sqe);
-            sqe->AddrOrSpliceOffIn = (ulong)pending.Pointer;
-            sqe->Len = pending.Length;
-            sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
-            HasSendInFlight = true;
-            return true;
-        }
-
-        // Ring full — complete with 0 so the drain task retries.
-        pending.Handle.Dispose();
-        pending.Completion.SetResult(0);
-        return false;
-    }
-
-    /// <summary>
-    /// Enqueues a SEND to the IO loop's send queue and wakes it via eventfd.
-    /// No lock is acquired — the IO loop is the sole SQ producer.
-    /// Returns a ValueTask that completes when the kernel finishes the SEND.
-    /// </summary>
-    private unsafe ValueTask<int> SubmitSendDirect(ReadOnlyMemory<byte> data)
-    {
-        var completion = PooledSendCompletion.Rent();
-        var handle = data.Pin();
-
-        var pending = new PendingSend(
-            _connectionId,
-            handle,
-            (nint)handle.Pointer,
-            (uint)data.Length,
-            completion,
-            useZeroCopy: data.Length > 4096);
-
-        _pendingSendQueue!.Enqueue(pending);
-        _wakeIoLoop!(); // Wake IO loop to process the enqueued send.
-
-        return completion.AsValueTask();
-    }
-
-    /// <summary>
-    /// Called by the IO loop to submit a SEND SQE from a queued PendingSend.
-    /// IO loop is the sole SQ producer — no lock needed.
-    /// Returns true if the SQE was successfully filled.
-    /// </summary>
-    internal unsafe bool SubmitSendFromQueue(in PendingSend pending)
-    {
-        if (_ring.TryGetSqe(out IoUringSqe* sqe))
-        {
-            sqe->Opcode = pending.UseZeroCopy
-                ? IoUringConstants.IORING_OP_SEND_ZC
-                : IoUringConstants.IORING_OP_SEND;
-            SetSqeFd(sqe);
-            sqe->AddrOrSpliceOffIn = (ulong)pending.Pointer;
-            sqe->Len = pending.Length;
-            sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
-
-            _sendHandle = pending.Handle;
-            _sendCompletion = pending.Completion;
-            HasSendInFlight = true;
-            return true;
-        }
-
-        // Ring full — complete with 0 so the drain task retries.
-        pending.Handle.Dispose();
-        pending.Completion.SetResult(0);
-        return false;
-    }
-
     /// <summary>
     /// Called by the IO loop when a SEND CQE completes.
-    /// Signals the drain task that submitted this send.
     /// </summary>
     internal void CompleteSend(int bytesSent, uint cqeFlags)
     {
         bool isNotif = (cqeFlags & IoUringConstants.IORING_CQE_F_NOTIF) != 0;
         if (isNotif)
         {
-            // NOTIF CQE: zero-copy buffer released. Allow next send.
             HasSendInFlight = false;
             _sendZcPendingHandle.Dispose();
             _sendZcPendingHandle = default;
@@ -325,22 +269,14 @@ internal sealed class IoUringConnection : ConnectionContext
             return;
         }
         bool hasMore = (cqeFlags & IoUringConstants.IORING_CQE_F_MORE) != 0;
-        if (hasMore)
+        if (!hasMore)
         {
-            // SEND_ZC first CQE: keep handle alive until NOTIF.
-            _sendZcPendingHandle = _sendHandle;
-            SendZcNotifPending = true;
-        }
-        else
-        {
-            // Regular SEND: free handle immediately.
             HasSendInFlight = false;
-            _sendHandle.Dispose();
         }
+        _sendHandle.Dispose();
         _sendHandle = default;
-        var completion = _sendCompletion;
-        _sendCompletion = null;
-        completion?.SetResult(bytesSent);
+        // Signal the send loop to resume — continuation runs inline on IO thread.
+        _sendTcs.SetResult(bytesSent);
     }
 
     /// <summary>
@@ -411,18 +347,21 @@ internal sealed class IoUringConnection : ConnectionContext
     }
 
     /// <summary>
-    /// Starts the background output-drain loop that reads from the application's output pipe
-    /// and enqueues SEND operations to the IO loop's send queue (no lock needed).
+    /// Starts the send loop. Continuations run on the IO loop thread via IoUringPipeScheduler.
+    /// No drain task thread — the output pipe's readerScheduler routes continuations to the IO loop.
     /// </summary>
-    public void StartOutputDrain(Action<long> requestRecvResubmit, ConcurrentQueue<PendingSend> sendQueue, Action wakeIoLoop)
+    public void StartSendLoop(Action<long> requestRecvResubmit)
     {
         _requestRecvResubmit = requestRecvResubmit;
-        _pendingSendQueue = sendQueue;
-        _wakeIoLoop = wakeIoLoop;
-        _ = RunOutputDrainAsync();
+        _ = RunSendLoopAsync();
     }
 
-    private async Task RunOutputDrainAsync()
+    /// <summary>
+    /// Reads from the output pipe and submits SEND SQEs.
+    /// Continuations run on the IO loop thread via IoUringPipeScheduler.
+    /// Non-blocking: yields to IO loop after SQE submit, resumes on CQE.
+    /// </summary>
+    private async Task RunSendLoopAsync()
     {
         var reader = _outputPipe.Reader;
         var ct = _connectionCts.Token;
@@ -441,62 +380,51 @@ internal sealed class IoUringConnection : ConnectionContext
                     break;
 
                 var buffer = result.Buffer;
-                SequencePosition consumed = buffer.Start;
-                bool error = false;
-
-                foreach (ReadOnlyMemory<byte> segment in buffer)
+                if (buffer.IsEmpty)
                 {
-                    if (segment.IsEmpty) continue;
+                    reader.AdvanceTo(buffer.End);
+                    continue;
+                }
 
-                    // Handle partial sends by retrying the remainder of each segment.
-                    int offset = 0;
-                    int remaining = segment.Length;
+                // Send directly from pipe buffer — no copy needed.
+                // Pin the first segment and submit a SEND SQE.
+                var first = buffer.First;
+                _sendHandle = first.Pin();
 
-                    while (remaining > 0)
+                unsafe
+                {
+                    if (!_ring.TryGetSqe(out IoUringSqe* sqe))
                     {
-                        var slice = segment.Slice(offset, remaining);
-
-                        // Submit SEND directly from this thread — no eventfd round-trip.
-                        int sent;
-                        try
-                        {
-                            sent = await SubmitSendDirect(slice).ConfigureAwait(false);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            error = true;
-                            break;
-                        }
-
-                        if (sent <= 0)
-                        {
-                            error = true;
-                            break;
-                        }
-
-                        offset += sent;
-                        remaining -= sent;
+                        _sendHandle.Dispose();
+                        _sendHandle = default;
+                        break; // Ring full
                     }
-
-                    if (error) break;
-                    consumed = buffer.GetPosition(segment.Length, consumed);
+                    sqe->Opcode = IoUringConstants.IORING_OP_SEND;
+                    SetSqeFd(sqe);
+                    sqe->AddrOrSpliceOffIn = (ulong)_sendHandle.Pointer;
+                    sqe->Len = (uint)first.Length;
+                    sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
+                    HasSendInFlight = true;
                 }
 
-                try
+                _ring.Submit();
+
+                // Yield to the IO loop — it will process other connections' recv/send.
+                // When the send CQE arrives, CompleteSend → SetResult → we resume inline.
+                int sent = await AwaitSendCompletion().ConfigureAwait(false);
+
+                if (sent <= 0)
                 {
-                    reader.AdvanceTo(consumed, buffer.End);
-                }
-                catch (InvalidOperationException)
-                {
-                    return;
+                    reader.AdvanceTo(buffer.Start, buffer.End);
+                    break;
                 }
 
-                if (error) break;
+                reader.AdvanceTo(buffer.GetPosition(sent));
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex, "Unhandled error in output drain for connection {Id}", _connectionId);
+            _logger.LogError(ex, "Unhandled error in send loop for connection {Id}", _connectionId);
         }
         finally
         {
@@ -525,15 +453,12 @@ internal sealed class IoUringConnection : ConnectionContext
         try { _inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
         try { _outputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
 
-        // If a send is still in flight, complete its awaiter so the drain task unblocks.
+        // If a send is still in flight, clean up the handle.
         if (HasSendInFlight)
         {
             HasSendInFlight = false;
             _sendHandle.Dispose();
             _sendHandle = default;
-            var completion = _sendCompletion;
-            _sendCompletion = null;
-            completion?.SetResult(-1);
         }
 
         if (SendZcNotifPending) { _sendZcPendingHandle.Dispose(); SendZcNotifPending = false; }

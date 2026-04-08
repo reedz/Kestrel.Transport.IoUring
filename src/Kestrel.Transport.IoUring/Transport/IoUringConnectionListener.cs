@@ -28,8 +28,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     // Connections that need RECV resubmitted (after async pipe flush completes).
     private readonly ConcurrentQueue<long> _recvResubmitQueue = new();
 
-    // Pending sends from drain tasks, processed by the IO loop (lock-free cross-thread path).
-    private readonly ConcurrentQueue<PendingSend> _pendingSendQueue = new();
+    // Pipe scheduler — routes output pipe reader continuations to the IO loop thread.
+    private IoUringPipeScheduler? _pipeScheduler;
 
     // Connections awaiting close after in-flight ops drain.
     private readonly Dictionary<long, IoUringConnection> _closingConnections = [];
@@ -158,6 +158,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         SubmitEventFdRead();
         _ring.Submit();
 
+        _pipeScheduler = new IoUringPipeScheduler(WakeIoLoop);
+
         var ioThread = new Thread(RunIoLoop)
         {
             IsBackground = true,
@@ -278,11 +280,15 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             {
                 try
                 {
-                    // Drain pending sends before blocking.
-                    DrainPendingSendQueue();
+                    // Drain pipe scheduler work items (send loop continuations).
+                    _pipeScheduler?.DrainWorkItems();
 
                     _ring.SubmitAndWait(1);
                     ProcessCompletions();
+
+                    // Drain work items again — send completions during ProcessCompletions
+                    // may have resumed send loops that filled new SQEs via PipeScheduler.
+                    _pipeScheduler?.DrainWorkItems();
                 }
                 catch (OperationCanceledException)
                 {
@@ -349,24 +355,6 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             _recvRetrySet.Remove(id);
     }
 
-    /// <summary>Drains pending sends from drain tasks and fills SEND SQEs.</summary>
-    private void DrainPendingSendQueue()
-    {
-        while (_pendingSendQueue.TryDequeue(out var pending))
-        {
-            var conn = GetConnection(pending.ConnectionId);
-            if (conn != null && !conn.IsClosing)
-            {
-                conn.SubmitSendFromQueue(in pending);
-            }
-            else
-            {
-                // Connection gone — complete with error so drain task stops.
-                pending.Handle.Dispose();
-                pending.Completion.SetResult(-1);
-            }
-        }
-    }
 
     private void ProcessCompletions()
     {
@@ -387,8 +375,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
             if (cqe.UserData == IoUringConstants.EVENTFD_USER_DATA)
             {
-                // Eventfd fired — drain pending sends and recv resubmits, re-arm.
-                DrainPendingSendQueue();
+                // Eventfd fired — drain pipe scheduler work items and recv resubmits, re-arm.
+                _pipeScheduler?.DrainWorkItems();
                 DrainRecvResubmitQueue();
                 SubmitEventFdRead();
                 continue;
@@ -469,10 +457,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                     remoteEndPoint: null,
                     EndPoint,
                     _receiveBufferSize,
+                    _pipeScheduler!,
                     _logger);
 
                 SetConnection(connId, conn);
-                conn.StartOutputDrain(RequestRecvResubmit, _pendingSendQueue, WakeIoLoop);
+                conn.StartSendLoop(RequestRecvResubmit);
 
                 // Submit multishot recv if buffer ring is available; otherwise single-shot.
                 if (_bufferRing != null)
