@@ -43,6 +43,14 @@ public sealed class IoUringTransportOptions
     public int BufferRingSize { get; set; } = 256;
 
     /// <summary>
+    /// When true, Kestrel HTTP processing runs inline on the IO loop thread,
+    /// eliminating cross-thread hops for maximum throughput (Seastar/ScyllaDB model).
+    /// When false, HTTP processing runs on the ThreadPool (safer for blocking middleware).
+    /// Defaults to true. Set to false if middleware performs blocking I/O.
+    /// </summary>
+    public bool UnsafeInlineScheduling { get; set; } = true;
+
+    /// <summary>
     /// Returns the effective ring size, ensuring it is large enough for the configured
     /// <see cref="MaxConnections"/> (at least <c>2 * MaxConnections + 16</c>, rounded up to
     /// the next power of two).

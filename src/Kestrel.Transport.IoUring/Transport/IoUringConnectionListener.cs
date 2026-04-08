@@ -55,6 +55,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
     private long _nextConnectionId;
     private int _activeConnectionCount;
+    private int _consecutiveErrors;
     private readonly TaskCompletionSource _ioLoopStopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _listenSocketFd;
     private bool _listenSocketFdRefAdded;
@@ -285,6 +286,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
                     _ring.SubmitAndWait(1);
                     ProcessCompletions();
+                    _consecutiveErrors = 0;
 
                     // Drain work items again — send completions during ProcessCompletions
                     // may have resumed send loops that filled new SQEs via PipeScheduler.
@@ -296,7 +298,16 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error in IO loop");
+                    _consecutiveErrors++;
+                    _logger.LogError(ex, "Error in IO loop (consecutive: {Count})", _consecutiveErrors);
+                    if (_consecutiveErrors > 5)
+                    {
+                        // Force-advance CQ to avoid infinite loop on corrupted CQE.
+                        _logger.LogCritical("Too many consecutive IO loop errors — advancing CQ head.");
+                        if (_ring.TryPeekCompletion(out _))
+                            _ring.AdvanceCompletion();
+                        _consecutiveErrors = 0;
+                    }
                     Thread.Sleep(10);
                 }
             }
@@ -458,6 +469,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                     EndPoint,
                     _receiveBufferSize,
                     _pipeScheduler!,
+                    _options.UnsafeInlineScheduling,
                     _logger);
 
                 SetConnection(connId, conn);

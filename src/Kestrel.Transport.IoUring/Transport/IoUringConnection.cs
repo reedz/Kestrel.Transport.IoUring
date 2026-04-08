@@ -13,26 +13,7 @@ using Microsoft.Extensions.Logging;
 
 namespace Kestrel.Transport.IoUring.Transport;
 
-/// <summary>A pending send operation queued from the output-drain task to the IO-loop thread.</summary>
-internal readonly struct PendingSend
-{
-    public readonly long ConnectionId;
-    public readonly MemoryHandle Handle;
-    public readonly nint Pointer;
-    public readonly uint Length;
-    public readonly PooledSendCompletion Completion;
-    public readonly bool UseZeroCopy;
 
-    public PendingSend(long connectionId, MemoryHandle handle, nint pointer, uint length, PooledSendCompletion completion, bool useZeroCopy = false)
-    {
-        ConnectionId = connectionId;
-        Handle = handle;
-        Pointer = pointer;
-        Length = length;
-        Completion = completion;
-        UseZeroCopy = useZeroCopy;
-    }
-}
 
 internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<int>
 {
@@ -113,6 +94,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         EndPoint? localEndPoint,
         int receiveBufferSize,
         IoUringPipeScheduler transportScheduler,
+        bool unsafeInlineScheduling,
         ILogger logger)
     {
         _connectionId = connectionId;
@@ -129,12 +111,15 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         _pinnedRecvBuf = GC.AllocateArray<byte>(receiveBufferSize, pinned: true);
         unsafe { fixed (byte* p = _pinnedRecvBuf) _pinnedRecvPtr = p; }
 
-        // PipeOptions: inline mode — ALL continuations run on the IO loop thread.
-        // Kestrel HTTP processing runs inline on the IO thread (like UnsafePreferInlineScheduling).
-        // This eliminates cross-thread hops: recv → HTTP → send all on one thread.
+        // When UnsafeInlineScheduling is true, Kestrel HTTP processing runs inline on
+        // the IO thread (Seastar model). When false, it runs on the ThreadPool (safer).
+        var appReadScheduler = unsafeInlineScheduling
+            ? (PipeScheduler)transportScheduler
+            : PipeScheduler.ThreadPool;
+
         var inputOptions = new PipeOptions(
             writerScheduler: transportScheduler,
-            readerScheduler: transportScheduler,  // Kestrel reads inline on IO thread
+            readerScheduler: appReadScheduler,
             pauseWriterThreshold: 1024 * 1024,
             resumeWriterThreshold: 512 * 1024,
             useSynchronizationContext: false);
@@ -339,13 +324,6 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         }
     }
 
-    public void OnSendComplete(int bytesSent, PendingSend pending)
-    {
-        HasSendInFlight = false;
-        pending.Handle.Dispose();
-        pending.Completion.SetResult(bytesSent);
-    }
-
     /// <summary>
     /// Starts the send loop. Continuations run on the IO loop thread via IoUringPipeScheduler.
     /// No drain task thread — the output pipe's readerScheduler routes continuations to the IO loop.
@@ -389,37 +367,54 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
                 // Send directly from pipe buffer — no copy needed.
                 // Pin the first segment and submit a SEND SQE.
                 var first = buffer.First;
-                _sendHandle = first.Pin();
+                int offset = 0;
 
-                unsafe
+                while (offset < first.Length)
                 {
-                    if (!_ring.TryGetSqe(out IoUringSqe* sqe))
+                    var slice = first.Slice(offset);
+                    _sendHandle = slice.Pin();
+
+                    bool submitted = false;
+                    try
+                    {
+                        unsafe
+                        {
+                            if (!_ring.TryGetSqe(out IoUringSqe* sqe))
+                            {
+                                _sendHandle.Dispose();
+                                _sendHandle = default;
+                                break; // Ring full
+                            }
+                            sqe->Opcode = IoUringConstants.IORING_OP_SEND;
+                            SetSqeFd(sqe);
+                            sqe->AddrOrSpliceOffIn = (ulong)_sendHandle.Pointer;
+                            sqe->Len = (uint)slice.Length;
+                            sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
+                            HasSendInFlight = true;
+                            submitted = true;
+                        }
+                    }
+                    catch
                     {
                         _sendHandle.Dispose();
                         _sendHandle = default;
-                        break; // Ring full
+                        throw;
                     }
-                    sqe->Opcode = IoUringConstants.IORING_OP_SEND;
-                    SetSqeFd(sqe);
-                    sqe->AddrOrSpliceOffIn = (ulong)_sendHandle.Pointer;
-                    sqe->Len = (uint)first.Length;
-                    sqe->UserData = EncodeUserData(_connectionId, OpType.Send);
-                    HasSendInFlight = true;
+
+                    if (!submitted) break;
+
+                    _ring.Submit();
+
+                    // Yield to the IO loop — it will process other connections' recv/send.
+                    int sent = await AwaitSendCompletion().ConfigureAwait(false);
+
+                    if (sent <= 0) break;
+                    offset += sent;
                 }
 
-                _ring.Submit();
-
-                // Yield to the IO loop — it will process other connections' recv/send.
-                // When the send CQE arrives, CompleteSend → SetResult → we resume inline.
-                int sent = await AwaitSendCompletion().ConfigureAwait(false);
-
-                if (sent <= 0)
-                {
-                    reader.AdvanceTo(buffer.Start, buffer.End);
-                    break;
-                }
-
-                reader.AdvanceTo(buffer.GetPosition(sent));
+                reader.AdvanceTo(buffer.GetPosition(offset > 0 ? offset : 0, buffer.Start),
+                                 buffer.End);
+                if (offset <= 0) break;
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -441,7 +436,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         _outputPipe.Writer.Complete(abortReason);
     }
 
-    public override ValueTask DisposeAsync()
+    public override unsafe ValueTask DisposeAsync()
     {
         if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
             return ValueTask.CompletedTask;
@@ -453,8 +448,9 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         try { _inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
         try { _outputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
 
-        // If a send is still in flight, clean up the handle.
-        if (HasSendInFlight)
+        // Always clean up the send handle — covers the case where Pin() was called
+        // but HasSendInFlight wasn't set yet (abort between Pin and SQE submit).
+        if (HasSendInFlight || _sendHandle.Pointer != null)
         {
             HasSendInFlight = false;
             _sendHandle.Dispose();
