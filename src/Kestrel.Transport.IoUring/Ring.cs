@@ -19,6 +19,9 @@ public sealed class Ring : IDisposable
     private readonly nuint _cqMapSize;  // 0 when singleMmap
     private readonly bool _singleMmap;
 
+    /// <summary>The actual setup flags accepted by the kernel after fallbacks.</summary>
+    public uint SetupFlags { get; }
+
     /// <summary>
     /// Lock protecting SQ ring access (TryGetSqe, Flush).
     /// Callers must hold this lock while calling <see cref="TryGetSqe"/> and filling the SQE.
@@ -61,31 +64,52 @@ public sealed class Ring : IDisposable
         }
     }
 
-    /// <summary>Initializes a new io_uring instance with the specified queue depth and optional setup flags.</summary>
+    /// <summary>Initializes a new io_uring instance with the specified queue depth and optional setup flags.
+    /// On EINVAL (typically older kernels lacking newer flag support), drops the optional flags
+    /// in the order DEFER_TASKRUN → SINGLE_ISSUER → COOP_TASKRUN → SQPOLL → none, and retries.</summary>
     public unsafe Ring(uint entries, uint setupFlags = 0)
     {
+        // Order matters: drop newest/most-restrictive flags first so older kernels still benefit
+        // from older flags (e.g. COOP_TASKRUN on a 5.19 kernel that doesn't support DEFER_TASKRUN).
+        // Each entry is a flag-mask removed from setupFlags on retry.
+        ReadOnlySpan<uint> dropOrder = stackalloc uint[]
+        {
+            IoUringConstants.IORING_SETUP_DEFER_TASKRUN,
+            IoUringConstants.IORING_SETUP_SINGLE_ISSUER,
+            IoUringConstants.IORING_SETUP_COOP_TASKRUN,
+            IoUringConstants.IORING_SETUP_SQPOLL,
+        };
+
         IoUringParams p = default;
         p.Flags = setupFlags;
         int fd = IoUringNative.IoUringSetup(entries, &p);
-        if (fd < 0)
+        int dropIdx = 0;
+        while (fd < 0)
         {
             int err = Marshal.GetLastPInvokeError();
-            // EINVAL may mean unsupported flags — retry without optional flags.
-            if (err == 22 /* EINVAL */ && setupFlags != 0)
+            if (err != 22 /* EINVAL */ || setupFlags == 0)
+                throw new InvalidOperationException($"io_uring_setup failed with errno {err} (flags=0x{setupFlags:x})");
+            // Try dropping the next flag in the drop order; if none left, fall back to flags=0.
+            bool dropped = false;
+            while (dropIdx < dropOrder.Length)
             {
-                p = default;
-                fd = IoUringNative.IoUringSetup(entries, &p);
-                if (fd < 0)
+                uint flag = dropOrder[dropIdx++];
+                if ((setupFlags & flag) != 0)
                 {
-                    err = Marshal.GetLastPInvokeError();
-                    throw new InvalidOperationException($"io_uring_setup failed with errno {err}");
+                    setupFlags &= ~flag;
+                    dropped = true;
+                    break;
                 }
             }
-            else
+            if (!dropped)
             {
-                throw new InvalidOperationException($"io_uring_setup failed with errno {err}");
+                setupFlags = 0;
             }
+            p = default;
+            p.Flags = setupFlags;
+            fd = IoUringNative.IoUringSetup(entries, &p);
         }
+        SetupFlags = setupFlags;
 
         _ringFd = fd;
 
@@ -257,14 +281,20 @@ public sealed class Ring : IDisposable
     /// <summary>The io_uring file descriptor — needed for buffer ring registration.</summary>
     internal int Fd => _ringFd;
 
+    /// <summary>True iff DEFER_TASKRUN is enabled — callers must always pass GETEVENTS to drain completions.</summary>
+    internal bool RequiresGetEventsToDrain => (SetupFlags & IoUringConstants.IORING_SETUP_DEFER_TASKRUN) != 0;
+
     /// <summary>Flushes pending submission queue entries and submits them to the kernel.</summary>
     public int Submit()
     {
         uint toSubmit;
         lock (SubmitLock) { toSubmit = _sq.Flush(); }
-        if (toSubmit == 0)
+        // With DEFER_TASKRUN, completions only run when we enter with GETEVENTS — pass it
+        // even on a "submit-only" call so the kernel processes any queued task work.
+        uint flags = RequiresGetEventsToDrain ? IoUringConstants.IORING_ENTER_GETEVENTS : 0u;
+        if (toSubmit == 0 && flags == 0)
             return 0;
-        return Enter(toSubmit, 0, 0);
+        return Enter(toSubmit, 0, flags);
     }
 
     /// <summary>Submits pending entries and waits for at least <paramref name="minComplete"/> completions.</summary>
@@ -272,7 +302,11 @@ public sealed class Ring : IDisposable
     {
         uint toSubmit;
         lock (SubmitLock) { toSubmit = _sq.Flush(); }
-        uint flags = minComplete > 0 ? IoUringConstants.IORING_ENTER_GETEVENTS : 0u;
+        // With DEFER_TASKRUN, ALWAYS pass GETEVENTS — even when minComplete is 0 — so the
+        // kernel actually drains task work into CQEs.
+        uint flags = (minComplete > 0 || RequiresGetEventsToDrain)
+            ? IoUringConstants.IORING_ENTER_GETEVENTS
+            : 0u;
         if (_sq.NeedsWakeup)
             flags |= IoUringConstants.IORING_ENTER_SQ_WAKEUP;
         return Enter(toSubmit, minComplete, flags);

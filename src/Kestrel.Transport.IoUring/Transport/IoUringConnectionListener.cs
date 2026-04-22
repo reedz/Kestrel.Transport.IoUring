@@ -53,6 +53,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private ProvidedBufferRing? _bufferRing;
     private const ushort RECV_BUF_GROUP_ID = 0;
     private const int ENOBUFS = 105; // errno for buffer ring exhaustion
+    private const int EPIPE = 32;
+    private const int ECONNRESET = 104;
 
     private long _nextConnectionId;
     private int _activeConnectionCount;
@@ -67,6 +69,15 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     // Registered file indices for fixed-fd SQEs (-1 = not registered).
     private int _listenSocketFileIndex = -1;
     private int _eventFdFileIndex = -1;
+
+    // Diagnostic timers for SendDiagnostics + RecvDiagnostics periodic logging
+    // (null when disabled). RecvDiagnostics shares the LogPoolStatsInterval flag.
+    private Timer? _diagTimer;
+    private Timer? _recvDiagTimer;
+
+    // Process-wide counter of accept-channel drops (S0.1). Inspected by
+    // diagnostics; reset is not supported because it would race the writer.
+    internal static long s_acceptChannelDrops;
 
     public EndPoint EndPoint { get; }
 
@@ -159,7 +170,16 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
         SubmitAccept();
         SubmitEventFdRead();
-        _ring.Submit();
+
+        // Submit pending SQEs to the kernel. NOTE: when EnableSingleIssuer is true, this
+        // would bind the issuer task to the constructor thread (wrong); the IO loop's
+        // first SubmitAndWait would also try to bind and fail. SINGLE_ISSUER is therefore
+        // disabled by default until submissions are routed exclusively through the IO
+        // loop. With SINGLE_ISSUER off, this Submit is fine on any thread.
+        if (!_options.EnableSingleIssuer)
+        {
+            _ring.Submit();
+        }
 
         _pipeScheduler = new IoUringPipeScheduler(WakeIoLoop);
 
@@ -169,6 +189,24 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             Name = "io_uring IO Loop",
         };
         ioThread.Start();
+
+        // Opt-in periodic diagnostic logging (Round-3, Opt G validation).
+        // Read interval from option OR env var (env var allows debug without source changes
+        // in benchmark fork that still references published v2.1.0 NuGet metadata).
+        int statsInterval = _options.LogPoolStatsInterval;
+        if (statsInterval <= 0 &&
+            int.TryParse(Environment.GetEnvironmentVariable("IOURING_LOG_POOL_STATS_INTERVAL"), out var envInt) &&
+            envInt > 0)
+        {
+            statsInterval = envInt;
+        }
+        if (statsInterval > 0)
+        {
+            _diagTimer = Diagnostics.SendDiagnostics.StartPeriodicLogger(_logger, statsInterval);
+            _recvDiagTimer = Diagnostics.RecvDiagnostics.StartPeriodicLogger(_logger, statsInterval);
+            _logger.LogInformation("[io_uring diag] periodic send+recv counters enabled (interval={Interval}s)",
+                statsInterval);
+        }
     }
 
     private static int GetSocketFd(Socket socket) =>
@@ -198,12 +236,15 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
             sqe->Opcode = IoUringConstants.IORING_OP_ACCEPT;
+            sqe->Flags = 0;
             sqe->AddrOrSpliceOffIn = 0;
             sqe->OffOrAddr2 = 0;
             sqe->Len = 0;
+            sqe->OpFlags = 0;
+            sqe->IoPrio = 0;
             sqe->UserData = IoUringConnection.EncodeUserData(0, 0, IoUringConnection.OpType.Accept);
             if (_useMultishotAccept)
-                sqe->OpFlags = IoUringConstants.IORING_ACCEPT_MULTISHOT;
+                sqe->IoPrio = (ushort)IoUringConstants.IORING_ACCEPT_MULTISHOT; // multishot is set in ioprio, NOT op_flags
             if (_listenSocketFileIndex >= 0)
             {
                 sqe->Fd = _listenSocketFileIndex;
@@ -227,8 +268,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
             sqe->Opcode = IoUringConstants.IORING_OP_READ;
+            sqe->Flags = 0;
             sqe->AddrOrSpliceOffIn = (ulong)(nint)Unsafe.AsPointer(ref _eventFdReadBuf[0]);
             sqe->Len = sizeof(ulong);
+            sqe->OpFlags = 0;
+            sqe->IoPrio = 0;
             sqe->UserData = IoUringConstants.EVENTFD_USER_DATA;
             if (_eventFdFileIndex >= 0)
             {
@@ -279,6 +323,21 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
     private void RunIoLoop()
     {
+        // OPT B: mark this thread so PipeScheduler.Schedule called on the IO loop
+        // (e.g. via SetResult-inlined async continuations during ProcessCompletions)
+        // skips the eventfd write — the outer loop will drain on next iteration.
+        IoUringPipeScheduler.MarkIoThread();
+
+        // OPT C: spin budget before parking on SubmitAndWait. Configurable via
+        // env var IOURING_SPIN_COUNT. 0 disables (legacy behaviour: always block).
+        // When >0, after a productive iteration we spin briefly polling for new
+        // CQEs / pipe-scheduler work before re-blocking — reduces wakeup latency
+        // under sustained load (epoll-style busy poll).
+        int spinBudget = 0;
+        var spinEnv = Environment.GetEnvironmentVariable("IOURING_SPIN_COUNT");
+        if (!string.IsNullOrEmpty(spinEnv) && int.TryParse(spinEnv, out var parsed) && parsed > 0)
+            spinBudget = parsed;
+
         var token = _cts.Token;
         try
         {
@@ -289,8 +348,39 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                     // Drain pipe scheduler work items (send loop continuations).
                     _pipeScheduler?.DrainWorkItems();
 
-                    _ring.SubmitAndWait(1);
-                    ProcessCompletions();
+                    bool didWork = false;
+                    if (spinBudget > 0)
+                    {
+                        // Submit any pending SQEs (no wait). If CQEs are already there OR
+                        // the pipe scheduler has work, process them without parking.
+                        _ring.Submit();
+                        for (int i = 0; i < spinBudget; i++)
+                        {
+                            if (_ring.TryPeekCompletion(out _))
+                            {
+                                ProcessCompletions();
+                                didWork = true;
+                                break;
+                            }
+                            if (_pipeScheduler != null && _pipeScheduler.HasWork)
+                            {
+                                _pipeScheduler.DrainWorkItems();
+                                didWork = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!didWork)
+                    {
+                        // OPT F: dynamic min_complete. If the pipe scheduler already has
+                        // queued work (e.g. another connection's send-loop staged an SQE
+                        // and bumped the eventfd), don't park waiting for a CQE — submit
+                        // and return immediately so we drain that work next iteration.
+                        uint minComplete = (_pipeScheduler != null && _pipeScheduler.HasWork) ? 0u : 1u;
+                        _ring.SubmitAndWait(minComplete);
+                        ProcessCompletions();
+                    }
                     _consecutiveErrors = 0;
 
                     // Drain work items again — send completions during ProcessCompletions
@@ -332,7 +422,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             if (conn != null && !conn.IsClosing && !conn.HasRecvInFlight)
             {
                 if (conn.UsingMultishotRecv && _bufferRing != null)
-                    conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID);
+                {
+                    if (!conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID))
+                        _recvRetrySet.Add(connId);
+                }
                 else if (!conn.SubmitRecv())
                     _recvRetrySet.Add(connId);
             }
@@ -350,16 +443,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             var conn = GetConnection(connId);
             if (conn != null && !conn.IsClosing && !conn.HasRecvInFlight)
             {
-                bool ok;
-                if (conn.UsingMultishotRecv && _bufferRing != null)
-                {
-                    conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID);
-                    ok = true;
-                }
-                else
-                {
-                    ok = conn.SubmitRecv();
-                }
+                bool ok = conn.UsingMultishotRecv && _bufferRing != null
+                    ? conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID)
+                    : conn.SubmitRecv();
                 if (ok) retried.Add(connId);
             }
             else
@@ -394,9 +480,16 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 conn.HasRecvInFlight = false;
                 hadStaleOps = true;
                 // Resubmit recv to resume receiving on this connection.
+                // S0.3: must use the SAME recv mode (multishot vs single-shot) the
+                // connection was originally using; otherwise we silently downgrade
+                // a multishot+buffer-ring connection to single-shot, leaving its
+                // pinned recv buffer unused and breaking buffer-ring semantics.
                 if (!conn.IsClosing)
                 {
-                    if (!conn.SubmitRecv())
+                    bool ok = conn.UsingMultishotRecv && _bufferRing != null
+                        ? conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID)
+                        : conn.SubmitRecv();
+                    if (!ok)
                         _recvRetrySet.Add(conn.NumericConnectionId);
                 }
             }
@@ -548,18 +641,44 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                     _receiveBufferSize,
                     _pipeScheduler!,
                     _options.UnsafeInlineScheduling,
-                    _logger);
+                    _logger,
+                    useBufferRing: _bufferRing != null);
 
                 SetConnection(connId, conn);
                 conn.StartSendLoop(RequestRecvResubmit);
 
                 // Submit multishot recv if buffer ring is available; otherwise single-shot.
                 if (_bufferRing != null)
-                    conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID);
+                {
+                    if (!conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID))
+                    {
+                        Diagnostics.RecvDiagnostics.OnMultishotRearmSqFull();
+                        _recvRetrySet.Add(connId);
+                        Diagnostics.RecvDiagnostics.OnRecvRetryDepth(_recvRetrySet.Count);
+                    }
+                }
                 else if (!conn.SubmitRecv())
+                {
+                    Diagnostics.RecvDiagnostics.OnSingleshotRearmSqFull();
                     _recvRetrySet.Add(connId);
+                    Diagnostics.RecvDiagnostics.OnRecvRetryDepth(_recvRetrySet.Count);
+                }
 
-                _acceptChannel.Writer.TryWrite(conn);
+                // S0.1: bounded accept channel (capacity AcceptQueueCapacity, default 128).
+                // If full under burst, the accepted connection would previously be leaked
+                // (slot allocated, send loop running, recv armed, but never observed by
+                // Kestrel). Tear it down cleanly so the slot is freed.
+                if (!_acceptChannel.Writer.TryWrite(conn))
+                {
+                    Interlocked.Increment(ref s_acceptChannelDrops);
+                    Diagnostics.RecvDiagnostics.OnAcceptChannelDrop();
+                    // Cancel CTS + complete pipes so the send loop exits and any in-flight
+                    // recv (multishot or single-shot) is observed as a close. Then route
+                    // through the standard close path which frees the slot, drains
+                    // in-flight ops, and issues CLOSE on the socket fd.
+                    try { conn.Abort(new ConnectionAbortedException("Accept channel full")); } catch { }
+                    BeginCloseConnection(connId, conn);
+                }
             }
 
             _acceptMultishotActive = more;
@@ -608,9 +727,16 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 // ENOBUFS: buffer ring empty — transient, rearm later.
                 if (result == -ENOBUFS)
                 {
+                    Diagnostics.RecvDiagnostics.OnRecvEnobufs();
                     _recvRetrySet.Add(connectionId);
+                    Diagnostics.RecvDiagnostics.OnRecvRetryDepth(_recvRetrySet.Count);
                     return false;
                 }
+
+                if (result == 0) Diagnostics.RecvDiagnostics.OnRecvCleanClose();
+                else if (result == -EPIPE) Diagnostics.RecvDiagnostics.OnRecvEpipe();
+                else if (result == -ECONNRESET) Diagnostics.RecvDiagnostics.OnRecvEconnreset();
+                else Diagnostics.RecvDiagnostics.OnRecvOtherError();
 
                 _inputPipeComplete(conn);
                 BeginCloseConnection(connectionId, conn);
@@ -623,10 +749,17 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 bool flushOk = conn.OnRecvCompleteFromBuffer(bufSpan);
                 _bufferRing.RecycleBuffer(bufferId);
 
+                if (!flushOk) Diagnostics.RecvDiagnostics.OnAsyncFlushPending();
+
                 // Rearm if multishot ended, flush was sync-ok, and no async rearm pending.
                 if (!more && flushOk && !conn.RecvRearmPending)
                 {
-                    conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID);
+                    if (!conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID))
+                    {
+                        Diagnostics.RecvDiagnostics.OnMultishotRearmSqFull();
+                        _recvRetrySet.Add(connectionId);
+                        Diagnostics.RecvDiagnostics.OnRecvRetryDepth(_recvRetrySet.Count);
+                    }
                     return true;
                 }
             }
@@ -638,6 +771,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
         if (result <= 0)
         {
+            if (result == 0) Diagnostics.RecvDiagnostics.OnRecvCleanClose();
+            else if (result == -EPIPE) Diagnostics.RecvDiagnostics.OnRecvEpipe();
+            else if (result == -ECONNRESET) Diagnostics.RecvDiagnostics.OnRecvEconnreset();
+            else Diagnostics.RecvDiagnostics.OnRecvOtherError();
             BeginCloseConnection(connectionId, conn);
             return false;
         }
@@ -645,7 +782,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         if (resubmit)
         {
             if (!conn.SubmitRecv())
+            {
+                Diagnostics.RecvDiagnostics.OnSingleshotRearmSqFull();
                 _recvRetrySet.Add(connectionId);
+                Diagnostics.RecvDiagnostics.OnRecvRetryDepth(_recvRetrySet.Count);
+            }
             return true;
         }
         return false;
@@ -765,6 +906,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _eventFdWriteHandle.Dispose();
         _sockOptHandle.Dispose();
         _bufferRing?.Dispose();
+        _diagTimer?.Dispose();
+        _recvDiagTimer?.Dispose();
         Libc.close(_eventFd);
 
         if (_listenSocketFdRefAdded)

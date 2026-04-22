@@ -93,7 +93,9 @@ internal static class IoUringConstants
 
     // io_uring_setup flags.
     public const uint IORING_SETUP_COOP_TASKRUN = 1u << 8;
+    public const uint IORING_SETUP_TASKRUN_FLAG = 1u << 9;
     public const uint IORING_SETUP_SINGLE_ISSUER = 1u << 12;
+    public const uint IORING_SETUP_DEFER_TASKRUN = 1u << 13;
 
     // SQE flags for fixed files.
     public const byte IOSQE_FIXED_FILE = 1 << 0;

@@ -51,12 +51,21 @@ internal sealed class IoUringMultiListener : IConnectionListener
             EnableSqPoll = options.EnableSqPoll,
             EnableBufferRing = options.EnableBufferRing,
             BufferRingSize = options.BufferRingSize,
+            EnableCoopTaskRun = options.EnableCoopTaskRun,
+            EnableSingleIssuer = options.EnableSingleIssuer,
+            EnableDeferTaskRun = options.EnableDeferTaskRun,
         };
 
         // Compute setup flags once for all workers.
         uint setupFlags = 0;
         if (options.EnableSqPoll)
             setupFlags |= IoUringConstants.IORING_SETUP_SQPOLL;
+        if (options.EnableCoopTaskRun)
+            setupFlags |= IoUringConstants.IORING_SETUP_COOP_TASKRUN;
+        if (options.EnableSingleIssuer)
+            setupFlags |= IoUringConstants.IORING_SETUP_SINGLE_ISSUER;
+        if (options.EnableDeferTaskRun && options.EnableSingleIssuer)
+            setupFlags |= IoUringConstants.IORING_SETUP_DEFER_TASKRUN;
 
         _workers = new IoUringConnectionListener[threadCount];
         _forwardTasks = new Task[threadCount];

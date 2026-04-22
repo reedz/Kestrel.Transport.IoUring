@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.IO.Pipelines;
+using System.Threading;
 
 namespace Kestrel.Transport.IoUring.Transport;
 
@@ -13,7 +14,21 @@ internal sealed class IoUringPipeScheduler : PipeScheduler
 {
     private readonly ConcurrentQueue<Work> _queue = new();
     private readonly Action _wakeIoLoop;
-    private volatile bool _signalPending;
+    // 0 = no signal pending, 1 = eventfd write already issued and not yet drained.
+    private int _signalPending;
+
+    [ThreadStatic]
+    private static bool t_isIoThread;
+
+    /// <summary>Marks the calling thread as the IO loop thread; calls to Schedule from this
+    /// thread will enqueue work but will NOT write the eventfd (the outer loop drains inline).</summary>
+    public static void MarkIoThread() => t_isIoThread = true;
+
+    /// <summary>Last drain count — diagnostic only, exposed to logs.</summary>
+    public int LastDrainedCount;
+
+    /// <summary>True if the queue has work waiting and we have NOT signalled yet (IO thread can avoid parking).</summary>
+    public bool HasWork => !_queue.IsEmpty;
 
     private readonly struct Work
     {
@@ -35,10 +50,16 @@ internal sealed class IoUringPipeScheduler : PipeScheduler
     public override void Schedule(Action<object?> action, object? state)
     {
         _queue.Enqueue(new Work(action, state));
-        // Coalesce wakeups: only write eventfd if no signal is already pending.
-        if (!_signalPending)
+
+        // OPT B: if we're already on the IO thread, the outer loop will drain
+        // before re-parking. No need to write the eventfd at all.
+        if (t_isIoThread)
+            return;
+
+        // OPT A: strict CAS coalesce. Only one off-loop producer wins the race
+        // to write the eventfd between drains.
+        if (Interlocked.Exchange(ref _signalPending, 1) == 0)
         {
-            _signalPending = true;
             _wakeIoLoop();
         }
     }
@@ -48,10 +69,15 @@ internal sealed class IoUringPipeScheduler : PipeScheduler
     /// </summary>
     public void DrainWorkItems()
     {
-        _signalPending = false;
+        // Clear BEFORE draining so any producer enqueuing during/after the drain
+        // still races to publish a wake (correctness: we never miss a signal).
+        Volatile.Write(ref _signalPending, 0);
+        int drained = 0;
         while (_queue.TryDequeue(out var work))
         {
             work.Callback(work.State);
+            drained++;
         }
+        LastDrainedCount = drained;
     }
 }

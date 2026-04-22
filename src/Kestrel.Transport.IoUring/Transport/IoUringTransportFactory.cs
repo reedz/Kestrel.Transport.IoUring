@@ -70,6 +70,13 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
         uint flags = 0;
         if (_options.EnableSqPoll)
             flags |= IoUringConstants.IORING_SETUP_SQPOLL;
+        if (_options.EnableCoopTaskRun)
+            flags |= IoUringConstants.IORING_SETUP_COOP_TASKRUN;
+        if (_options.EnableSingleIssuer)
+            flags |= IoUringConstants.IORING_SETUP_SINGLE_ISSUER;
+        // DEFER_TASKRUN requires SINGLE_ISSUER; the kernel will EINVAL otherwise (and Ring will retry).
+        if (_options.EnableDeferTaskRun && _options.EnableSingleIssuer)
+            flags |= IoUringConstants.IORING_SETUP_DEFER_TASKRUN;
         return flags;
     }
 }

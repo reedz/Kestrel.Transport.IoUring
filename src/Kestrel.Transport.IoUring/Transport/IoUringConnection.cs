@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Threading.Tasks.Sources;
+using Kestrel.Transport.IoUring.Diagnostics;
 using Kestrel.Transport.IoUring.Native;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Http.Features;
@@ -90,8 +91,12 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     /// <summary>True when an async flush is pending and will trigger a recv rearm on completion.</summary>
     internal bool RecvRearmPending { get; set; }
 
-    // Pre-pinned recv buffer — eliminates Pin()/Dispose() per recv.
-    private readonly byte[] _pinnedRecvBuf;
+    // Pre-pinned recv buffer for the SINGLE-SHOT path. Null when the connection was
+    // constructed for the buffer-ring (multishot) path — in that case the kernel
+    // selects buffers from the provided buffer ring and we never copy via this array.
+    // S1: skipping this 4 KB POH allocation when buffer ring is active saves
+    // ~ReceiveBufferSize × MaxConnections × ThreadCount of pinned heap.
+    private readonly byte[]? _pinnedRecvBuf;
     private readonly unsafe byte* _pinnedRecvPtr;
 
     public IoUringConnection(
@@ -104,7 +109,8 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         int receiveBufferSize,
         IoUringPipeScheduler transportScheduler,
         bool unsafeInlineScheduling,
-        ILogger logger)
+        ILogger logger,
+        bool useBufferRing = false)
     {
         _connectionId = connectionId;
         _socketFd = socketFd;
@@ -116,9 +122,18 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         RemoteEndPoint = remoteEndPoint;
         LocalEndPoint = localEndPoint;
 
-        // Pre-pin recv buffer to avoid Pin()/Dispose() on every recv.
-        _pinnedRecvBuf = GC.AllocateArray<byte>(receiveBufferSize, pinned: true);
-        unsafe { fixed (byte* p = _pinnedRecvBuf) _pinnedRecvPtr = p; }
+        // Pre-pin recv buffer to avoid Pin()/Dispose() on every recv. Skip when the
+        // listener will use multishot+buffer-ring for this connection (S1).
+        if (!useBufferRing)
+        {
+            _pinnedRecvBuf = GC.AllocateArray<byte>(receiveBufferSize, pinned: true);
+            unsafe { fixed (byte* p = _pinnedRecvBuf) _pinnedRecvPtr = p; }
+        }
+        else
+        {
+            _pinnedRecvBuf = null;
+            unsafe { _pinnedRecvPtr = null; }
+        }
 
         // When UnsafeInlineScheduling is true, Kestrel HTTP processing runs inline on
         // the IO thread (Seastar model). When false, it runs on the ThreadPool (safer).
@@ -155,6 +170,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     /// <summary>Sets the fd on an SQE, using fixed-file index if registered.</summary>
     private unsafe void SetSqeFd(IoUringSqe* sqe)
     {
+        sqe->Flags = 0; // ensure clean slate — SQEs are reused; |= below would carry stale bits
         if (_fileIndex >= 0)
         {
             sqe->Fd = _fileIndex;
@@ -177,6 +193,8 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             SetSqeFd(sqe);
             sqe->AddrOrSpliceOffIn = (ulong)_pinnedRecvPtr;
             sqe->Len = (uint)_receiveBufferSize;
+            sqe->OpFlags = 0;
+            sqe->IoPrio = 0;
             sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Recv);
             HasRecvInFlight = true;
             return true;
@@ -189,22 +207,34 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     /// Submits a multishot RECV SQE with buffer selection from a provided buffer ring.
     /// The kernel will select buffers from the specified group and generate multiple CQEs.
     /// No per-recv Pin() needed — the buffer ring owns the memory.
+    /// Returns true if the SQE was queued; false if the SQ was full (caller should retry).
     /// </summary>
-    public unsafe void SubmitMultishotRecv(ushort bufferGroupId)
+    public unsafe bool SubmitMultishotRecv(ushort bufferGroupId)
     {
-        if (_ring.TryGetSqe(out IoUringSqe* sqe))
+        if (!_ring.TryGetSqe(out IoUringSqe* sqe))
         {
-            sqe->Opcode = IoUringConstants.IORING_OP_RECV;
-            SetSqeFd(sqe);
-            sqe->AddrOrSpliceOffIn = 0; // kernel selects buffer
-            sqe->Len = 0;              // kernel determines length from buffer ring
-            sqe->OpFlags = IoUringConstants.IORING_RECV_MULTISHOT;
-            sqe->Flags = IoUringConstants.IOSQE_BUFFER_SELECT;
-            sqe->BufIndexOrGroup = bufferGroupId;
-            sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Recv);
-            HasRecvInFlight = true;
-            UsingMultishotRecv = true;
+            // S0.2: previously this returned silently, leaving the connection without
+            // an armed recv (it would never receive again). Caller must add to the
+            // retry set so the IO loop reattempts on the next iteration.
+            return false;
         }
+
+        sqe->Opcode = IoUringConstants.IORING_OP_RECV;
+        SetSqeFd(sqe);
+        sqe->AddrOrSpliceOffIn = 0; // kernel selects buffer
+        sqe->Len = 0;              // kernel determines length from buffer ring
+        sqe->OpFlags = 0; // recv_flags (MSG_xxx) — none
+        sqe->IoPrio = (ushort)IoUringConstants.IORING_RECV_MULTISHOT; // multishot is set in ioprio, NOT op_flags
+        // Use |= to preserve any flags already set by SetSqeFd (e.g. IOSQE_FIXED_FILE).
+        // Regression of commit 2cd6067 — overwriting flags here caused recv to read from
+        // wrong fd when fixed-file table is registered, producing immediate -ENOTSOCK
+        // (or similar) and causing every connection to close right after accept.
+        sqe->Flags |= IoUringConstants.IOSQE_BUFFER_SELECT;
+        sqe->BufIndexOrGroup = bufferGroupId;
+        sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Recv);
+        HasRecvInFlight = true;
+        UsingMultishotRecv = true;
+        return true;
     }
 
     /// <summary>Completes the input pipe writer (called by listener on recv close).</summary>
@@ -246,6 +276,9 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     // Send state — only accessed from the IO loop thread (via pipe scheduler).
     private MemoryHandle _sendHandle;
     private MemoryHandle _sendZcPendingHandle;
+    // Diagnostic shadow state: timestamp + byte count of the current pin (0 when no pin held).
+    private long _sendPinStartTs;
+    private int _sendPinByteLen;
     internal bool SendZcNotifPending { get; set; }
 
     /// <summary>
@@ -270,8 +303,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         {
             HasSendInFlight = false;
         }
-        _sendHandle.Dispose();
-        _sendHandle = default;
+        DisposeSendPin();
         // Signal the send loop to resume — continuation runs inline on IO thread.
         _sendTcs.SetResult(bytesSent);
     }
@@ -336,6 +368,27 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         }
     }
 
+    /// <summary>Pins a slice for SEND and records diagnostic counters. IO-loop thread only.</summary>
+    private void PinSendSlice(ReadOnlyMemory<byte> slice)
+    {
+        _sendHandle = slice.Pin();
+        _sendPinByteLen = slice.Length;
+        _sendPinStartTs = SendDiagnostics.OnPinStart(slice.Length);
+    }
+
+    /// <summary>Disposes the current SEND pin (if any) and records diagnostic counters.</summary>
+    private unsafe void DisposeSendPin()
+    {
+        if (_sendHandle.Pointer != null)
+        {
+            _sendHandle.Dispose();
+            SendDiagnostics.OnPinDispose(_sendPinStartTs, _sendPinByteLen);
+        }
+        _sendHandle = default;
+        _sendPinStartTs = 0;
+        _sendPinByteLen = 0;
+    }
+
     /// <summary>
     /// Starts the send loop. Continuations run on the IO loop thread via IoUringPipeScheduler.
     /// No drain task thread — the output pipe's readerScheduler routes continuations to the IO loop.
@@ -376,57 +429,73 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
                     continue;
                 }
 
-                // Send directly from pipe buffer — no copy needed.
-                // Pin the first segment and submit a SEND SQE.
-                var first = buffer.First;
-                int offset = 0;
-
-                while (offset < first.Length)
+                // Send across all segments of the buffer (multi-segment safe).
+                // Bug history: previously only buffer.First was sent and the rest
+                // was silently dropped via AdvanceTo(examined: buffer.End).
+                long totalConsumed = 0;
+                bool aborted = false;
+                foreach (var segment in buffer)
                 {
-                    var slice = first.Slice(offset);
-                    _sendHandle = slice.Pin();
-
-                    bool submitted = false;
-                    try
+                    int segOffset = 0;
+                    while (segOffset < segment.Length)
                     {
-                        unsafe
+                        var slice = segment.Slice(segOffset);
+                        PinSendSlice(slice);
+                        int requestedLen = slice.Length;
+
+                        bool submitted = false;
+                        try
                         {
-                            if (!_ring.TryGetSqe(out IoUringSqe* sqe))
+                            unsafe
                             {
-                                _sendHandle.Dispose();
-                                _sendHandle = default;
-                                break; // Ring full
+                                if (!_ring.TryGetSqe(out IoUringSqe* sqe))
+                                {
+                                    DisposeSendPin();
+                                    break; // Ring full — yield and retry next iteration.
+                                }
+                                sqe->Opcode = IoUringConstants.IORING_OP_SEND;
+                                SetSqeFd(sqe);
+                                sqe->AddrOrSpliceOffIn = (ulong)_sendHandle.Pointer;
+                                sqe->Len = (uint)slice.Length;
+                                sqe->OpFlags = 0;
+                                sqe->IoPrio = 0;
+                                sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Send);
+                                HasSendInFlight = true;
+                                submitted = true;
                             }
-                            sqe->Opcode = IoUringConstants.IORING_OP_SEND;
-                            SetSqeFd(sqe);
-                            sqe->AddrOrSpliceOffIn = (ulong)_sendHandle.Pointer;
-                            sqe->Len = (uint)slice.Length;
-                            sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Send);
-                            HasSendInFlight = true;
-                            submitted = true;
                         }
+                        catch
+                        {
+                            DisposeSendPin();
+                            throw;
+                        }
+
+                        if (!submitted) break;
+
+                        // Opt E: do NOT call _ring.Submit() here. The send loop (with Opt B)
+                        // runs on the IO thread; the IO loop's next SubmitAndWait at the top
+                        // of RunIoLoop will submit this SQE along with any others. Saves one
+                        // io_uring_enter syscall per send. Off-IO-thread send schedules go
+                        // through IoUringPipeScheduler, which writes to eventfd → the IO loop
+                        // wakes from SubmitAndWait → also submits this SQE.
+
+                        // Yield to the IO loop — it will process other connections' recv/send.
+                        int sent = await AwaitSendCompletion().ConfigureAwait(false);
+
+                        if (sent <= 0) { aborted = true; break; }
+                        if (sent < requestedLen) SendDiagnostics.OnShortSendResubmit();
+                        segOffset += sent;
+                        totalConsumed += sent;
                     }
-                    catch
-                    {
-                        _sendHandle.Dispose();
-                        _sendHandle = default;
-                        throw;
-                    }
-
-                    if (!submitted) break;
-
-                    _ring.Submit();
-
-                    // Yield to the IO loop — it will process other connections' recv/send.
-                    int sent = await AwaitSendCompletion().ConfigureAwait(false);
-
-                    if (sent <= 0) break;
-                    offset += sent;
+                    if (aborted) break;
+                    if (segOffset < segment.Length) break; // SQ-full; resume next ReadAsync.
                 }
 
-                reader.AdvanceTo(buffer.GetPosition(offset > 0 ? offset : 0, buffer.Start),
-                                 buffer.End);
-                if (offset <= 0) break;
+                // Tell the pipe how many bytes we consumed; examined = consumed so the
+                // pipe will return immediately if more data is buffered.
+                var consumedPos = buffer.GetPosition(totalConsumed, buffer.Start);
+                reader.AdvanceTo(consumedPos, consumedPos);
+                if (aborted) break;
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -465,9 +534,16 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         // but HasSendInFlight wasn't set yet (abort between Pin and SQE submit).
         if (HasSendInFlight || _sendHandle.Pointer != null)
         {
+            // Diagnostic: surface aborts that race with an in-flight send. If this fires,
+            // the kernel may still touch the buffer after we've freed it (use-after-free).
+            // The current per-send Pin() approach is correct only because MemoryHandle
+            // back-references the GC pin to the MemoryPool block, which keeps the block
+            // alive until Dispose. Once Opt G lands, slot lifecycle will be tied to CQE
+            // arrival instead of to the connection — this counter validates that.
+            if (HasSendInFlight) SendDiagnostics.OnSendAbortWithPinned();
+
             HasSendInFlight = false;
-            _sendHandle.Dispose();
-            _sendHandle = default;
+            DisposeSendPin();
         }
 
         if (SendZcNotifPending) { _sendZcPendingHandle.Dispose(); SendZcNotifPending = false; }
@@ -497,8 +573,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     /// <summary>Disposes any pinned send handle (for CQ overflow recovery).</summary>
     internal void CleanupSendHandle()
     {
-        _sendHandle.Dispose();
-        _sendHandle = default;
+        DisposeSendPin();
     }
 
     /// <summary>

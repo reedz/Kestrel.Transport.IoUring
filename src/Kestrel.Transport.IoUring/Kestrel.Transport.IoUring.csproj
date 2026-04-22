@@ -16,9 +16,9 @@
 
     <!-- NuGet package metadata -->
     <PackageId>Kestrel.Transport.IoUring</PackageId>
-    <Version>2.1.0</Version>
+    <Version>2.2.0</Version>
     <Authors>reedz</Authors>
-    <Description>High-performance io_uring transport for ASP.NET Core Kestrel. Drop-in replacement for the default socket transport. Up to 15% faster than sockets at 1024+ connections on Linux with thread-per-core architecture, zero-alloc send path, and inline HTTP processing.</Description>
+    <Description>High-performance io_uring transport for ASP.NET Core Kestrel. Drop-in replacement for the default socket transport. Beats sockets on RPS, CPU efficiency (+48% RPS/CPU%), and tail latency on Linux. Thread-per-core architecture with provided buffer rings, zero-alloc send path, and inline HTTP processing.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/reedz/Kestrel.Transport.IoUring</PackageProjectUrl>
     <RepositoryUrl>https://github.com/reedz/Kestrel.Transport.IoUring</RepositoryUrl>
@@ -27,6 +27,41 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <Copyright>Copyright (c) 2026 reedz</Copyright>
     <PackageReleaseNotes>
+v2.2.0 — Stability + correctness + smaller pinned heap; consistently beats sockets
+• S0 Correctness fixes (3 latent bugs that caused ~1429 socket errors / 60s @ c=2048
+  with v2.1.0 and full death-spiral at higher loads):
+  - Accept-channel drop: when bounded accept-channel was full under burst, the new
+    connection was created but TryWrite return value was ignored, leaking the conn.
+    Now: on TryWrite=false, abort + close cleanly.
+  - Multishot recv rearm SQ-full silent loss: SubmitMultishotRecv now returns bool;
+    callers add to the recv-retry set on failure. No more silent stop-receiving.
+  - CQ-overflow recovery: RecoverFromCqOverflow now routes via UsingMultishotRecv
+    flag; previously always used single-shot recv even for buffer-ring connections.
+• S1 Skip per-connection pinned recv buffer when buffer ring is active (it's never
+  used in that path). Saves ~4 KB POH per connection.
+• P1 Default ThreadCount tuning: TC=64 was wildly oversubscribed on 56-core boxes.
+  TC=32 (or matching ProcessorCount/2) gives same/better RPS at half the CPU.
+• P2 Buffer-ring right-size: ReceiveBufferSize default 4096 -> 2048. Halves the
+  per-buffer pinned heap; keep-alive HTTP/1.1 small payloads need ~2 KB.
+• S2 Diagnostics: new RecvDiagnostics counters (ENOBUFS, EPIPE, ECONNRESET, accept
+  channel drops, recv-retry queue depth/water-mark, async-flush pending). Periodic
+  log via LogPoolStatsInterval.
+• Result: stable to c=4096+ (zero socket errors, zero bad responses, no death
+  spiral). v2.1.0 is broken at c>=256 — v2.2.0 fixes that AND beats sockets.
+
+Benchmarks (json, 56-core Intel Xeon Gold 6330, Azure D64as_v5, kernel 6.8, 3-trial
+median, single-load except c=2048 which is dual-load 2x c=1024):
+
+  c=256   patched 781,942 RPS @ 28% CPU  vs sockets 753,172 @ 40% CPU
+                  +3.8% RPS, -30% CPU, +48% RPS/CPU%, P99 0.64 vs 0.70 ms, 0 errors
+  c=1024  patched 1,068,612 RPS @ 34% CPU vs sockets 1,046,915 @ 51% CPU
+                  +2.1% RPS, -33% CPU, +53% RPS/CPU%, P99 5.50 vs 6.41 ms, 0 errors
+  c=2048  patched 2,132,290 RPS @ 34% CPU vs sockets 2,037,381 @ 48% CPU
+                  +4.7% RPS, -29% CPU, +48% RPS/CPU%, P99 5.74 vs 6.55 ms, 0 errors
+  c=4096  patched 1,718,626 RPS @ 33% CPU, P99 3.59 ms, 0 errors (stress validation)
+
+  Pinned heap dropped from 75 MB (v2.1.0 at TC=64) -> 16 MB (4.7x reduction).
+
 v2.0.0 — Architecture overhaul: beats sockets by 15%
 • IoUringPipeScheduler: custom PipeScheduler runs all pipe continuations on
   the IO loop thread. Eliminates ThreadPool hops for both recv and send paths.

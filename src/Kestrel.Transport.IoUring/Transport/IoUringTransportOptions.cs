@@ -15,8 +15,19 @@ public sealed class IoUringTransportOptions
     /// <summary>Capacity of the internal accept channel (buffered accepted-connection queue).</summary>
     public int AcceptQueueCapacity { get; set; } = 128;
 
-    /// <summary>Per-connection receive buffer size in bytes.</summary>
-    public int ReceiveBufferSize { get; set; } = 4096;
+    /// <summary>
+    /// When &gt; 0, opt-in periodic logging of send-path diagnostic counters
+    /// (Pin/Unpin rate, outstanding pinned bytes, short-send resubmits, etc.).
+    /// Used during Round-3 perf work to validate the NativeSendArena lands its
+    /// POH reduction; default 0 (disabled, zero-cost).
+    /// </summary>
+    public int LogPoolStatsInterval { get; set; } = 0;
+
+    /// <summary>Per-connection receive buffer size in bytes.
+    /// Also controls per-buffer size in the provided buffer ring when EnableBufferRing=true.
+    /// 2 KB is plenty for keep-alive HTTP/1.1 small-payload workloads (Plaintext/JSON);
+    /// raise for upload-heavy workloads. Pinned heap cost = BufferRingSize × ReceiveBufferSize × ThreadCount.</summary>
+    public int ReceiveBufferSize { get; set; } = 2048;
 
     /// <summary>
     /// Number of IO threads (each with its own io_uring ring). Defaults to 1.
@@ -32,6 +43,34 @@ public sealed class IoUringTransportOptions
     /// Each ring consumes one kernel CPU thread.
     /// </summary>
     public bool EnableSqPoll { get; set; }
+
+    /// <summary>
+    /// Enable IORING_SETUP_COOP_TASKRUN (kernel 5.19+). Defers task-work to the next
+    /// io_uring_enter from the issuer thread, eliminating IPI wakeups for completions.
+    /// <para>
+    /// WARNING: this defers task-work for cross-thread completions too — incompatible with
+    /// our eventfd-based cross-thread wakeup pattern (the eventfd completion stays as task
+    /// work and never wakes a blocked issuer). Defaults to <c>false</c>; opt in only after
+    /// switching to MSG_RING-based wakeups.
+    /// </para>
+    /// </summary>
+    public bool EnableCoopTaskRun { get; set; } = false;
+
+    /// <summary>
+    /// Enable IORING_SETUP_SINGLE_ISSUER (kernel 6.0+). Asserts a single submitter, allowing
+    /// kernel-side optimisations and is required for DEFER_TASKRUN. Defaults to true
+    /// (auto-fallback on older kernels).
+    /// </summary>
+    public bool EnableSingleIssuer { get; set; } = false;
+
+    /// <summary>
+    /// Enable IORING_SETUP_DEFER_TASKRUN (kernel 6.1+). All task-work is deferred until the
+    /// issuer thread re-enters io_uring; biggest reduction in scheduling overhead.
+    /// Requires SINGLE_ISSUER. Defaults to <c>false</c> — DEFER_TASKRUN can interact poorly
+    /// with cross-thread eventfd wakeups in some scenarios; opt in explicitly after validating.
+    /// (Auto-fallback on older kernels if enabled.)
+    /// </summary>
+    public bool EnableDeferTaskRun { get; set; } = false;
 
     /// <summary>
     /// Enable provided buffer rings for multishot recv. Eliminates per-recv memory pinning
