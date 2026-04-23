@@ -21,6 +21,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private readonly Channel<ConnectionContext> _acceptChannel;
     private readonly IoUringConnection?[] _connectionSlots;
     private readonly ushort[] _slotGenerations;
+    // Round-7: free-list of available slot indices. Acquire a slot on accept, release
+    // on RemoveConnection. Prevents the pre-R7 `connId % maxConn` collision that
+    // orphaned prior connections at c=2048 under default MaxConnections=1024.
+    // All access is on the single IO-loop thread, so Stack<T> (no locks) is safe.
+    private readonly Stack<int> _freeSlots;
     private readonly CancellationTokenSource _cts = new();
     private readonly int _maxConnections;
     private readonly int _receiveBufferSize;
@@ -56,7 +61,6 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private const int EPIPE = 32;
     private const int ECONNRESET = 104;
 
-    private long _nextConnectionId;
     private int _activeConnectionCount;
     private int _consecutiveErrors;
     private readonly TaskCompletionSource _ioLoopStopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -91,6 +95,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _options = options;
         _connectionSlots = new IoUringConnection?[options.MaxConnections];
         _slotGenerations = new ushort[options.MaxConnections];
+        _freeSlots = new Stack<int>(options.MaxConnections);
+        // Pre-populate free-list with all slot indices. Push highest first so Pop()
+        // returns 0 first — stable small connIds under light load for easier debugging.
+        for (int i = options.MaxConnections - 1; i >= 0; i--) _freeSlots.Push(i);
         _listenSocket = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         _acceptChannel = Channel.CreateBounded<ConnectionContext>(new BoundedChannelOptions(options.AcceptQueueCapacity)
         {
@@ -213,22 +221,32 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         (int)socket.SafeHandle.DangerousGetHandle();
 
     // Connection slot helpers — IO loop is the sole accessor, no synchronization needed.
-    private IoUringConnection? GetConnection(long connId) =>
-        _connectionSlots[connId % _maxConnections];
+    // Round-7: connectionId passed throughout the IO loop is now the SLOT INDEX
+    // (0..MaxConnections-1), acquired from _freeSlots on accept and returned on close.
+    // Prior behavior was `slot = connId % maxConn` with a monotonic connId, which
+    // recycled slots based on connId wrap-around and silently overwrote live
+    // connections' slots under load (the Round-6 c=2048 mass-error root cause).
+    private IoUringConnection? GetConnection(long slot) =>
+        (uint)slot < (uint)_maxConnections ? _connectionSlots[slot] : null;
 
-    private void SetConnection(long connId, IoUringConnection conn)
+    private void SetConnection(long slot, IoUringConnection conn)
     {
-        int slot = (int)(connId % _maxConnections);
-        _slotGenerations[slot]++;
-        conn.Generation = _slotGenerations[slot];
-        _connectionSlots[slot] = conn;
+        int s = (int)slot;
+        _slotGenerations[s]++;
+        conn.Generation = _slotGenerations[s];
+        _connectionSlots[s] = conn;
         _activeConnectionCount++;
     }
 
-    private void RemoveConnection(long connId)
+    private void RemoveConnection(long slot)
     {
-        _connectionSlots[connId % _maxConnections] = null;
-        _activeConnectionCount--;
+        int s = (int)slot;
+        if (_connectionSlots[s] != null)
+        {
+            _connectionSlots[s] = null;
+            _activeConnectionCount--;
+            _freeSlots.Push(s);
+        }
     }
 
     private unsafe void SubmitAccept()
@@ -618,7 +636,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         {
             int socketFd = result;
 
-            if (_activeConnectionCount >= _maxConnections)
+            // Round-7: acquire a slot from the free-list. If none available, close the
+            // accepted fd cleanly instead of orphaning a live connection by slot-reuse.
+            if (!_freeSlots.TryPop(out int slot))
             {
                 _logger.LogWarning("Connection limit ({Limit}) reached; rejecting new connection.", _maxConnections);
                 Libc.close(socketFd);
@@ -626,7 +646,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             else
             {
                 SetTcpNoDelay(socketFd);
-                long connId = Interlocked.Increment(ref _nextConnectionId);
+                // connId now IS the slot index (no monotonic counter). Logging uses
+                // $"iouring:{slot}" which is fine — slot reuse collides only after a
+                // connection has fully closed and returned its slot.
+                long connId = slot;
 
                 // Register the accepted socket fd for IOSQE_FIXED_FILE.
                 int fileIndex = _ring.HasRegisteredFiles ? _ring.RegisterFd(socketFd) : -1;
@@ -827,7 +850,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private void BeginCloseConnection(long connectionId, IoUringConnection conn)
     {
         conn.IsClosing = true;
-        RemoveConnection(connectionId);
+        // Round-7: do NOT release the slot here. Keep the connection parked in
+        // _connectionSlots[slot] until in-flight CQEs drain (TryFinalizeClose).
+        // Otherwise an immediate new accept could reuse the slot and route the
+        // closing conn's residual recv/send completions to the new conn's lookup,
+        // leaking HasRecvInFlight=true forever on the closing conn.
         _recvRetrySet.Remove(connectionId);
         _closingConnections[connectionId] = conn;
 
@@ -844,6 +871,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
         _closingConnections.Remove(connectionId);
         conn.CloseSocketFd();
+        // Round-7: release the slot now that all in-flight ops have drained.
+        RemoveConnection(connectionId);
         // Kestrel will call DisposeAsync when it finishes the HTTP pipeline.
     }
 

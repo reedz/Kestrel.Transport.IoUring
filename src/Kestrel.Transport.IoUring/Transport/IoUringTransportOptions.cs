@@ -7,7 +7,7 @@ public sealed class IoUringTransportOptions
     public int RingSize { get; set; } = 256;
 
     /// <summary>Maximum number of simultaneous connections. Excess connections are rejected.</summary>
-    public int MaxConnections { get; set; } = 1024;
+    public int MaxConnections { get; set; } = 16384;
 
     /// <summary>TCP listen backlog passed to <c>listen(2)</c>.</summary>
     public int ListenBacklog { get; set; } = 512;
