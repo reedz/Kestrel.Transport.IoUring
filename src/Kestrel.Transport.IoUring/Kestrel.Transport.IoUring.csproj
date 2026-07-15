@@ -16,17 +16,33 @@
 
     <!-- NuGet package metadata -->
     <PackageId>Kestrel.Transport.IoUring</PackageId>
-    <Version>2.2.1</Version>
+    <Version>2.2.2</Version>
     <Authors>reedz</Authors>
-    <Description>High-performance io_uring transport for ASP.NET Core Kestrel. Drop-in replacement for the default socket transport. Beats sockets on RPS, CPU efficiency (+48% RPS/CPU%), and tail latency on Linux. Thread-per-core architecture with provided buffer rings, zero-alloc send path, and inline HTTP processing.</Description>
+    <Description>Experimental io_uring transport for ASP.NET Core Kestrel with provided buffer rings, registered files, multi-ring support, and safe ThreadPool application scheduling by default.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/reedz/Kestrel.Transport.IoUring</PackageProjectUrl>
     <RepositoryUrl>https://github.com/reedz/Kestrel.Transport.IoUring</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>io_uring;kestrel;aspnetcore;transport;linux;high-performance;networking;zero-copy</PackageTags>
+    <PackageTags>io_uring;kestrel;aspnetcore;transport;linux;high-performance;networking</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <Copyright>Copyright (c) 2026 reedz</Copyright>
     <PackageReleaseNotes>
+v2.2.2 — Correctness, safety, and compatibility hardening
+• Fix the default single-ring startup failure caused by requesting 65,536 SQ entries.
+• Keep in-flight SEND buffers pinned until their terminal CQE or ring shutdown.
+• Serialize multishot receive data while PipeWriter backpressure is active.
+• Retry ACCEPT/eventfd submissions after SQ-full and prevent send-loop busy spins.
+• Route aborts through idempotent socket shutdown/close and generation-safe slot release.
+• Preserve TCP half-close semantics so delayed responses cannot target recycled fd slots.
+• Drain graceful TLS connection-close responses before socket shutdown; cover sequential and concurrent handshake churn.
+• Bound copied multishot backpressure data with a shared per-ring memory budget.
+• Never unmap ring memory after an unconfirmed IO-loop shutdown.
+• Quarantine the fixed-file table if a kernel unregister update fails.
+• Fail closed on unrecoverable CQ overflow instead of duplicating unknown operations.
+• Populate peer/local endpoints, report ephemeral ports, and use unique public connection IDs.
+• Default UnsafeInlineScheduling to false; explicit opt-in is still available.
+• Validate transport options early and preserve exact multi-ring capacity/configuration.
+
 v2.2.1 — Slot free-list: fixes high-c correctness + unlocks stronger wins
 • Fix: per-listener connection-slot allocator now uses a pre-populated free-list
   (Stack&lt;int&gt;) instead of the pre-2.2.1 `connId % MaxConnections` modulo. The
@@ -53,12 +69,6 @@ Ubuntu-24.04 kernel 6.8, IOURING_THREAD_COUNT=32, 1-trial-per-cell matrix):
   tls-steady-dual c=1024: 1.21M RPS (+7%    RPS, -35% CPU)
   tls-steady-dual c=2048: 1.22M RPS (+9.5%  RPS, -41% CPU)
   0 errors across all 24 cells (12 scenarios/connection pairs × 2 variants).
-
-Known limitation (unchanged from 2.2.0): bombardier TLS handshake-churn with
-`connectionclose=true` still hits an IO-loop livelock after the first close.
-This is orthogonal to the slot-collision bug — reproduces at c=1 and with
-IOURING_MAX_CONNECTIONS=65536. Deferred; keep-alive workloads (the common
-production shape) are unaffected.
 
 v2.2.0 — Stability + correctness + smaller pinned heap; consistently beats sockets
 • S0 Correctness fixes (3 latent bugs that caused ~1429 socket errors / 60s @ c=2048
@@ -141,7 +151,7 @@ v1.0.1 — Bug fix
 v1.0.0 — Initial release
 • Drop-in io_uring transport via UseIoUring()
 • Multishot recv with buffer rings
-• Zero-copy send (SEND_ZC)
+• Asynchronous send via IORING_OP_SEND
 • Registered file descriptors
 • Targets net8.0, net9.0, net10.0
     </PackageReleaseNotes>

@@ -22,6 +22,7 @@ internal sealed unsafe class ProvidedBufferRing : IDisposable
     private readonly IoUringBuf* _bufs;
     private readonly ushort* _tailPtr;
     private ushort _tail;
+    private int _disposed;
 
     public ushort GroupId => _bgid;
     public int BufferSize => _bufferSize;
@@ -109,6 +110,9 @@ internal sealed unsafe class ProvidedBufferRing : IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
         var reg = new IoUringBufReg { Bgid = _bgid };
         IoUringNative.IoUringRegister(
             _ringFd,

@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using Kestrel.Transport.IoUring.Native;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.Extensions.Logging;
+using Microsoft.Win32.SafeHandles;
 
 namespace Kestrel.Transport.IoUring.Transport;
 
@@ -29,10 +30,12 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private readonly CancellationTokenSource _cts = new();
     private readonly int _maxConnections;
     private readonly int _receiveBufferSize;
+    private readonly ReceiveBufferBudget _receiveBufferBudget;
     private readonly IoUringTransportOptions _options;
 
     // Connections that need RECV resubmitted (after async pipe flush completes).
-    private readonly ConcurrentQueue<long> _recvResubmitQueue = new();
+    private readonly ConcurrentQueue<(long ConnectionId, ushort Generation)> _recvResubmitQueue = new();
+    private readonly ConcurrentQueue<(long ConnectionId, ushort Generation)> _closeRequestQueue = new();
 
     // Pipe scheduler — routes output pipe reader continuations to the IO loop thread.
     private IoUringPipeScheduler? _pipeScheduler;
@@ -61,14 +64,20 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     private const int EPIPE = 32;
     private const int ECONNRESET = 104;
 
-    private int _activeConnectionCount;
     private int _consecutiveErrors;
     private readonly TaskCompletionSource _ioLoopStopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _listenSocketFd;
     private bool _listenSocketFdRefAdded;
+    private int _ioLoopStarted;
+    private int _unbound;
+    private int _disposed;
+    private Exception? _fatalError;
     private uint _lastOverflowCount;
-    private bool _acceptMultishotActive;
     private bool _useMultishotAccept = false;
+    private bool _acceptSubmissionPending;
+    private bool _acceptArmed;
+    private bool _eventFdReadSubmissionPending;
+    private bool _eventFdReadArmed;
 
     // Registered file indices for fixed-fd SQEs (-1 = not registered).
     private int _listenSocketFileIndex = -1;
@@ -82,8 +91,18 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     // Process-wide counter of accept-channel drops (S0.1). Inspected by
     // diagnostics; reset is not supported because it would race the writer.
     internal static long s_acceptChannelDrops;
+    private static long s_nextPublicConnectionId;
+    internal bool AcceptSubmissionPending => _acceptSubmissionPending;
+    internal bool AcceptArmed => _acceptArmed;
+    internal bool EventFdReadSubmissionPending => _eventFdReadSubmissionPending;
+    internal bool EventFdReadArmed => _eventFdReadArmed;
+    internal int OccupiedConnectionCount =>
+        _connectionSlots.Count(static connection => connection != null);
+    internal int ClosingConnectionCount => _closingConnections.Count;
+    internal int FreeConnectionSlotCount => _freeSlots.Count;
+    internal long PendingReceiveBudgetBytes => _receiveBufferBudget.ReservedBytes;
 
-    public EndPoint EndPoint { get; }
+    public EndPoint EndPoint { get; private set; }
 
     public IoUringConnectionListener(EndPoint endPoint, Ring ring, IoUringTransportOptions options, ILogger logger)
     {
@@ -92,6 +111,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _logger = logger;
         _maxConnections = options.MaxConnections;
         _receiveBufferSize = options.ReceiveBufferSize;
+        _receiveBufferBudget = new ReceiveBufferBudget(options.MaxPendingReceiveBytesPerRing);
         _options = options;
         _connectionSlots = new IoUringConnection?[options.MaxConnections];
         _slotGenerations = new ushort[options.MaxConnections];
@@ -140,6 +160,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
         _listenSocket.Bind(EndPoint);
         _listenSocket.Listen(listenBacklog);
+        EndPoint = _listenSocket.LocalEndPoint!;
 
         // Safely acquire the socket fd with proper ref counting.
         bool refAdded = false;
@@ -176,8 +197,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             _bufferRing = null;
         }
 
-        SubmitAccept();
-        SubmitEventFdRead();
+        RequestAcceptSubmission();
+        RequestEventFdReadSubmission();
 
         // Submit pending SQEs to the kernel. NOTE: when EnableSingleIssuer is true, this
         // would bind the issuer task to the constructor thread (wrong); the IO loop's
@@ -196,6 +217,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             IsBackground = true,
             Name = "io_uring IO Loop",
         };
+        Volatile.Write(ref _ioLoopStarted, 1);
         ioThread.Start();
 
         // Opt-in periodic diagnostic logging (Round-3, Opt G validation).
@@ -217,8 +239,15 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         }
     }
 
-    private static int GetSocketFd(Socket socket) =>
-        (int)socket.SafeHandle.DangerousGetHandle();
+    internal static string CreatePublicConnectionId() =>
+        $"iouring:{Interlocked.Increment(ref s_nextPublicConnectionId)}";
+
+    internal static (EndPoint? RemoteEndPoint, EndPoint? LocalEndPoint) GetSocketEndpoints(int socketFd)
+    {
+        using var handle = new SafeSocketHandle((nint)socketFd, ownsHandle: false);
+        using var socket = new Socket(handle);
+        return (socket.RemoteEndPoint, socket.LocalEndPoint);
+    }
 
     // Connection slot helpers — IO loop is the sole accessor, no synchronization needed.
     // Round-7: connectionId passed throughout the IO loop is now the SLOT INDEX
@@ -235,8 +264,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         _slotGenerations[s]++;
         conn.Generation = _slotGenerations[s];
         _connectionSlots[s] = conn;
-        _activeConnectionCount++;
     }
+
+    internal void SetConnectionForTest(long slot, IoUringConnection conn) =>
+        SetConnection(slot, conn);
 
     private void RemoveConnection(long slot)
     {
@@ -244,13 +275,30 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         if (_connectionSlots[s] != null)
         {
             _connectionSlots[s] = null;
-            _activeConnectionCount--;
             _freeSlots.Push(s);
         }
     }
 
-    private unsafe void SubmitAccept()
+    private void RequestAcceptSubmission()
     {
+        if (_acceptArmed || Volatile.Read(ref _unbound) != 0)
+            return;
+
+        _acceptSubmissionPending = true;
+        TrySubmitAccept();
+    }
+
+    private unsafe bool TrySubmitAccept()
+    {
+        if (Volatile.Read(ref _unbound) != 0)
+        {
+            _acceptSubmissionPending = false;
+            return true;
+        }
+
+        if (!_acceptSubmissionPending || _acceptArmed)
+            return true;
+
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
             sqe->Opcode = IoUringConstants.IORING_OP_ACCEPT;
@@ -272,17 +320,29 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             {
                 sqe->Fd = _listenSocketFd;
             }
-            _acceptMultishotActive = _useMultishotAccept;
+            _acceptArmed = true;
+            _acceptSubmissionPending = false;
+            return true;
         }
-        else
-        {
-            _logger.LogWarning("SQ full when submitting ACCEPT — will retry on next loop iteration.");
-        }
+
+        return false;
     }
 
     /// <summary>Submits a READ SQE on the eventfd.</summary>
-    private unsafe void SubmitEventFdRead()
+    private void RequestEventFdReadSubmission()
     {
+        if (_eventFdReadArmed)
+            return;
+
+        _eventFdReadSubmissionPending = true;
+        TrySubmitEventFdRead();
+    }
+
+    private unsafe bool TrySubmitEventFdRead()
+    {
+        if (!_eventFdReadSubmissionPending || _eventFdReadArmed)
+            return true;
+
         if (_ring.TryGetSqe(out IoUringSqe* sqe))
         {
             sqe->Opcode = IoUringConstants.IORING_OP_READ;
@@ -301,7 +361,38 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             {
                 sqe->Fd = _eventFd;
             }
+            _eventFdReadArmed = true;
+            _eventFdReadSubmissionPending = false;
+            return true;
         }
+
+        return false;
+    }
+
+    private void RetryControlSubmissions()
+    {
+        if (_acceptSubmissionPending)
+            TrySubmitAccept();
+        if (_eventFdReadSubmissionPending)
+            TrySubmitEventFdRead();
+
+        if (!_acceptSubmissionPending && !_eventFdReadSubmissionPending)
+            return;
+
+        // Make queued SQEs visible to the kernel so their slots can be consumed, then
+        // immediately retry the control operations before the IO loop considers parking.
+        _ring.Submit();
+        if (_acceptSubmissionPending)
+            TrySubmitAccept();
+        if (_eventFdReadSubmissionPending)
+            TrySubmitEventFdRead();
+    }
+
+    internal void RetryControlSubmissionsForTest() => RetryControlSubmissions();
+    internal void RequestControlSubmissionsForTest()
+    {
+        RequestAcceptSubmission();
+        RequestEventFdReadSubmission();
     }
 
     /// <summary>
@@ -314,9 +405,15 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     }
 
     /// <summary>Enqueues a RECV resubmission request and wakes the IO loop.</summary>
-    private void RequestRecvResubmit(long connectionId)
+    private void RequestRecvResubmit(long connectionId, ushort generation)
     {
-        _recvResubmitQueue.Enqueue(connectionId);
+        _recvResubmitQueue.Enqueue((connectionId, generation));
+        WakeIoLoop();
+    }
+
+    private void RequestConnectionClose(long connectionId, ushort generation)
+    {
+        _closeRequestQueue.Enqueue((connectionId, generation));
         WakeIoLoop();
     }
 
@@ -365,6 +462,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 {
                     // Drain pipe scheduler work items (send loop continuations).
                     _pipeScheduler?.DrainWorkItems();
+                    DrainCloseRequestQueue();
+                    DrainRecvResubmitQueue();
+                    RetryControlSubmissions();
 
                     bool didWork = false;
                     if (spinBudget > 0)
@@ -395,7 +495,12 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                         // queued work (e.g. another connection's send-loop staged an SQE
                         // and bumped the eventfd), don't park waiting for a CQE — submit
                         // and return immediately so we drain that work next iteration.
-                        uint minComplete = (_pipeScheduler != null && _pipeScheduler.HasWork) ? 0u : 1u;
+                        bool controlSubmissionPending =
+                            _acceptSubmissionPending || _eventFdReadSubmissionPending;
+                        uint minComplete =
+                            (_pipeScheduler != null && _pipeScheduler.HasWork) || controlSubmissionPending
+                                ? 0u
+                                : 1u;
                         _ring.SubmitAndWait(minComplete);
                         ProcessCompletions();
                     }
@@ -415,11 +520,14 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                     _logger.LogError(ex, "Error in IO loop (consecutive: {Count})", _consecutiveErrors);
                     if (_consecutiveErrors > 5)
                     {
-                        // Force-advance CQ to avoid infinite loop on corrupted CQE.
-                        _logger.LogCritical("Too many consecutive IO loop errors — advancing CQ head.");
-                        if (_ring.TryPeekCompletion(out _))
-                            _ring.AdvanceCompletion();
-                        _consecutiveErrors = 0;
+                        var fatalError = new InvalidOperationException(
+                            "The io_uring IO loop entered an unrecoverable error state.",
+                            ex);
+                        _logger.LogCritical(
+                            fatalError,
+                            "Too many consecutive IO loop errors; stopping the listener.");
+                        FailListener(fatalError);
+                        break;
                     }
                     Thread.Sleep(10);
                 }
@@ -434,21 +542,78 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     /// <summary>Resubmits RECV SQEs for connections that had async flush (back-pressure resolved).</summary>
     private void DrainRecvResubmitQueue()
     {
-        while (_recvResubmitQueue.TryDequeue(out long connId))
+        while (_recvResubmitQueue.TryDequeue(out var request))
         {
-            var conn = GetConnection(connId);
-            if (conn != null && !conn.IsClosing && !conn.HasRecvInFlight)
+            var conn = GetConnection(request.ConnectionId);
+            if (conn == null ||
+                conn.Generation != request.Generation)
             {
-                if (conn.UsingMultishotRecv && _bufferRing != null)
-                {
-                    if (!conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID))
-                        _recvRetrySet.Add(connId);
-                }
-                else if (!conn.SubmitRecv())
-                    _recvRetrySet.Add(connId);
+                continue;
             }
+
+            var flushState = conn.ResumeRecvAfterFlush();
+            if (conn.IsClosing)
+            {
+                TryFinalizeClose(request.ConnectionId, conn);
+                continue;
+            }
+
+            if (flushState == IoUringConnection.RecvWriteResult.Closed)
+            {
+                BeginCloseConnection(request.ConnectionId, conn);
+                continue;
+            }
+            if (flushState == IoUringConnection.RecvWriteResult.InputCompleted)
+                continue;
+            if (flushState == IoUringConnection.RecvWriteResult.Pending ||
+                conn.HasRecvInFlight)
+            {
+                continue;
+            }
+
+            if (conn.UsingMultishotRecv && _bufferRing != null)
+            {
+                if (!conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID))
+                    _recvRetrySet.Add(request.ConnectionId);
+            }
+            else if (!conn.SubmitRecv())
+                _recvRetrySet.Add(request.ConnectionId);
         }
     }
+
+    internal void EnqueueRecvResubmitForTest(long connectionId, ushort generation) =>
+        _recvResubmitQueue.Enqueue((connectionId, generation));
+
+    internal void DrainRecvResubmitQueueForTest() => DrainRecvResubmitQueue();
+
+    private void DrainCloseRequestQueue()
+    {
+        while (_closeRequestQueue.TryDequeue(out var request))
+            ProcessCloseRequest(request.ConnectionId, request.Generation);
+    }
+
+    private bool ProcessCloseRequest(long connectionId, ushort generation)
+    {
+        var conn = GetConnection(connectionId);
+        if (conn == null || conn.Generation != generation)
+            return false;
+
+        conn.CompleteInputWriter();
+        if (conn.AbortRequested || conn.SendLoopCompleted)
+            conn.ShutdownSocket();
+        _logger.LogDebug(
+            "Close progress for connection {Id}: abortive={Abortive}, sendLoopCompleted={SendLoopCompleted}, recvInFlight={RecvInFlight}, sendInFlight={SendInFlight}.",
+            connectionId,
+            conn.AbortRequested,
+            conn.SendLoopCompleted,
+            conn.HasRecvInFlight,
+            conn.HasSendInFlight);
+        BeginCloseConnection(connectionId, conn);
+        return true;
+    }
+
+    internal bool ProcessCloseRequestForTest(long connectionId, ushort generation) =>
+        ProcessCloseRequest(connectionId, generation);
 
     /// <summary>Retries RECV submissions that previously failed due to SQ-full.</summary>
     private void RetryFailedRecvs()
@@ -475,86 +640,31 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             _recvRetrySet.Remove(id);
     }
 
-    /// <summary>
-    /// Recovers from CQ overflow by scanning all connections and force-cleaning
-    /// those with stale in-flight operations. Lost CQEs mean HasSendInFlight /
-    /// HasRecvInFlight will never be cleared normally, so we must do it forcibly.
-    /// </summary>
-    private void RecoverFromCqOverflow()
-    {
-        int recovered = 0;
-
-        // Scan active connections for stale in-flight ops.
-        for (int i = 0; i < _connectionSlots.Length; i++)
-        {
-            var conn = _connectionSlots[i];
-            if (conn == null) continue;
-
-            bool hadStaleOps = false;
-
-            if (conn.HasRecvInFlight)
-            {
-                _logger.LogWarning("CQ overflow recovery: clearing stale recv for connection {Id}", conn.NumericConnectionId);
-                conn.HasRecvInFlight = false;
-                hadStaleOps = true;
-                // Resubmit recv to resume receiving on this connection.
-                // S0.3: must use the SAME recv mode (multishot vs single-shot) the
-                // connection was originally using; otherwise we silently downgrade
-                // a multishot+buffer-ring connection to single-shot, leaving its
-                // pinned recv buffer unused and breaking buffer-ring semantics.
-                if (!conn.IsClosing)
-                {
-                    bool ok = conn.UsingMultishotRecv && _bufferRing != null
-                        ? conn.SubmitMultishotRecv(RECV_BUF_GROUP_ID)
-                        : conn.SubmitRecv();
-                    if (!ok)
-                        _recvRetrySet.Add(conn.NumericConnectionId);
-                }
-            }
-
-            if (conn.HasSendInFlight)
-            {
-                _logger.LogWarning("CQ overflow recovery: clearing stale send for connection {Id}", conn.NumericConnectionId);
-                conn.HasSendInFlight = false;
-                conn.CleanupSendHandle();
-                hadStaleOps = true;
-                // Signal the send loop to retry (sent = -1 means error).
-                try { conn.CompleteSendOverflowRecovery(); } catch { }
-            }
-
-            if (hadStaleOps) recovered++;
-        }
-
-        // Also scan closing connections.
-        foreach (var (connId, conn) in _closingConnections)
-        {
-            if (conn.HasRecvInFlight || conn.HasSendInFlight)
-            {
-                conn.HasRecvInFlight = false;
-                conn.HasSendInFlight = false;
-                conn.CleanupSendHandle();
-                TryFinalizeClose(connId, conn);
-                recovered++;
-            }
-        }
-
-        _logger.LogCritical("CQ overflow recovery complete: {Count} connections recovered.", recovered);
-    }
-
-
     private void ProcessCompletions()
     {
-        // Check for CQ overflow — indicates completions were lost by the kernel.
+        // NODROP rings defer CQEs internally when the mapped CQ is full. Without NODROP,
+        // the owner of a dropped CQE is unknowable; mutating per-connection in-flight state
+        // could release a buffer still owned by the kernel or submit a duplicate operation.
         uint overflow = _ring.CqOverflowCount;
         if (overflow != _lastOverflowCount)
         {
-            uint lost = overflow - _lastOverflowCount;
-            _logger.LogCritical(
-                "io_uring CQ overflow detected ({Count} completions lost). " +
-                "Recovering by force-cleaning stale connections.",
-                lost);
+            uint overflowed = overflow - _lastOverflowCount;
             _lastOverflowCount = overflow;
-            RecoverFromCqOverflow();
+
+            if (IsCqOverflowFatal(_ring.Features))
+            {
+                var error = new IOException(
+                    $"io_uring dropped {overflowed} completion(s); connection ownership is no longer recoverable.");
+                _logger.LogCritical(
+                    error,
+                    "io_uring CQ overflow is fatal because the ring does not report IORING_FEAT_NODROP.");
+                FailListener(error);
+                return;
+            }
+
+            _logger.LogWarning(
+                "io_uring CQ overflowed by {Count} completion(s); the kernel retained them via IORING_FEAT_NODROP.",
+                overflowed);
         }
 
         while (_ring.TryPeekCompletion(out var cqe))
@@ -564,9 +674,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener
             if (cqe.UserData == IoUringConstants.EVENTFD_USER_DATA)
             {
                 // Eventfd fired — drain pipe scheduler work items and recv resubmits, re-arm.
+                _eventFdReadArmed = false;
                 _pipeScheduler?.DrainWorkItems();
+                DrainCloseRequestQueue();
                 DrainRecvResubmitQueue();
-                SubmitEventFdRead();
+                RequestEventFdReadSubmission();
                 continue;
             }
 
@@ -604,41 +716,56 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         }
 
         RetryFailedRecvs();
+        RetryControlSubmissions();
 
         // Single batched submit for all pending SQEs (accepts, recvs, sends).
         _ring.Submit();
     }
 
+    internal static bool IsCqOverflowFatal(uint ringFeatures) =>
+        (ringFeatures & IoUringConstants.IORING_FEAT_NODROP) == 0;
+
+    private void FailListener(Exception error)
+    {
+        Interlocked.CompareExchange(ref _fatalError, error, null);
+        _acceptChannel.Writer.TryComplete(error);
+        _cts.Cancel();
+    }
+
+    internal void FailListenerForTest(Exception error) => FailListener(error);
+
     private unsafe void HandleAccept(int result, uint cqeFlags)
     {
         bool more = (cqeFlags & IoUringConstants.IORING_CQE_F_MORE) != 0;
+        _acceptArmed = more;
 
         if (result < 0)
         {
             int errno = -result;
-            _acceptMultishotActive = more;
-
             // EINVAL means multishot accept is not supported — fall back to single-shot.
             if (errno == 22 /* EINVAL */ && _useMultishotAccept)
             {
                 _useMultishotAccept = false;
-                _acceptMultishotActive = false;
                 _logger.LogInformation("Multishot accept not supported; using single-shot accept.");
                 if (!_cts.IsCancellationRequested)
-                    SubmitAccept();
+                    RequestAcceptSubmission();
                 return;
             }
 
-            if (!_cts.IsCancellationRequested)
+            if (!_cts.IsCancellationRequested && Volatile.Read(ref _unbound) == 0)
                 _logger.LogWarning("Accept failed with errno {Errno}", errno);
         }
         else
         {
             int socketFd = result;
 
+            if (Volatile.Read(ref _unbound) != 0)
+            {
+                Libc.close(socketFd);
+            }
             // Round-7: acquire a slot from the free-list. If none available, close the
             // accepted fd cleanly instead of orphaning a live connection by slot-reuse.
-            if (!_freeSlots.TryPop(out int slot))
+            else if (!_freeSlots.TryPop(out int slot))
             {
                 _logger.LogWarning("Connection limit ({Limit}) reached; rejecting new connection.", _maxConnections);
                 Libc.close(socketFd);
@@ -653,22 +780,40 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
                 // Register the accepted socket fd for IOSQE_FIXED_FILE.
                 int fileIndex = _ring.HasRegisteredFiles ? _ring.RegisterFd(socketFd) : -1;
+                EndPoint? remoteEndPoint = null;
+                EndPoint? localEndPoint = EndPoint;
+                try
+                {
+                    (remoteEndPoint, localEndPoint) = GetSocketEndpoints(socketFd);
+                }
+                catch (SocketException ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Failed to resolve endpoints for accepted socket fd {Fd}.",
+                        socketFd);
+                }
 
                 var conn = new IoUringConnection(
                     connId,
                     socketFd,
                     fileIndex,
                     _ring,
-                    remoteEndPoint: null,
-                    EndPoint,
+                    remoteEndPoint,
+                    localEndPoint,
                     _receiveBufferSize,
                     _pipeScheduler!,
                     _options.UnsafeInlineScheduling,
                     _logger,
-                    useBufferRing: _bufferRing != null);
+                    useBufferRing: _bufferRing != null,
+                    publicConnectionId: CreatePublicConnectionId(),
+                    receiveBufferBudget: _receiveBufferBudget);
 
                 SetConnection(connId, conn);
-                conn.StartSendLoop(RequestRecvResubmit);
+                conn.StartSendLoop(
+                    RequestRecvResubmit,
+                    RequestConnectionClose,
+                    RequestConnectionClose);
 
                 // Submit multishot recv if buffer ring is available; otherwise single-shot.
                 if (_bufferRing != null)
@@ -698,18 +843,18 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                     // Cancel CTS + complete pipes so the send loop exits and any in-flight
                     // recv (multishot or single-shot) is observed as a close. Then route
                     // through the standard close path which frees the slot, drains
-                    // in-flight ops, and issues CLOSE on the socket fd.
+                    // in-flight ops, and closes the socket fd.
                     try { conn.Abort(new ConnectionAbortedException("Accept channel full")); } catch { }
                     BeginCloseConnection(connId, conn);
                 }
             }
-
-            _acceptMultishotActive = more;
         }
 
         // If multishot ended (F_MORE not set), rearm.
-        if (!more && !_cts.IsCancellationRequested)
-            SubmitAccept();
+        if (!more &&
+            !_cts.IsCancellationRequested &&
+            Volatile.Read(ref _unbound) == 0)
+            RequestAcceptSubmission();
     }
 
     /// <summary>Returns true if a submission was queued (caller should call Submit).</summary>
@@ -761,18 +906,35 @@ internal sealed class IoUringConnectionListener : IConnectionListener
                 else if (result == -ECONNRESET) Diagnostics.RecvDiagnostics.OnRecvEconnreset();
                 else Diagnostics.RecvDiagnostics.OnRecvOtherError();
 
-                _inputPipeComplete(conn);
-                BeginCloseConnection(connectionId, conn);
+                var endState = conn.OnRecvEnd();
+                if (result < 0)
+                {
+                    conn.Abort(new ConnectionAbortedException(
+                        $"Receive failed with errno {-result}."));
+                    BeginCloseConnection(connectionId, conn);
+                }
+                else if (endState == IoUringConnection.RecvWriteResult.Closed)
+                {
+                    BeginCloseConnection(connectionId, conn);
+                }
                 return false;
             }
 
             if (hasBuffer && _bufferRing != null)
             {
                 var bufSpan = _bufferRing.GetBuffer(bufferId).Slice(0, result);
-                bool flushOk = conn.OnRecvCompleteFromBuffer(bufSpan);
+                var flushState = conn.OnRecvCompleteFromBuffer(bufSpan);
                 _bufferRing.RecycleBuffer(bufferId);
 
-                if (!flushOk) Diagnostics.RecvDiagnostics.OnAsyncFlushPending();
+                if (flushState == IoUringConnection.RecvWriteResult.Closed)
+                {
+                    BeginCloseConnection(connectionId, conn);
+                    return false;
+                }
+
+                bool flushOk = flushState == IoUringConnection.RecvWriteResult.Ready;
+                if (!flushOk)
+                    Diagnostics.RecvDiagnostics.OnAsyncFlushPending();
 
                 // Rearm if multishot ended, flush was sync-ok, and no async rearm pending.
                 if (!more && flushOk && !conn.RecvRearmPending)
@@ -790,19 +952,31 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         }
 
         // ── Single-shot recv (fallback) ──
-        bool resubmit = conn.OnRecvComplete(result);
+        var recvState = conn.OnRecvComplete(result);
 
-        if (result <= 0)
+        if (result < 0)
         {
-            if (result == 0) Diagnostics.RecvDiagnostics.OnRecvCleanClose();
-            else if (result == -EPIPE) Diagnostics.RecvDiagnostics.OnRecvEpipe();
+            if (result == -EPIPE) Diagnostics.RecvDiagnostics.OnRecvEpipe();
             else if (result == -ECONNRESET) Diagnostics.RecvDiagnostics.OnRecvEconnreset();
             else Diagnostics.RecvDiagnostics.OnRecvOtherError();
+            conn.Abort(new ConnectionAbortedException(
+                $"Receive failed with errno {-result}."));
+            BeginCloseConnection(connectionId, conn);
+            return false;
+        }
+        if (result == 0)
+        {
+            Diagnostics.RecvDiagnostics.OnRecvCleanClose();
+            return false;
+        }
+
+        if (recvState == IoUringConnection.RecvWriteResult.Closed)
+        {
             BeginCloseConnection(connectionId, conn);
             return false;
         }
 
-        if (resubmit)
+        if (recvState == IoUringConnection.RecvWriteResult.Ready)
         {
             if (!conn.SubmitRecv())
             {
@@ -815,19 +989,14 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         return false;
     }
 
-    private static void _inputPipeComplete(IoUringConnection conn)
-    {
-        // Signal the pipe that no more data will arrive.
-        try { conn.CompleteInputWriter(); } catch { }
-    }
-
     private void HandleSend(long connectionId, int result, uint cqeFlags)
     {
-        bool isNotif = (cqeFlags & IoUringConstants.IORING_CQE_F_NOTIF) != 0;
         if (_closingConnections.TryGetValue(connectionId, out var closingConn))
         {
-            closingConn.CompleteSend(isNotif ? 0 : -1, cqeFlags);
-            if (!isNotif) TryFinalizeClose(connectionId, closingConn);
+            closingConn.CompleteSend(
+                closingConn.AbortRequested ? -1 : result,
+                cqeFlags);
+            TryFinalizeClose(connectionId, closingConn);
             return;
         }
         var conn = GetConnection(connectionId);
@@ -845,7 +1014,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener
 
     /// <summary>
     /// Begins closing a connection: marks it as closing, moves it to the closing set,
-    /// and waits for in-flight ops to drain before issuing CLOSE.
+    /// and waits for in-flight ops to drain before closing the socket.
     /// </summary>
     private void BeginCloseConnection(long connectionId, IoUringConnection conn)
     {
@@ -862,14 +1031,15 @@ internal sealed class IoUringConnectionListener : IConnectionListener
     }
 
     /// <summary>
-    /// If no in-flight ops remain for the connection, submits a CLOSE SQE.
+    /// If no in-flight ops remain for the connection, closes its socket and releases its slot.
     /// </summary>
-    private unsafe void TryFinalizeClose(long connectionId, IoUringConnection conn)
+    private void TryFinalizeClose(long connectionId, IoUringConnection conn)
     {
-        if (conn.HasRecvInFlight || conn.HasSendInFlight || conn.SendZcNotifPending)
+        if (conn.HasRecvInFlight || conn.HasSendInFlight || !conn.SendLoopCompleted)
             return;
 
         _closingConnections.Remove(connectionId);
+        conn.ReleasePendingReceiveBuffers();
         conn.CloseSocketFd();
         // Round-7: release the slot now that all in-flight ops have drained.
         RemoveConnection(connectionId);
@@ -888,62 +1058,97 @@ internal sealed class IoUringConnectionListener : IConnectionListener
         }
         catch (ChannelClosedException)
         {
+            if (Volatile.Read(ref _fatalError) is { } fatalError)
+            {
+                throw new IOException(
+                    "The io_uring listener stopped because its IO loop failed.",
+                    fatalError);
+            }
             return null;
         }
     }
 
-    public async ValueTask UnbindAsync(CancellationToken cancellationToken = default)
+    public ValueTask UnbindAsync(CancellationToken cancellationToken = default)
     {
-        _cts.Cancel();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (Interlocked.Exchange(ref _unbound, 1) != 0)
+            return ValueTask.CompletedTask;
+
         WakeIoLoop();
         _acceptChannel.Writer.TryComplete();
-
-        try
-        {
-            await _ioLoopStopped.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
-        }
-        catch (TimeoutException)
-        {
-            _logger.LogWarning("IO loop did not complete gracefully within the timeout period.");
-        }
+        return ValueTask.CompletedTask;
     }
+
+    internal static Task WaitForIoLoopShutdownAsync(
+        Task ioLoopStopped,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default) =>
+        ioLoopStopped.WaitAsync(timeout, cancellationToken);
 
     public async ValueTask DisposeAsync()
     {
-        await UnbindAsync().ConfigureAwait(false);
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
 
+        try
+        {
+            await UnbindAsync().ConfigureAwait(false);
+            _cts.Cancel();
+            WakeIoLoop();
+            if (Volatile.Read(ref _ioLoopStarted) != 0)
+            {
+                await WaitForIoLoopShutdownAsync(
+                        _ioLoopStopped.Task,
+                        TimeSpan.FromSeconds(5))
+                    .ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            // No native memory may be unmapped until the IO loop is confirmed stopped.
+            Volatile.Write(ref _disposed, 0);
+            throw;
+        }
+
+        var connections = new HashSet<IoUringConnection>();
         foreach (var conn in _connectionSlots)
         {
-            if (conn == null) continue;
-            if (conn.HasRecvInFlight)
-                conn.CleanupRecvHandle();
-            conn.CloseSocketFd();
-            await conn.DisposeAsync().ConfigureAwait(false);
+            if (conn != null)
+                connections.Add(conn);
         }
-        Array.Clear(_connectionSlots);
-
         foreach (var conn in _closingConnections.Values)
+            connections.Add(conn);
+
+        foreach (var conn in connections)
         {
-            if (conn.HasRecvInFlight)
-                conn.CleanupRecvHandle();
+            conn.CompleteInputWriter();
+            conn.ShutdownSocket();
             conn.CloseSocketFd();
             await conn.DisposeAsync().ConfigureAwait(false);
         }
+
+        Array.Clear(_connectionSlots);
         _closingConnections.Clear();
 
-        _eventFdReadHandle.Dispose();
-        _eventFdWriteHandle.Dispose();
-        _sockOptHandle.Dispose();
-        _bufferRing?.Dispose();
         _diagTimer?.Dispose();
         _recvDiagTimer?.Dispose();
-        Libc.close(_eventFd);
 
         if (_listenSocketFdRefAdded)
             _listenSocket.SafeHandle.DangerousRelease();
         _listenSocket.Dispose();
 
         _ring.Dispose();
+        _bufferRing?.Dispose();
+
+        // Closing the ring is the terminal ownership boundary for any CQEs that could
+        // not be drained during shutdown. Only now is it safe to release SEND pins.
+        foreach (var conn in connections)
+            conn.CleanupAfterRingShutdown();
+
+        _eventFdReadHandle.Dispose();
+        _eventFdWriteHandle.Dispose();
+        _sockOptHandle.Dispose();
+        Libc.close(_eventFd);
         _cts.Dispose();
     }
 }

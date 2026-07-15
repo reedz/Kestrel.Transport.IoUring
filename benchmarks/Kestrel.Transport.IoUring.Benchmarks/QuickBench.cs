@@ -42,8 +42,18 @@ public static class QuickBench
 
         try
         {
-            // Connection churn scenario skipped — io_uring's async close lifecycle
-            // causes timeouts with PooledConnectionLifetime=0 under high concurrency.
+            Console.WriteLine("═══ Scenario 1: Connection Churn ═══");
+            Console.WriteLine("  A new HTTP connection is created for every request.");
+            Console.WriteLine();
+            foreach (int concurrency in new[] { 16, 64 })
+            {
+                int requests = 5000;
+                var sr = await BenchmarkConnectionChurn(SocketPort, requests, concurrency);
+                var ur = await BenchmarkConnectionChurn(IoUringPort, requests, concurrency);
+                Console.WriteLine($"  {requests,6} reqs @ {concurrency,3} concurrency | Socket: {sr.ReqPerSec,7:F0} req/s errors:{sr.Errors} | io_uring: {ur.ReqPerSec,7:F0} req/s errors:{ur.Errors}");
+            }
+
+            Console.WriteLine();
 
             // ── Scenario 2: Many concurrent connections, sustained ──
             Console.WriteLine("═══ Scenario 2: Many Concurrent Connections (sustained) ═══");
@@ -55,7 +65,7 @@ public static class QuickBench
                 var sr = await BenchmarkManyConcurrentConnections(SocketPort, connections, requests);
                 var ur = await BenchmarkManyConcurrentConnections(IoUringPort, connections, requests);
                 double ratio = ur.MeanUs / sr.MeanUs;
-                Console.WriteLine($"  {connections,4} connections, {requests} reqs | Socket: {sr.ReqPerSec,7:F0} req/s {sr.MeanUs,7:F0}µs gc0:{sr.Gen0Collects} | io_uring: {ur.ReqPerSec,7:F0} req/s {ur.MeanUs,7:F0}µs gc0:{ur.Gen0Collects} | ratio: {ratio:F3}x");
+                Console.WriteLine($"  {connections,4} connections, {requests} reqs | Socket: {sr.ReqPerSec,7:F0} req/s {sr.MeanUs,7:F0}µs gc0:{sr.Gen0Collects} errors:{sr.Errors} | io_uring: {ur.ReqPerSec,7:F0} req/s {ur.MeanUs,7:F0}µs gc0:{ur.Gen0Collects} errors:{ur.Errors} | ratio: {ratio:F3}x");
             }
 
             Console.WriteLine();
@@ -70,7 +80,7 @@ public static class QuickBench
                 var sr = await BenchmarkHighFrequency(SocketPort, requests, concurrency);
                 var ur = await BenchmarkHighFrequency(IoUringPort, requests, concurrency);
                 double ratio = ur.MeanUs / sr.MeanUs;
-                Console.WriteLine($"  {requests,6} reqs @ {concurrency,3} concurrency | Socket: {sr.ReqPerSec,7:F0} req/s gc0:{sr.Gen0Collects} | io_uring: {ur.ReqPerSec,7:F0} req/s gc0:{ur.Gen0Collects} | ratio: {ratio:F3}x");
+                Console.WriteLine($"  {requests,6} reqs @ {concurrency,3} concurrency | Socket: {sr.ReqPerSec,7:F0} req/s gc0:{sr.Gen0Collects} errors:{sr.Errors} | io_uring: {ur.ReqPerSec,7:F0} req/s gc0:{ur.Gen0Collects} errors:{ur.Errors} | ratio: {ratio:F3}x");
             }
         }
         finally
@@ -107,6 +117,7 @@ public static class QuickBench
         GC.Collect(2, GCCollectionMode.Aggressive, true, true);
         GC.WaitForPendingFinalizers();
         long g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1);
+        int errors = 0;
 
         var sw = Stopwatch.StartNew();
         var sem = new SemaphoreSlim(concurrency);
@@ -121,6 +132,10 @@ public static class QuickBench
                     var r = await client.GetAsync("/");
                     r.EnsureSuccessStatusCode();
                 }
+                catch
+                {
+                    Interlocked.Increment(ref errors);
+                }
                 finally { sem.Release(); }
             });
         }
@@ -128,7 +143,7 @@ public static class QuickBench
         sw.Stop();
 
         return new BenchResult(count, sw.Elapsed.TotalMilliseconds,
-            GC.CollectionCount(0) - g0, GC.CollectionCount(1) - g1);
+            GC.CollectionCount(0) - g0, GC.CollectionCount(1) - g1, errors);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -164,6 +179,7 @@ public static class QuickBench
             GC.Collect(2, GCCollectionMode.Aggressive, true, true);
             GC.WaitForPendingFinalizers();
             long g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1);
+            int errors = 0;
 
             var sw = Stopwatch.StartNew();
             var sem = new SemaphoreSlim(connectionCount);
@@ -180,7 +196,7 @@ public static class QuickBench
                         var r = await client.GetAsync("/", cts.Token);
                         r.EnsureSuccessStatusCode();
                     }
-                    catch { }
+                    catch { Interlocked.Increment(ref errors); }
                     finally { sem.Release(); }
                 });
             }
@@ -188,7 +204,7 @@ public static class QuickBench
             sw.Stop();
 
             return new BenchResult(totalRequests, sw.Elapsed.TotalMilliseconds,
-                GC.CollectionCount(0) - g0, GC.CollectionCount(1) - g1);
+                GC.CollectionCount(0) - g0, GC.CollectionCount(1) - g1, errors);
         }
         finally
         {
@@ -216,6 +232,7 @@ public static class QuickBench
         GC.Collect(2, GCCollectionMode.Aggressive, true, true);
         GC.WaitForPendingFinalizers();
         long g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1);
+        int errors = 0;
 
         var sw = Stopwatch.StartNew();
         var sem = new SemaphoreSlim(concurrency);
@@ -230,7 +247,7 @@ public static class QuickBench
                     var r = await client.GetAsync("/");
                     r.EnsureSuccessStatusCode();
                 }
-                catch { }
+                catch { Interlocked.Increment(ref errors); }
                 finally { sem.Release(); }
             });
         }
@@ -238,7 +255,7 @@ public static class QuickBench
         sw.Stop();
 
         return new BenchResult(count, sw.Elapsed.TotalMilliseconds,
-            GC.CollectionCount(0) - g0, GC.CollectionCount(1) - g1);
+            GC.CollectionCount(0) - g0, GC.CollectionCount(1) - g1, errors);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -265,7 +282,12 @@ public static class QuickBench
         return app;
     }
 
-    private record BenchResult(int RequestCount, double TotalMs, long Gen0Collects, long Gen1Collects)
+    private record BenchResult(
+        int RequestCount,
+        double TotalMs,
+        long Gen0Collects,
+        long Gen1Collects,
+        int Errors)
     {
         public double MeanUs => TotalMs * 1000.0 / RequestCount;
         public double ReqPerSec => RequestCount / (TotalMs / 1000.0);

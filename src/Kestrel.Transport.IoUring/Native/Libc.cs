@@ -14,6 +14,9 @@ internal static partial class Libc
     internal static partial int close(int fd);
 
     [LibraryImport("libc", SetLastError = true)]
+    internal static partial int shutdown(int fd, int how);
+
+    [LibraryImport("libc", SetLastError = true)]
     internal static partial int socket(int domain, int type, int protocol);
 
     [LibraryImport("libc", SetLastError = true)]

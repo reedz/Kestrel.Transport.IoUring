@@ -3,6 +3,8 @@ namespace Kestrel.Transport.IoUring.Transport;
 /// <summary>Configuration options for the io_uring transport.</summary>
 public sealed class IoUringTransportOptions
 {
+    internal const int MaxRingEntries = 32768;
+
     /// <summary>Depth of the io_uring submission and completion queues (must be a power of two).</summary>
     public int RingSize { get; set; } = 256;
 
@@ -28,6 +30,12 @@ public sealed class IoUringTransportOptions
     /// 2 KB is plenty for keep-alive HTTP/1.1 small-payload workloads (Plaintext/JSON);
     /// raise for upload-heavy workloads. Pinned heap cost = BufferRingSize × ReceiveBufferSize × ThreadCount.</summary>
     public int ReceiveBufferSize { get; set; } = 2048;
+
+    /// <summary>
+    /// Maximum bytes per ring that may be copied while multishot receive is waiting
+    /// for application pipe backpressure to clear.
+    /// </summary>
+    public int MaxPendingReceiveBytesPerRing { get; set; } = 4 * 1024 * 1024;
 
     /// <summary>
     /// Number of IO threads (each with its own io_uring ring). Defaults to 1.
@@ -58,7 +66,7 @@ public sealed class IoUringTransportOptions
 
     /// <summary>
     /// Enable IORING_SETUP_SINGLE_ISSUER (kernel 6.0+). Asserts a single submitter, allowing
-    /// kernel-side optimisations and is required for DEFER_TASKRUN. Defaults to true
+    /// kernel-side optimisations and is required for DEFER_TASKRUN. Defaults to false
     /// (auto-fallback on older kernels).
     /// </summary>
     public bool EnableSingleIssuer { get; set; } = false;
@@ -85,35 +93,16 @@ public sealed class IoUringTransportOptions
     /// When true, Kestrel HTTP processing runs inline on the IO loop thread,
     /// eliminating cross-thread hops for maximum throughput (Seastar/ScyllaDB model).
     /// When false, HTTP processing runs on the ThreadPool (safer for blocking middleware).
-    /// Defaults to true. Set to false if middleware performs blocking I/O.
+    /// Defaults to false. Opt in only when the entire request pipeline is known to be non-blocking.
     /// </summary>
-    public bool UnsafeInlineScheduling { get; set; } = true;
+    public bool UnsafeInlineScheduling { get; set; }
 
     /// <summary>
-    /// Returns the effective ring size, ensuring it is large enough for the configured
-    /// <see cref="MaxConnections"/> (at least <c>2 * MaxConnections + 16</c>, rounded up to
-    /// the next power of two).
+    /// Returns the configured queue depth. Queue depth controls submission batching and is
+    /// independent from the number of long-lived connections.
     /// </summary>
-    internal int EffectiveRingSize
-    {
-        get
-        {
-            // Each connection needs at least a RECV slot, plus headroom for ACCEPT, eventfd, SENDs.
-            int minimum = 2 * MaxConnections + 16;
-            int size = Math.Max(RingSize, minimum);
-            return (int)RoundUpPowerOfTwo((uint)size);
-        }
-    }
+    internal int EffectiveRingSize => RingSize;
 
-    internal static uint RoundUpPowerOfTwo(uint v)
-    {
-        v--;
-        v |= v >> 1;
-        v |= v >> 2;
-        v |= v >> 4;
-        v |= v >> 8;
-        v |= v >> 16;
-        v++;
-        return v;
-    }
+    internal static bool IsPowerOfTwo(int value) =>
+        value > 0 && (value & (value - 1)) == 0;
 }

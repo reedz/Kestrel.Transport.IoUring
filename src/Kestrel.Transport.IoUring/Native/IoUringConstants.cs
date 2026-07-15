@@ -47,6 +47,7 @@ internal static class IoUringConstants
     public const uint IORING_SQ_NEED_WAKEUP = 1u;
 
     public const uint IORING_FEAT_SINGLE_MMAP = 1u;
+    public const uint IORING_FEAT_NODROP = 1u << 1;
 
     public const ulong TIMEOUT_USER_DATA = ulong.MaxValue;
 
@@ -59,12 +60,15 @@ internal static class IoUringConstants
     public const int SO_REUSEPORT = 15;
     public const int IPPROTO_TCP = 6;
     public const int TCP_NODELAY = 1;
+    public const int SHUT_RDWR = 2;
 
     // errno constants.
+    public const int EBADF = 9;
     public const int ENOSYS = 38;
     public const int EINTR = 4;
     public const int EPERM = 1;
     public const int EAGAIN = 11;
+    public const int ENOTCONN = 107;
 
     // Multishot flags — set in the SQE OpFlags field for ACCEPT/RECV.
     public const uint IORING_ACCEPT_MULTISHOT = 1u << 1;
@@ -100,6 +104,4 @@ internal static class IoUringConstants
     // SQE flags for fixed files.
     public const byte IOSQE_FIXED_FILE = 1 << 0;
 
-    // Send zero-copy.
-    public const byte IORING_OP_SEND_ZC = 47;
 }

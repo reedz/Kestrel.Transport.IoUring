@@ -38,14 +38,16 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
     public static bool IsUsingIoUring => Ring.IsSupported;
 
     /// <inheritdoc />
-    public ValueTask<IConnectionListener> BindAsync(EndPoint endpoint, CancellationToken cancellationToken = default)
+    public async ValueTask<IConnectionListener> BindAsync(
+        EndPoint endpoint,
+        CancellationToken cancellationToken = default)
     {
         if (!Ring.IsSupported)
         {
             _logger.LogWarning(
                 "io_uring is not supported on this system (Linux 5.1+ required). " +
                 "Falling back to the default socket transport.");
-            return _socketFallback.Value.BindAsync(endpoint, cancellationToken);
+            return await _socketFallback.Value.BindAsync(endpoint, cancellationToken).ConfigureAwait(false);
         }
 
         if (_options.ThreadCount > 1)
@@ -53,16 +55,27 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
             _logger.LogInformation(
                 "Starting io_uring transport with {ThreadCount} rings (SO_REUSEPORT).",
                 _options.ThreadCount);
-            var multiListener = new IoUringMultiListener(endpoint, _options, _loggerFactory);
-            return ValueTask.FromResult<IConnectionListener>(multiListener);
+            return new IoUringMultiListener(endpoint, _options, _loggerFactory);
         }
 
-        var ring = new Ring((uint)_options.EffectiveRingSize, GetSetupFlags());
-        var logger = _loggerFactory.CreateLogger<IoUringConnectionListener>();
-        var listener = new IoUringConnectionListener(endpoint, ring, _options, logger);
-        listener.Bind(_options.ListenBacklog);
-
-        return ValueTask.FromResult<IConnectionListener>(listener);
+        Ring? ring = null;
+        IoUringConnectionListener? listener = null;
+        try
+        {
+            ring = new Ring((uint)_options.EffectiveRingSize, GetSetupFlags());
+            var logger = _loggerFactory.CreateLogger<IoUringConnectionListener>();
+            listener = new IoUringConnectionListener(endpoint, ring, _options, logger);
+            listener.Bind(_options.ListenBacklog);
+            return listener;
+        }
+        catch
+        {
+            if (listener != null)
+                await listener.DisposeAsync().ConfigureAwait(false);
+            else
+                ring?.Dispose();
+            throw;
+        }
     }
 
     internal uint GetSetupFlags()

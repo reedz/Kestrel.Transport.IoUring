@@ -108,10 +108,10 @@ public class ConnectionCorrectnessTests
         oldDecGen.Should().NotBe(newDecGen, "generation counter distinguishes stale CQEs");
     }
 
-    // --- Fix #3: EffectiveRingSize awareness ---
+    // --- Fix #3: Ring queue depth is independent from connection capacity ---
 
     [Fact]
-    public void EffectiveRingSize_WithHighConnectionCount_IsExcessive()
+    public void EffectiveRingSize_DoesNotExceedConfiguredQueueDepth()
     {
         var options = new IoUringTransportOptions
         {
@@ -120,34 +120,24 @@ public class ConnectionCorrectnessTests
             RingSize = 256
         };
 
-        int perRing = options.MaxConnections / options.ThreadCount;
-        int minimum = 2 * perRing + 16;
-        int rounded = (int)NextPowerOfTwo((uint)minimum);
-
-        rounded.Should().Be(131072);
+        options.EffectiveRingSize.Should().Be(256);
     }
 
     // --- Fix #4: UnsafeInlineScheduling option ---
 
     [Fact]
-    public void UnsafeInlineScheduling_DefaultsToTrue()
+    public void UnsafeInlineScheduling_DefaultsToFalse()
     {
         var options = new IoUringTransportOptions();
-        options.UnsafeInlineScheduling.Should().BeTrue(
-            "inline scheduling should default to true for maximum performance");
+        options.UnsafeInlineScheduling.Should().BeFalse(
+            "blocking application code must not run on the IO loop unless explicitly enabled");
     }
 
     [Fact]
-    public void UnsafeInlineScheduling_CanBeDisabled()
+    public void UnsafeInlineScheduling_CanBeEnabled()
     {
-        var options = new IoUringTransportOptions { UnsafeInlineScheduling = false };
-        options.UnsafeInlineScheduling.Should().BeFalse(
-            "users should be able to disable inline scheduling for safety");
-    }
-
-    private static uint NextPowerOfTwo(uint v)
-    {
-        v--; v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16; v++;
-        return v;
+        var options = new IoUringTransportOptions { UnsafeInlineScheduling = true };
+        options.UnsafeInlineScheduling.Should().BeTrue(
+            "users should be able to opt into inline scheduling for maximum throughput");
     }
 }

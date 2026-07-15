@@ -93,4 +93,36 @@ public class RingTests
         clientSocket.Close();
         serverSocket.Close();
     }
+
+    [Fact]
+    public void FailedFileUnregister_DisablesFixedFileReuse()
+    {
+        using var ring = new Ring(8);
+        ring.InitFileTable(4).Should().BeTrue();
+        int socketFd = Libc.socket(2 /* AF_INET */, 1 /* SOCK_STREAM */, 0);
+        socketFd.Should().BeGreaterThanOrEqualTo(0);
+
+        int slot = ring.RegisterFd(socketFd);
+        slot.Should().BeGreaterThanOrEqualTo(0);
+
+        ring.CompleteFileUnregisterForTest(slot, updateResult: -1).Should().BeFalse();
+        ring.HasRegisteredFiles.Should().BeFalse(
+            "an unconfirmed kernel table update must quarantine all future fixed-file registrations");
+        ring.RegisterFd(socketFd).Should().Be(-1);
+
+        Libc.close(socketFd).Should().Be(0);
+    }
+
+    [Fact]
+    public void NativeStructSizes_MatchLinuxIoUringAbi()
+    {
+        Unsafe.SizeOf<IoUringSqe>().Should().Be(64);
+        Unsafe.SizeOf<IoUringCqe>().Should().Be(16);
+        Unsafe.SizeOf<IoUringSqRingOffsets>().Should().Be(40);
+        Unsafe.SizeOf<IoUringCqRingOffsets>().Should().Be(40);
+        Unsafe.SizeOf<IoUringParams>().Should().Be(120);
+        Unsafe.SizeOf<IoUringBuf>().Should().Be(16);
+        Unsafe.SizeOf<IoUringBufReg>().Should().Be(40);
+        Unsafe.SizeOf<IoUringFilesUpdate>().Should().Be(16);
+    }
 }

@@ -22,6 +22,9 @@ public sealed class Ring : IDisposable
     /// <summary>The actual setup flags accepted by the kernel after fallbacks.</summary>
     public uint SetupFlags { get; }
 
+    /// <summary>Feature flags reported by the kernel for this ring.</summary>
+    internal uint Features { get; }
+
     /// <summary>
     /// Lock protecting SQ ring access (TryGetSqe, Flush).
     /// Callers must hold this lock while calling <see cref="TryGetSqe"/> and filling the SQE.
@@ -110,6 +113,7 @@ public sealed class Ring : IDisposable
             fd = IoUringNative.IoUringSetup(entries, &p);
         }
         SetupFlags = setupFlags;
+        Features = p.Features;
 
         _ringFd = fd;
 
@@ -191,10 +195,13 @@ public sealed class Ring : IDisposable
     private int[]? _registeredFiles;
     private int _nextFileSlot;
     private bool _fileTableRegistered;
+    private bool _fileTableHealthy;
     private readonly Stack<int> _freeFileSlots = new();
 
     /// <summary>Whether fixed-file descriptors are available.</summary>
-    internal bool HasRegisteredFiles => _fileTableRegistered;
+    internal bool HasRegisteredFiles => _fileTableRegistered && _fileTableHealthy;
+    internal int RegisteredFileCount =>
+        _registeredFiles?.Count(static fd => fd >= 0) ?? 0;
 
     /// <summary>
     /// Initializes the registered file table. Call once before accepting connections.
@@ -216,6 +223,7 @@ public sealed class Ring : IDisposable
             }
         }
         _fileTableRegistered = true;
+        _fileTableHealthy = true;
         return true;
     }
 
@@ -225,7 +233,7 @@ public sealed class Ring : IDisposable
     /// </summary>
     internal unsafe int RegisterFd(int fd)
     {
-        if (_registeredFiles == null)
+        if (_registeredFiles == null || !_fileTableHealthy)
             return -1;
 
         int slot;
@@ -258,13 +266,10 @@ public sealed class Ring : IDisposable
     /// <summary>
     /// Unregisters an fd from its slot (sets to -1).
     /// </summary>
-    internal unsafe void UnregisterFd(int slot)
+    internal unsafe bool UnregisterFd(int slot)
     {
         if (_registeredFiles == null || slot < 0 || slot >= _registeredFiles.Length)
-            return;
-
-        _registeredFiles[slot] = -1;
-        _freeFileSlots.Push(slot);
+            return false;
 
         int emptyFd = -1;
         var update = new IoUringFilesUpdate
@@ -272,9 +277,28 @@ public sealed class Ring : IDisposable
             Offset = (uint)slot,
             Fds = (ulong)(nint)(&emptyFd),
         };
-        IoUringNative.IoUringRegister(
+        int ret = IoUringNative.IoUringRegister(
             _ringFd, 6 /* IORING_REGISTER_FILES_UPDATE */, (nint)(&update), 1);
+        return CompleteFileUnregister(slot, ret);
     }
+
+    private bool CompleteFileUnregister(int slot, int updateResult)
+    {
+        if (updateResult < 0)
+        {
+            // The kernel may still reference the old file. Quarantine the slot and
+            // disable future fixed-file registrations rather than risk cross-fd reuse.
+            _fileTableHealthy = false;
+            return false;
+        }
+
+        _registeredFiles![slot] = -1;
+        _freeFileSlots.Push(slot);
+        return true;
+    }
+
+    internal bool CompleteFileUnregisterForTest(int slot, int updateResult) =>
+        CompleteFileUnregister(slot, updateResult);
 
     internal unsafe bool TryGetSqe(out IoUringSqe* sqe) => _sq.TryGetSqe(out sqe);
 

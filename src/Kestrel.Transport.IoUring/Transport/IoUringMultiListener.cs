@@ -20,6 +20,8 @@ internal sealed class IoUringMultiListener : IConnectionListener
     private readonly Channel<ConnectionContext> _mergedChannel;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task[] _forwardTasks;
+    private int _disposed;
+    private Exception? _fatalError;
 
     public EndPoint EndPoint { get; }
 
@@ -39,23 +41,6 @@ internal sealed class IoUringMultiListener : IConnectionListener
                 SingleWriter = false,
             });
 
-        // Per-worker ring size: divide MaxConnections across workers.
-        var perWorkerOptions = new IoUringTransportOptions
-        {
-            RingSize = options.RingSize,
-            MaxConnections = Math.Max(1, options.MaxConnections / threadCount),
-            ListenBacklog = options.ListenBacklog,
-            AcceptQueueCapacity = options.AcceptQueueCapacity,
-            ReceiveBufferSize = options.ReceiveBufferSize,
-            ThreadCount = 1, // each worker is single-threaded
-            EnableSqPoll = options.EnableSqPoll,
-            EnableBufferRing = options.EnableBufferRing,
-            BufferRingSize = options.BufferRingSize,
-            EnableCoopTaskRun = options.EnableCoopTaskRun,
-            EnableSingleIssuer = options.EnableSingleIssuer,
-            EnableDeferTaskRun = options.EnableDeferTaskRun,
-        };
-
         // Compute setup flags once for all workers.
         uint setupFlags = 0;
         if (options.EnableSqPoll)
@@ -72,17 +57,75 @@ internal sealed class IoUringMultiListener : IConnectionListener
 
         var logger = loggerFactory.CreateLogger<IoUringConnectionListener>();
 
-        for (int i = 0; i < threadCount; i++)
+        int createdWorkers = 0;
+        try
         {
-            var ring = new Ring((uint)perWorkerOptions.EffectiveRingSize, setupFlags);
-            var worker = new IoUringConnectionListener(endPoint, ring, perWorkerOptions, logger);
-            worker.Bind(options.ListenBacklog, reusePort: true);
-            _workers[i] = worker;
+            for (int i = 0; i < threadCount; i++)
+            {
+                var perWorkerOptions = CreateWorkerOptions(options, i);
+                Ring? ring = null;
+                IoUringConnectionListener? worker = null;
+                try
+                {
+                    ring = new Ring((uint)perWorkerOptions.EffectiveRingSize, setupFlags);
+                    var workerEndPoint = i == 0 ? endPoint : _workers[0].EndPoint;
+                    worker = new IoUringConnectionListener(workerEndPoint, ring, perWorkerOptions, logger);
+                    worker.Bind(options.ListenBacklog, reusePort: true);
+                    _workers[i] = worker;
 
-            // Forward accepted connections from each worker to the merged channel.
-            int workerIndex = i;
-            _forwardTasks[i] = ForwardAcceptsAsync(worker, workerIndex);
+                    // Forward accepted connections from each worker to the merged channel.
+                    int workerIndex = i;
+                    _forwardTasks[i] = ForwardAcceptsAsync(worker, workerIndex);
+                    createdWorkers++;
+                }
+                catch
+                {
+                    if (worker != null)
+                        worker.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                    else
+                        ring?.Dispose();
+                    throw;
+                }
+            }
         }
+        catch
+        {
+            _cts.Cancel();
+            _mergedChannel.Writer.TryComplete();
+            for (int i = 0; i < createdWorkers; i++)
+                _workers[i].DisposeAsync().AsTask().GetAwaiter().GetResult();
+            _cts.Dispose();
+            throw;
+        }
+
+        EndPoint = _workers[0].EndPoint;
+    }
+
+    internal static IoUringTransportOptions CreateWorkerOptions(
+        IoUringTransportOptions options,
+        int workerIndex)
+    {
+        int baseConnections = options.MaxConnections / options.ThreadCount;
+        int remainder = options.MaxConnections % options.ThreadCount;
+
+        return new IoUringTransportOptions
+        {
+            RingSize = options.RingSize,
+            MaxConnections = baseConnections + (workerIndex < remainder ? 1 : 0),
+            ListenBacklog = options.ListenBacklog,
+            AcceptQueueCapacity = options.AcceptQueueCapacity,
+            LogPoolStatsInterval = options.LogPoolStatsInterval,
+            ReceiveBufferSize = options.ReceiveBufferSize,
+            MaxPendingReceiveBytesPerRing = options.MaxPendingReceiveBytesPerRing,
+            ThreadCount = 1,
+            EnableSqPoll = options.EnableSqPoll,
+            EnableCoopTaskRun = options.EnableCoopTaskRun,
+            EnableSingleIssuer = options.EnableSingleIssuer,
+            EnableDeferTaskRun = options.EnableDeferTaskRun,
+            EnableBufferRing = options.EnableBufferRing,
+            BufferRingSize = options.BufferRingSize,
+            UnsafeInlineScheduling = options.UnsafeInlineScheduling,
+        };
     }
 
     private async Task ForwardAcceptsAsync(IoUringConnectionListener worker, int workerIndex)
@@ -99,6 +142,12 @@ internal sealed class IoUringMultiListener : IConnectionListener
         }
         catch (OperationCanceledException) { }
         catch (ChannelClosedException) { }
+        catch (Exception ex)
+        {
+            Interlocked.CompareExchange(ref _fatalError, ex, null);
+            _mergedChannel.Writer.TryComplete(ex);
+            _cts.Cancel();
+        }
     }
 
     public async ValueTask<ConnectionContext?> AcceptAsync(CancellationToken cancellationToken = default)
@@ -113,6 +162,12 @@ internal sealed class IoUringMultiListener : IConnectionListener
         }
         catch (ChannelClosedException)
         {
+            if (Volatile.Read(ref _fatalError) is { } fatalError)
+            {
+                throw new IOException(
+                    "An io_uring worker stopped because its IO loop failed.",
+                    fatalError);
+            }
             return null;
         }
     }
@@ -130,6 +185,9 @@ internal sealed class IoUringMultiListener : IConnectionListener
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
         await UnbindAsync().ConfigureAwait(false);
 
         foreach (var worker in _workers)
@@ -137,4 +195,7 @@ internal sealed class IoUringMultiListener : IConnectionListener
 
         _cts.Dispose();
     }
+
+    internal void FailWorkerForTest(int workerIndex, Exception error) =>
+        _workers[workerIndex].FailListenerForTest(error);
 }
