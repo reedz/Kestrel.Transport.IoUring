@@ -21,7 +21,7 @@ internal sealed class IoUringMultiListener : IConnectionListener
     private readonly CancellationTokenSource _cts = new();
     private readonly Task[] _forwardTasks;
 
-    public EndPoint EndPoint { get; }
+    public EndPoint EndPoint { get; private set; }
 
     public IoUringMultiListener(
         EndPoint endPoint,
@@ -39,23 +39,6 @@ internal sealed class IoUringMultiListener : IConnectionListener
                 SingleWriter = false,
             });
 
-        // Per-worker ring size: divide MaxConnections across workers.
-        var perWorkerOptions = new IoUringTransportOptions
-        {
-            RingSize = options.RingSize,
-            MaxConnections = Math.Max(1, options.MaxConnections / threadCount),
-            ListenBacklog = options.ListenBacklog,
-            AcceptQueueCapacity = options.AcceptQueueCapacity,
-            ReceiveBufferSize = options.ReceiveBufferSize,
-            ThreadCount = 1, // each worker is single-threaded
-            EnableSqPoll = options.EnableSqPoll,
-            EnableBufferRing = options.EnableBufferRing,
-            BufferRingSize = options.BufferRingSize,
-            EnableCoopTaskRun = options.EnableCoopTaskRun,
-            EnableSingleIssuer = options.EnableSingleIssuer,
-            EnableDeferTaskRun = options.EnableDeferTaskRun,
-        };
-
         // Compute setup flags once for all workers.
         uint setupFlags = 0;
         if (options.EnableSqPoll)
@@ -72,20 +55,80 @@ internal sealed class IoUringMultiListener : IConnectionListener
 
         var logger = loggerFactory.CreateLogger<IoUringConnectionListener>();
 
-        for (int i = 0; i < threadCount; i++)
+        int createdWorkers = 0;
+        try
         {
-            var ring = new Ring((uint)perWorkerOptions.EffectiveRingSize, setupFlags);
-            var worker = new IoUringConnectionListener(endPoint, ring, perWorkerOptions, logger);
-            worker.Bind(options.ListenBacklog, reusePort: true);
-            _workers[i] = worker;
-
-            // Forward accepted connections from each worker to the merged channel.
-            int workerIndex = i;
-            _forwardTasks[i] = ForwardAcceptsAsync(worker, workerIndex);
+            for (int i = 0; i < threadCount; i++)
+            {
+                var workerOptions = CreateWorkerOptions(
+                    options,
+                    GetWorkerMaxConnections(options.MaxConnections, threadCount, i));
+                Ring? ring = null;
+                IoUringConnectionListener? worker = null;
+                try
+                {
+                    ring = new Ring((uint)workerOptions.EffectiveRingSize, setupFlags);
+                    EndPoint workerEndPoint = i == 0 ? endPoint : EndPoint;
+                    worker = new IoUringConnectionListener(
+                        workerEndPoint,
+                        ring,
+                        workerOptions,
+                        logger);
+                    worker.Bind(options.ListenBacklog, reusePort: true);
+                    if (i == 0)
+                        EndPoint = worker.EndPoint;
+                    ring = null; // listener owns the ring
+                    _workers[i] = worker;
+                    _forwardTasks[i] = ForwardAcceptsAsync(worker);
+                    createdWorkers++;
+                }
+                finally
+                {
+                    if (ring != null && worker != null)
+                        worker.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                    else
+                        ring?.Dispose();
+                }
+            }
+        }
+        catch
+        {
+            _cts.Cancel();
+            _mergedChannel.Writer.TryComplete();
+            for (int i = createdWorkers - 1; i >= 0; i--)
+                _workers[i].DisposeAsync().AsTask().GetAwaiter().GetResult();
+            _cts.Dispose();
+            throw;
         }
     }
 
-    private async Task ForwardAcceptsAsync(IoUringConnectionListener worker, int workerIndex)
+    internal static IoUringTransportOptions CreateWorkerOptions(
+        IoUringTransportOptions options,
+        int maxConnections) =>
+        new()
+        {
+            RingSize = options.RingSize,
+            MaxConnections = maxConnections,
+            ListenBacklog = options.ListenBacklog,
+            AcceptQueueCapacity = options.AcceptQueueCapacity,
+            LogPoolStatsInterval = options.LogPoolStatsInterval,
+            ReceiveBufferSize = options.ReceiveBufferSize,
+            ThreadCount = 1,
+            EnableSqPoll = options.EnableSqPoll,
+            EnableBufferRing = options.EnableBufferRing,
+            EnableMultishotAccept = options.EnableMultishotAccept,
+            EnableRegisteredFiles = options.EnableRegisteredFiles,
+            BufferRingSize = options.BufferRingSize,
+            EnableCoopTaskRun = options.EnableCoopTaskRun,
+            EnableSingleIssuer = options.EnableSingleIssuer,
+            EnableDeferTaskRun = options.EnableDeferTaskRun,
+            UnsafeInlineScheduling = options.UnsafeInlineScheduling,
+        };
+
+    internal static int GetWorkerMaxConnections(int total, int workers, int workerIndex) =>
+        total / workers + (workerIndex < total % workers ? 1 : 0);
+
+    private async Task ForwardAcceptsAsync(IoUringConnectionListener worker)
     {
         var token = _cts.Token;
         try

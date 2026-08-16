@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-pack:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        framework: [net8.0, net9.0, net10.0]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - run: dotnet restore Kestrel.Transport.IoUring.slnx
+
+      - run: >-
+          dotnet test
+          tests/Kestrel.Transport.IoUring.Tests/Kestrel.Transport.IoUring.Tests.csproj
+          --framework ${{ matrix.framework }}
+          --configuration Release
+          --no-restore
+          --verbosity minimal
+
+      - if: matrix.framework == 'net10.0'
+        run: >-
+          dotnet pack
+          src/Kestrel.Transport.IoUring/Kestrel.Transport.IoUring.csproj
+          --configuration Release
+          --no-restore
+          --output artifacts
+
+  socket-fallback:
+    runs-on: ubuntu-24.04
+    env:
+      IOURING_FORCE_FALLBACK: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - run: >-
+          dotnet test
+          tests/Kestrel.Transport.IoUring.Tests/Kestrel.Transport.IoUring.Tests.csproj
+          --framework net10.0
+          --configuration Release
+          --verbosity minimal

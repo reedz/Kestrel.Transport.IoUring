@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Kestrel.Transport.IoUring.Native;
+using Kestrel.Transport.IoUring.Transport;
 
 namespace Kestrel.Transport.IoUring;
 
@@ -22,12 +23,23 @@ internal sealed unsafe class ProvidedBufferRing : IDisposable
     private readonly IoUringBuf* _bufs;
     private readonly ushort* _tailPtr;
     private ushort _tail;
+    private int _disposed;
 
     public ushort GroupId => _bgid;
     public int BufferSize => _bufferSize;
 
     public ProvidedBufferRing(int ringFd, ushort bgid, int ringEntries, int bufferSize)
     {
+        if (ringEntries < 1 ||
+            ringEntries > IoUringTransportOptions.MaxRingEntries ||
+            (ringEntries & (ringEntries - 1)) != 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(ringEntries),
+                $"ringEntries must be a power of two between 1 and {IoUringTransportOptions.MaxRingEntries}.");
+        }
+        if (bufferSize < 1 || (long)ringEntries * bufferSize > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(bufferSize));
+
         _ringFd = ringFd;
         _bgid = bgid;
         _bufferSize = bufferSize;
@@ -39,18 +51,17 @@ internal sealed unsafe class ProvidedBufferRing : IDisposable
         nuint ringSize = (nuint)(ringEntries * sizeof(IoUringBuf));
         nuint pageSize = 4096;
         _ringMemSize = (ringSize + pageSize - 1) & ~(pageSize - 1);
+        _backingMemory = GC.AllocateArray<byte>(ringEntries * bufferSize, pinned: true);
 
         _ringMem = Libc.mmap(
             nint.Zero, _ringMemSize,
             IoUringConstants.PROT_READ | IoUringConstants.PROT_WRITE,
-            0x22 /* MAP_PRIVATE | MAP_ANONYMOUS */, -1, 0);
+            IoUringConstants.MAP_PRIVATE | IoUringConstants.MAP_ANONYMOUS, -1, 0);
         if (_ringMem == IoUringConstants.MAP_FAILED)
             throw new InvalidOperationException($"mmap for buffer ring failed: {Marshal.GetLastPInvokeError()}");
 
         _bufs = (IoUringBuf*)_ringMem;
         _tailPtr = (ushort*)(_ringMem + 14);
-
-        _backingMemory = GC.AllocateArray<byte>(ringEntries * bufferSize, pinned: true);
 
         var reg = new IoUringBufReg
         {
@@ -108,13 +119,25 @@ internal sealed unsafe class ProvidedBufferRing : IDisposable
     }
 
     public void Dispose()
+        => DisposeCore(unregister: true);
+
+    internal void DisposeAfterRingClosed()
+        => DisposeCore(unregister: false);
+
+    private void DisposeCore(bool unregister)
     {
-        var reg = new IoUringBufReg { Bgid = _bgid };
-        IoUringNative.IoUringRegister(
-            _ringFd,
-            IoUringConstants.IORING_UNREGISTER_PBUF_RING,
-            (nint)Unsafe.AsPointer(ref reg),
-            1);
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        if (unregister)
+        {
+            var reg = new IoUringBufReg { Bgid = _bgid };
+            IoUringNative.IoUringRegister(
+                _ringFd,
+                IoUringConstants.IORING_UNREGISTER_PBUF_RING,
+                (nint)Unsafe.AsPointer(ref reg),
+                1);
+        }
         Libc.munmap(_ringMem, _ringMemSize);
     }
 }

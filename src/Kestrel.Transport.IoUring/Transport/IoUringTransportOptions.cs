@@ -3,8 +3,10 @@ namespace Kestrel.Transport.IoUring.Transport;
 /// <summary>Configuration options for the io_uring transport.</summary>
 public sealed class IoUringTransportOptions
 {
+    internal const int MaxRingEntries = 32768;
+
     /// <summary>Depth of the io_uring submission and completion queues (must be a power of two).</summary>
-    public int RingSize { get; set; } = 256;
+    public int RingSize { get; set; } = 1024;
 
     /// <summary>Maximum number of simultaneous connections. Excess connections are rejected.</summary>
     public int MaxConnections { get; set; } = 16384;
@@ -13,7 +15,7 @@ public sealed class IoUringTransportOptions
     public int ListenBacklog { get; set; } = 512;
 
     /// <summary>Capacity of the internal accept channel (buffered accepted-connection queue).</summary>
-    public int AcceptQueueCapacity { get; set; } = 128;
+    public int AcceptQueueCapacity { get; set; } = 1024;
 
     /// <summary>
     /// When &gt; 0, opt-in periodic logging of send-path diagnostic counters
@@ -78,8 +80,21 @@ public sealed class IoUringTransportOptions
     /// </summary>
     public bool EnableBufferRing { get; set; } = true;
 
+    /// <summary>
+    /// Enables multishot accept when supported by the kernel, with automatic fallback
+    /// to single-shot accept on <c>EINVAL</c>.
+    /// </summary>
+    public bool EnableMultishotAccept { get; set; } = true;
+
+    /// <summary>
+    /// Enables registered file descriptors. This requires a synchronous kernel table update
+    /// for every accepted and closed connection, so it is disabled by default for balanced
+    /// persistent-connection and connection-churn performance.
+    /// </summary>
+    public bool EnableRegisteredFiles { get; set; }
+
     /// <summary>Number of buffers in the provided buffer ring (must be power of two).</summary>
-    public int BufferRingSize { get; set; } = 256;
+    public int BufferRingSize { get; set; } = 1024;
 
     /// <summary>
     /// When true, Kestrel HTTP processing runs inline on the IO loop thread,
@@ -90,30 +105,41 @@ public sealed class IoUringTransportOptions
     public bool UnsafeInlineScheduling { get; set; } = true;
 
     /// <summary>
-    /// Returns the effective ring size, ensuring it is large enough for the configured
-    /// <see cref="MaxConnections"/> (at least <c>2 * MaxConnections + 16</c>, rounded up to
-    /// the next power of two).
+    /// Returns the configured ring size.
+    /// In-flight operations do not consume submission-ring entries after the kernel has
+    /// accepted them, so queue depth must not scale with <see cref="MaxConnections"/>.
     /// </summary>
-    internal int EffectiveRingSize
+    internal int EffectiveRingSize => RingSize;
+
+    internal void Validate()
     {
-        get
-        {
-            // Each connection needs at least a RECV slot, plus headroom for ACCEPT, eventfd, SENDs.
-            int minimum = 2 * MaxConnections + 16;
-            int size = Math.Max(RingSize, minimum);
-            return (int)RoundUpPowerOfTwo((uint)size);
-        }
+        if (RingSize < 2 || RingSize > MaxRingEntries || !IsPowerOfTwo(RingSize))
+            throw new ArgumentOutOfRangeException(nameof(RingSize),
+                $"RingSize must be a power of two between 2 and {MaxRingEntries}.");
+        if (MaxConnections < 1)
+            throw new ArgumentOutOfRangeException(nameof(MaxConnections), "MaxConnections must be positive.");
+        if (ListenBacklog < 1)
+            throw new ArgumentOutOfRangeException(nameof(ListenBacklog), "ListenBacklog must be positive.");
+        if (AcceptQueueCapacity < 1)
+            throw new ArgumentOutOfRangeException(nameof(AcceptQueueCapacity), "AcceptQueueCapacity must be positive.");
+        if (ReceiveBufferSize < 1)
+            throw new ArgumentOutOfRangeException(nameof(ReceiveBufferSize), "ReceiveBufferSize must be positive.");
+        if (ThreadCount < 1 || ThreadCount > MaxConnections)
+            throw new ArgumentOutOfRangeException(nameof(ThreadCount),
+                "ThreadCount must be positive and no greater than MaxConnections.");
+        if (LogPoolStatsInterval < 0)
+            throw new ArgumentOutOfRangeException(nameof(LogPoolStatsInterval),
+                "LogPoolStatsInterval cannot be negative.");
+        if (BufferRingSize < 1 || BufferRingSize > MaxRingEntries || !IsPowerOfTwo(BufferRingSize))
+            throw new ArgumentOutOfRangeException(nameof(BufferRingSize),
+                $"BufferRingSize must be a power of two between 1 and {MaxRingEntries}.");
+        if ((long)BufferRingSize * ReceiveBufferSize > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(BufferRingSize),
+                "BufferRingSize multiplied by ReceiveBufferSize must fit in a managed array.");
+        if ((long)AcceptQueueCapacity * ThreadCount > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(AcceptQueueCapacity),
+                "AcceptQueueCapacity multiplied by ThreadCount is too large.");
     }
 
-    internal static uint RoundUpPowerOfTwo(uint v)
-    {
-        v--;
-        v |= v >> 1;
-        v |= v >> 2;
-        v |= v >> 4;
-        v |= v >> 8;
-        v |= v >> 16;
-        v++;
-        return v;
-    }
+    private static bool IsPowerOfTwo(int value) => (value & (value - 1)) == 0;
 }

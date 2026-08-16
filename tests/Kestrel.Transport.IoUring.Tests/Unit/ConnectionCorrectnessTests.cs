@@ -108,10 +108,19 @@ public class ConnectionCorrectnessTests
         oldDecGen.Should().NotBe(newDecGen, "generation counter distinguishes stale CQEs");
     }
 
-    // --- Fix #3: EffectiveRingSize awareness ---
+    // --- Ring depth must not scale with connection capacity ---
 
     [Fact]
-    public void EffectiveRingSize_WithHighConnectionCount_IsExcessive()
+    public void EffectiveRingSize_DefaultOptions_StaysWithinKernelLimit()
+    {
+        var options = new IoUringTransportOptions();
+
+        options.EffectiveRingSize.Should().Be(1024);
+        options.EffectiveRingSize.Should().BeLessThanOrEqualTo(32768);
+    }
+
+    [Fact]
+    public void EffectiveRingSize_WithHighConnectionCount_UsesConfiguredRingSize()
     {
         var options = new IoUringTransportOptions
         {
@@ -120,11 +129,7 @@ public class ConnectionCorrectnessTests
             RingSize = 256
         };
 
-        int perRing = options.MaxConnections / options.ThreadCount;
-        int minimum = 2 * perRing + 16;
-        int rounded = (int)NextPowerOfTwo((uint)minimum);
-
-        rounded.Should().Be(131072);
+        options.EffectiveRingSize.Should().Be(256);
     }
 
     // --- Fix #4: UnsafeInlineScheduling option ---
@@ -145,9 +150,85 @@ public class ConnectionCorrectnessTests
             "users should be able to disable inline scheduling for safety");
     }
 
-    private static uint NextPowerOfTwo(uint v)
+    [Theory]
+    [InlineData(0, 1024, 1, 256)]
+    [InlineData(1, 1024, 1, 256)]
+    [InlineData(256, 0, 1, 256)]
+    [InlineData(256, 1024, 0, 256)]
+    [InlineData(256, 4, 5, 256)]
+    [InlineData(3, 1024, 1, 256)]
+    [InlineData(65536, 1024, 1, 256)]
+    public void Validate_RejectsInvalidCoreOptions(
+        int ringSize,
+        int maxConnections,
+        int threadCount,
+        int bufferRingSize)
     {
-        v--; v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16; v++;
-        return v;
+        var options = new IoUringTransportOptions
+        {
+            RingSize = ringSize,
+            MaxConnections = maxConnections,
+            ThreadCount = threadCount,
+            BufferRingSize = bufferRingSize,
+        };
+
+        var act = options.Validate;
+
+        act.Should().Throw<ArgumentOutOfRangeException>();
     }
+
+    [Fact]
+    public void MultiListener_WorkerOptions_PreserveBehavioralSettings()
+    {
+        var options = new IoUringTransportOptions
+        {
+            RingSize = 512,
+            MaxConnections = 11,
+            ListenBacklog = 123,
+            AcceptQueueCapacity = 45,
+            LogPoolStatsInterval = 6,
+            ReceiveBufferSize = 4096,
+            ThreadCount = 3,
+            EnableSqPoll = true,
+            EnableBufferRing = false,
+            EnableMultishotAccept = false,
+            EnableRegisteredFiles = true,
+            BufferRingSize = 1024,
+            EnableCoopTaskRun = true,
+            EnableSingleIssuer = true,
+            EnableDeferTaskRun = true,
+            UnsafeInlineScheduling = false,
+        };
+
+        var worker = IoUringMultiListener.CreateWorkerOptions(options, maxConnections: 4);
+
+        worker.RingSize.Should().Be(options.RingSize);
+        worker.MaxConnections.Should().Be(4);
+        worker.ListenBacklog.Should().Be(options.ListenBacklog);
+        worker.AcceptQueueCapacity.Should().Be(options.AcceptQueueCapacity);
+        worker.LogPoolStatsInterval.Should().Be(options.LogPoolStatsInterval);
+        worker.ReceiveBufferSize.Should().Be(options.ReceiveBufferSize);
+        worker.ThreadCount.Should().Be(1);
+        worker.EnableSqPoll.Should().Be(options.EnableSqPoll);
+        worker.EnableBufferRing.Should().Be(options.EnableBufferRing);
+        worker.EnableMultishotAccept.Should().Be(options.EnableMultishotAccept);
+        worker.EnableRegisteredFiles.Should().Be(options.EnableRegisteredFiles);
+        worker.BufferRingSize.Should().Be(options.BufferRingSize);
+        worker.EnableCoopTaskRun.Should().Be(options.EnableCoopTaskRun);
+        worker.EnableSingleIssuer.Should().Be(options.EnableSingleIssuer);
+        worker.EnableDeferTaskRun.Should().Be(options.EnableDeferTaskRun);
+        worker.UnsafeInlineScheduling.Should().BeFalse();
+    }
+
+    [Fact]
+    public void MultiListener_DistributesExactConnectionCapacity()
+    {
+        int[] capacities = Enumerable.Range(0, 3)
+            .Select(i => IoUringMultiListener.GetWorkerMaxConnections(11, 3, i))
+            .ToArray();
+
+        capacities.Should().Equal(4, 4, 3);
+        capacities.Sum().Should().Be(11);
+    }
+
 }

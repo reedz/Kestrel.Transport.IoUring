@@ -30,7 +30,7 @@ public sealed class Ring : IDisposable
     /// </summary>
     internal readonly object SubmitLock = new();
 
-    private bool _disposed;
+    private int _disposed;
 
     /// <summary>Gets a value indicating whether io_uring is supported on this system.</summary>
     public static bool IsSupported { get; private set; }
@@ -42,6 +42,11 @@ public sealed class Ring : IDisposable
 
     private static bool CheckSupport()
     {
+        if (Environment.GetEnvironmentVariable("IOURING_FORCE_FALLBACK") == "1")
+            return false;
+        if (!OperatingSystem.IsLinux())
+            return false;
+
         try
         {
             unsafe
@@ -53,9 +58,7 @@ public sealed class Ring : IDisposable
                     Libc.close(fd);
                     return true;
                 }
-                int err = Marshal.GetLastPInvokeError();
-                // ENOSYS = syscall not available; EPERM = blocked by seccomp/permissions.
-                return err != IoUringConstants.ENOSYS && err != IoUringConstants.EPERM;
+                return false;
             }
         }
         catch
@@ -87,53 +90,75 @@ public sealed class Ring : IDisposable
         while (fd < 0)
         {
             int err = Marshal.GetLastPInvokeError();
-            if (err != 22 /* EINVAL */ || setupFlags == 0)
-                throw new InvalidOperationException($"io_uring_setup failed with errno {err} (flags=0x{setupFlags:x})");
-            // Try dropping the next flag in the drop order; if none left, fall back to flags=0.
-            bool dropped = false;
-            while (dropIdx < dropOrder.Length)
+            bool canDropSqPollForPermissions =
+                err == IoUringConstants.EPERM &&
+                (setupFlags & IoUringConstants.IORING_SETUP_SQPOLL) != 0;
+            if (canDropSqPollForPermissions)
             {
-                uint flag = dropOrder[dropIdx++];
-                if ((setupFlags & flag) != 0)
-                {
-                    setupFlags &= ~flag;
-                    dropped = true;
-                    break;
-                }
+                setupFlags &= ~IoUringConstants.IORING_SETUP_SQPOLL;
             }
-            if (!dropped)
+            else if (err != IoUringConstants.EINVAL || setupFlags == 0)
             {
-                setupFlags = 0;
+                throw new InvalidOperationException($"io_uring_setup failed with errno {err} (flags=0x{setupFlags:x})");
+            }
+            else
+            {
+                // Try dropping the next flag in the drop order; if none left, fall back to flags=0.
+                bool dropped = false;
+                while (dropIdx < dropOrder.Length)
+                {
+                    uint flag = dropOrder[dropIdx++];
+                    if ((setupFlags & flag) != 0)
+                    {
+                        setupFlags &= ~flag;
+                        dropped = true;
+                        break;
+                    }
+                }
+                if (!dropped)
+                {
+                    setupFlags = 0;
+                }
             }
             p = default;
             p.Flags = setupFlags;
             fd = IoUringNative.IoUringSetup(entries, &p);
         }
         SetupFlags = setupFlags;
-
         _ringFd = fd;
 
+        bool singleMmap = (p.Features & IoUringConstants.IORING_FEAT_SINGLE_MMAP) != 0;
+        nint sqRingPtr = nint.Zero;
+        nint sqesPtr = nint.Zero;
+        nint cqRingPtr = nint.Zero;
+        nuint ringMapSize = 0;
+        nuint sqesSize = 0;
+        nuint cqMapSize = 0;
         try
         {
-            _singleMmap = (p.Features & IoUringConstants.IORING_FEAT_SINGLE_MMAP) != 0;
+            _singleMmap = singleMmap;
 
             nuint sqRingSize = p.SqOff.Array + p.SqEntries * (nuint)sizeof(uint);
             nuint cqRingSize = p.CqOff.Cqes + p.CqEntries * (nuint)sizeof(IoUringCqe);
-            nuint sqesSize = p.SqEntries * (nuint)sizeof(IoUringSqe);
+            sqesSize = p.SqEntries * (nuint)sizeof(IoUringSqe);
 
             // When SINGLE_MMAP is supported, SQ and CQ share one mmap region at IORING_OFF_SQ_RING.
-            nuint ringMapSize = _singleMmap ? Math.Max(sqRingSize, cqRingSize) : sqRingSize;
+            ringMapSize = singleMmap ? Math.Max(sqRingSize, cqRingSize) : sqRingSize;
 
-            nint sqRingPtr = Libc.mmap(
+            sqRingPtr = Libc.mmap(
                 nint.Zero, ringMapSize,
                 IoUringConstants.PROT_READ | IoUringConstants.PROT_WRITE,
                 IoUringConstants.MAP_SHARED | IoUringConstants.MAP_POPULATE,
                 fd, (long)IoUringConstants.IORING_OFF_SQ_RING);
 
             if (sqRingPtr == IoUringConstants.MAP_FAILED)
-                throw new InvalidOperationException($"mmap SQ ring failed: {Marshal.GetLastPInvokeError()}");
+            {
+                int errno = Marshal.GetLastPInvokeError();
+                sqRingPtr = nint.Zero;
+                throw new InvalidOperationException($"mmap SQ ring failed: {errno}");
+            }
 
-            nint sqesPtr = Libc.mmap(
+            sqesPtr = Libc.mmap(
                 nint.Zero, sqesSize,
                 IoUringConstants.PROT_READ | IoUringConstants.PROT_WRITE,
                 IoUringConstants.MAP_SHARED | IoUringConstants.MAP_POPULATE,
@@ -141,14 +166,12 @@ public sealed class Ring : IDisposable
 
             if (sqesPtr == IoUringConstants.MAP_FAILED)
             {
-                Libc.munmap(sqRingPtr, ringMapSize);
-                throw new InvalidOperationException($"mmap SQEs failed: {Marshal.GetLastPInvokeError()}");
+                int errno = Marshal.GetLastPInvokeError();
+                sqesPtr = nint.Zero;
+                throw new InvalidOperationException($"mmap SQEs failed: {errno}");
             }
 
-            nint cqRingPtr;
-            nuint cqMapSize;
-
-            if (_singleMmap)
+            if (singleMmap)
             {
                 cqRingPtr = sqRingPtr; // shared region
                 cqMapSize = 0;
@@ -164,9 +187,9 @@ public sealed class Ring : IDisposable
 
                 if (cqRingPtr == IoUringConstants.MAP_FAILED)
                 {
-                    Libc.munmap(sqesPtr, sqesSize);
-                    Libc.munmap(sqRingPtr, ringMapSize);
-                    throw new InvalidOperationException($"mmap CQ ring failed: {Marshal.GetLastPInvokeError()}");
+                    int errno = Marshal.GetLastPInvokeError();
+                    cqRingPtr = nint.Zero;
+                    throw new InvalidOperationException($"mmap CQ ring failed: {errno}");
                 }
             }
 
@@ -182,6 +205,12 @@ public sealed class Ring : IDisposable
         }
         catch
         {
+            if (!singleMmap && cqRingPtr != nint.Zero)
+                Libc.munmap(cqRingPtr, cqMapSize);
+            if (sqesPtr != nint.Zero)
+                Libc.munmap(sqesPtr, sqesSize);
+            if (sqRingPtr != nint.Zero)
+                Libc.munmap(sqRingPtr, ringMapSize);
             Libc.close(fd);
             throw;
         }
@@ -245,7 +274,7 @@ public sealed class Ring : IDisposable
             Fds = (ulong)(nint)(&fd),
         };
         int ret = IoUringNative.IoUringRegister(
-            _ringFd, 6 /* IORING_REGISTER_FILES_UPDATE */, (nint)(&update), 1);
+            _ringFd, IoUringConstants.IORING_REGISTER_FILES_UPDATE, (nint)(&update), 1);
         if (ret < 0)
         {
             _registeredFiles[slot] = -1;
@@ -258,13 +287,12 @@ public sealed class Ring : IDisposable
     /// <summary>
     /// Unregisters an fd from its slot (sets to -1).
     /// </summary>
-    internal unsafe void UnregisterFd(int slot)
+    internal unsafe bool UnregisterFd(int slot)
     {
         if (_registeredFiles == null || slot < 0 || slot >= _registeredFiles.Length)
-            return;
-
-        _registeredFiles[slot] = -1;
-        _freeFileSlots.Push(slot);
+            return false;
+        if (_registeredFiles[slot] == -1)
+            return true;
 
         int emptyFd = -1;
         var update = new IoUringFilesUpdate
@@ -272,8 +300,14 @@ public sealed class Ring : IDisposable
             Offset = (uint)slot,
             Fds = (ulong)(nint)(&emptyFd),
         };
-        IoUringNative.IoUringRegister(
-            _ringFd, 6 /* IORING_REGISTER_FILES_UPDATE */, (nint)(&update), 1);
+        int ret = IoUringNative.IoUringRegister(
+            _ringFd, IoUringConstants.IORING_REGISTER_FILES_UPDATE, (nint)(&update), 1);
+        if (ret < 0)
+            return false;
+
+        _registeredFiles[slot] = -1;
+        _freeFileSlots.Push(slot);
+        return true;
     }
 
     internal unsafe bool TryGetSqe(out IoUringSqe* sqe) => _sq.TryGetSqe(out sqe);
@@ -292,6 +326,8 @@ public sealed class Ring : IDisposable
         // With DEFER_TASKRUN, completions only run when we enter with GETEVENTS — pass it
         // even on a "submit-only" call so the kernel processes any queued task work.
         uint flags = RequiresGetEventsToDrain ? IoUringConstants.IORING_ENTER_GETEVENTS : 0u;
+        if (_sq.NeedsWakeup)
+            flags |= IoUringConstants.IORING_ENTER_SQ_WAKEUP;
         if (toSubmit == 0 && flags == 0)
             return 0;
         return Enter(toSubmit, 0, flags);
@@ -332,7 +368,9 @@ public sealed class Ring : IDisposable
             }
             if (err == IoUringConstants.EAGAIN)
                 return 0;
-            if (err == 17 /* EEXIST: concurrent io_uring_enter collision */)
+            if (err == IoUringConstants.EBUSY)
+                return 0;
+            if (err == IoUringConstants.EEXIST)
             {
                 Thread.Yield();
                 toSubmit = 0;
@@ -357,8 +395,8 @@ public sealed class Ring : IDisposable
     /// <summary>Releases all io_uring resources and unmaps shared memory regions.</summary>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
 
         if (!_singleMmap && _cqMapSize > 0)
             Libc.munmap(_cqRingPtr, _cqMapSize);

@@ -2,7 +2,6 @@ using System.Net.Http;
 using System.Threading.Tasks;
 using Kestrel.Transport.IoUring;
 using BenchmarkDotNet.Attributes;
-using BenchmarkDotNet.Jobs;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Hosting;
@@ -10,7 +9,7 @@ using Microsoft.Extensions.Logging;
 
 namespace Kestrel.Transport.IoUring.Benchmarks;
 
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob]
 [MemoryDiagnoser]
 public class HttpBenchmark : IDisposable
 {

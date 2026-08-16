@@ -17,12 +17,11 @@ internal sealed class IoUringPipeScheduler : PipeScheduler
     // 0 = no signal pending, 1 = eventfd write already issued and not yet drained.
     private int _signalPending;
 
-    [ThreadStatic]
-    private static bool t_isIoThread;
+    private int _ioThreadId;
 
     /// <summary>Marks the calling thread as the IO loop thread; calls to Schedule from this
     /// thread will enqueue work but will NOT write the eventfd (the outer loop drains inline).</summary>
-    public static void MarkIoThread() => t_isIoThread = true;
+    public void MarkIoThread() => Volatile.Write(ref _ioThreadId, Environment.CurrentManagedThreadId);
 
     /// <summary>Last drain count — diagnostic only, exposed to logs.</summary>
     public int LastDrainedCount;
@@ -51,12 +50,10 @@ internal sealed class IoUringPipeScheduler : PipeScheduler
     {
         _queue.Enqueue(new Work(action, state));
 
-        // OPT B: if we're already on the IO thread, the outer loop will drain
-        // before re-parking. No need to write the eventfd at all.
-        if (t_isIoThread)
+        if (Environment.CurrentManagedThreadId == Volatile.Read(ref _ioThreadId))
             return;
 
-        // OPT A: strict CAS coalesce. Only one off-loop producer wins the race
+        // Strict CAS coalesce. Only one off-loop producer wins the race
         // to write the eventfd between drains.
         if (Interlocked.Exchange(ref _signalPending, 1) == 0)
         {

@@ -10,7 +10,9 @@ using Microsoft.Extensions.Options;
 namespace Kestrel.Transport.IoUring.Transport;
 
 /// <summary>Kestrel connection listener factory backed by io_uring, with automatic socket fallback.</summary>
-public sealed class IoUringTransportFactory : IConnectionListenerFactory
+public sealed class IoUringTransportFactory :
+    IConnectionListenerFactory,
+    IConnectionListenerFactorySelector
 {
     private readonly IoUringTransportOptions _options;
     private readonly ILoggerFactory _loggerFactory;
@@ -38,14 +40,21 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
     public static bool IsUsingIoUring => Ring.IsSupported;
 
     /// <inheritdoc />
-    public ValueTask<IConnectionListener> BindAsync(EndPoint endpoint, CancellationToken cancellationToken = default)
+    public async ValueTask<IConnectionListener> BindAsync(
+        EndPoint endpoint,
+        CancellationToken cancellationToken = default)
     {
+        _options.Validate();
+
+        if (!CanBind(endpoint))
+            return await _socketFallback.Value.BindAsync(endpoint, cancellationToken).ConfigureAwait(false);
+
         if (!Ring.IsSupported)
         {
             _logger.LogWarning(
                 "io_uring is not supported on this system (Linux 5.1+ required). " +
                 "Falling back to the default socket transport.");
-            return _socketFallback.Value.BindAsync(endpoint, cancellationToken);
+            return await _socketFallback.Value.BindAsync(endpoint, cancellationToken).ConfigureAwait(false);
         }
 
         if (_options.ThreadCount > 1)
@@ -53,17 +62,51 @@ public sealed class IoUringTransportFactory : IConnectionListenerFactory
             _logger.LogInformation(
                 "Starting io_uring transport with {ThreadCount} rings (SO_REUSEPORT).",
                 _options.ThreadCount);
-            var multiListener = new IoUringMultiListener(endpoint, _options, _loggerFactory);
-            return ValueTask.FromResult<IConnectionListener>(multiListener);
+            try
+            {
+                var multiListener = new IoUringMultiListener(endpoint, _options, _loggerFactory);
+                return multiListener;
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogWarning(ex,
+                    "Failed to initialize io_uring; falling back to the default socket transport.");
+                return await _socketFallback.Value.BindAsync(endpoint, cancellationToken).ConfigureAwait(false);
+            }
         }
 
-        var ring = new Ring((uint)_options.EffectiveRingSize, GetSetupFlags());
+        Ring ring;
+        try
+        {
+            ring = new Ring((uint)_options.EffectiveRingSize, GetSetupFlags());
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to initialize io_uring; falling back to the default socket transport.");
+            return await _socketFallback.Value.BindAsync(endpoint, cancellationToken).ConfigureAwait(false);
+        }
         var logger = _loggerFactory.CreateLogger<IoUringConnectionListener>();
-        var listener = new IoUringConnectionListener(endpoint, ring, _options, logger);
-        listener.Bind(_options.ListenBacklog);
+        IoUringConnectionListener? listener = null;
+        try
+        {
+            listener = new IoUringConnectionListener(endpoint, ring, _options, logger);
+            listener.Bind(_options.ListenBacklog);
+        }
+        catch
+        {
+            if (listener == null)
+                ring.Dispose();
+            else
+                await listener.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
 
-        return ValueTask.FromResult<IConnectionListener>(listener);
+        return listener;
     }
+
+    /// <inheritdoc />
+    public bool CanBind(EndPoint endpoint) => endpoint is IPEndPoint;
 
     internal uint GetSetupFlags()
     {
