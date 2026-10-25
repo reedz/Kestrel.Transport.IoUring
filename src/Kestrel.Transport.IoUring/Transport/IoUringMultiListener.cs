@@ -280,10 +280,13 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         {
             await unbindTask.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested && !unbindTask.IsCompleted)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             // Best effort, like SocketTransport: Kestrel passes an already-cancelled token once its shutdown
-            // timeout expires and must still dispose the workers. The shared unbind keeps running.
+            // timeout expires and must still dispose the workers. The shared unbind keeps running. If it
+            // finished in the meantime, report its real outcome (a worker failure) rather than the cancellation.
+            if (unbindTask.IsCompleted)
+                await unbindTask.ConfigureAwait(false);
         }
     }
 

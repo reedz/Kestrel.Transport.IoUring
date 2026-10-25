@@ -15,20 +15,33 @@ namespace Kestrel.Transport.IoUring.Tests.Integration;
 public class ActiveConnectionGaugeTests
 {
     [Fact]
-    public async Task DisposingWithLiveConnections_RestoresTheProcessWideGauge()
+    public async Task DisposingAfterTheLoopDiedWithLiveConnections_RestoresTheProcessWideGauge()
     {
         if (!Ring.IsSupported) return;
 
         long before = Volatile.Read(ref IoUringConnectionListener.s_activeConnections);
-        var listener = ListenerLoopFailureTests.CreateListener();
+        using var fail = new ManualResetEventSlim(false);
+        var listener = ListenerLoopFailureTests.CreateListener(() =>
+        {
+            if (fail.IsSet)
+                throw new InvalidOperationException("injected io loop fault");
+        });
+
+        using var client = new TcpClient();
         try
         {
-            using var client = new TcpClient();
             await client.ConnectAsync((IPEndPoint)listener.EndPoint);
             var connection = await listener.AcceptAsync();
             connection.Should().NotBeNull();
-
             Volatile.Read(ref IoUringConnectionListener.s_activeConnections).Should().Be(before + 1);
+
+            // Kill the loop while the client is still connected: the connection can never be released normally.
+            fail.Set();
+            await client.GetStream().WriteAsync(new byte[] { 1 }); // wakes the parked loop
+            await listener.IoLoopStopped.WaitAsync(TimeSpan.FromSeconds(20));
+
+            Volatile.Read(ref IoUringConnectionListener.s_activeConnections)
+                .Should().Be(before + 1, "a dead loop cannot release the connection, so dispose must");
         }
         finally
         {

@@ -61,6 +61,39 @@ public class ListenerLoopFailureTests
     }
 
     [Fact]
+    public async Task AfterTheIoLoopDied_TheListenPortStopsAccepting()
+    {
+        if (!Ring.IsSupported) return;
+
+        using var fail = new ManualResetEventSlim(false);
+        var listener = CreateListener(() =>
+        {
+            if (fail.IsSet)
+                throw new InvalidOperationException("injected io loop fault");
+        });
+
+        try
+        {
+            var endpoint = (IPEndPoint)listener.EndPoint;
+            fail.Set();
+            using (var waker = new TcpClient())
+                await waker.ConnectAsync(endpoint); // wakes the parked loop so it can fail
+            await listener.IoLoopStopped.WaitAsync(Limit);
+
+            await WithinLimit(listener.UnbindAsync().AsTask(), "UnbindAsync after the loop died");
+
+            // The kernel would otherwise keep completing connects into the listen backlog of a socket nobody serves.
+            using var late = new TcpClient();
+            Func<Task> connect = async () => await late.ConnectAsync(endpoint);
+            await connect.Should().ThrowAsync<SocketException>("a dead listener must not keep accepting connections");
+        }
+        finally
+        {
+            await WithinLimit(listener.DisposeAsync().AsTask(), "DisposeAsync after loop death");
+        }
+    }
+
+    [Fact]
     public async Task FatalErrorAfterUnbind_StillAbortsAppOwnedConnections()
     {
         if (!Ring.IsSupported) return;

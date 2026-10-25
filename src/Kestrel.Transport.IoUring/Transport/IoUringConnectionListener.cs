@@ -90,6 +90,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private int _ringFailed;
     // Test seam: invoked at the top of every IO-loop iteration so tests can inject loop faults. Null in production.
     internal Action? IoLoopIterationHook { get; set; }
+
+    internal Task IoLoopStopped => _ioLoopStopped.Task;
+
+    /// <summary>True when connections of this listener receive through the provided-buffer ring (multishot).</summary>
+    internal bool UsesBufferRing => _bufferRing != null;
     private int _unbindStarted;
     private int _disposeStarted;
     private bool _ioLoopStarted;
@@ -605,9 +610,31 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             // Nothing will service lifecycle commands again: an unbind or dispose waiting for the IO loop to
             // stop accepting or to drain connections would otherwise wait forever. The listen socket is
             // released by DisposeAsync.
+            StopAcceptingAfterLoopExit();
             _acceptStopped.TrySetResult();
             _connectionsDrained.TrySetResult();
             _ioLoopStopped.TrySetResult();
+        }
+    }
+
+    /// <summary>
+    /// A dead IO loop can no longer cancel its outstanding accept, and the kernel keeps accepting through that
+    /// request (it holds its own reference to the listen socket, so closing our handle would not stop it).
+    /// Shutting the listening socket down makes new clients get refused and fails the accept request, so the port
+    /// stops accepting before unbind is acknowledged.
+    /// </summary>
+    private void StopAcceptingAfterLoopExit()
+    {
+        if (Volatile.Read(ref _listenSocketReleased) != 0)
+            return;
+
+        try
+        {
+            _listenSocket.Shutdown(SocketShutdown.Both);
+        }
+        catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
+        {
+            // Already shut down or disposed: nothing left to stop.
         }
     }
 
@@ -1241,6 +1268,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
                 // A clean EOF can overtake data still queued behind pipe backpressure (the multishot receive
                 // keeps posting until its cancel lands). Deliver that data first; a reset discards it anyway.
+                // Like SocketTransport, whose receive loop awaits the paused flush before it can read the FIN,
+                // the closure is not observable until the application drains the input.
                 if (result == 0 && conn.TryDeferReceiveEof())
                     return false;
 

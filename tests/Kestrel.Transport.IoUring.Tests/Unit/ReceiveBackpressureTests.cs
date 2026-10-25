@@ -18,7 +18,9 @@ public class ReceiveBackpressureTests
 
     private static IoUringConnection CreateConnection(
         Ring ring,
-        List<ConnectionAbortedException?> closeRequests)
+        List<ConnectionAbortedException?> closeRequests,
+        Action<long, ushort>? requestRecvResubmit = null,
+        IoUringPipeScheduler? scheduler = null)
     {
         var connection = new IoUringConnection(
             connectionId: 0,
@@ -28,7 +30,7 @@ public class ReceiveBackpressureTests
             remoteEndPoint: null,
             localEndPoint: null,
             receiveBufferSize: ReceiveBufferSize,
-            transportScheduler: new IoUringPipeScheduler(static () => { }),
+            transportScheduler: scheduler ?? new IoUringPipeScheduler(static () => { }),
             unsafeInlineScheduling: false,
             logger: NullLogger.Instance,
             useBufferRing: true)
@@ -36,7 +38,7 @@ public class ReceiveBackpressureTests
             Generation = 1,
         };
         connection.InitializeIoCallbacks(
-            static (_, _) => { },
+            requestRecvResubmit ?? (static (_, _) => { }),
             static (_, _) => { },
             (_, _, reason) => closeRequests.Add(reason));
         return connection;
@@ -95,6 +97,68 @@ public class ReceiveBackpressureTests
 
             outcome.Should().Be(IoUringConnection.RecvOutcome.Closed);
             closes.Should().ContainSingle().Which.Should().NotBeNull();
+        }
+        finally
+        {
+            connection.ForceCleanupAfterRingClosed();
+        }
+    }
+
+    [Fact]
+    public void EofWithNoBackpressure_IsNotDeferred()
+    {
+        if (!Ring.IsSupported) return;
+        using var ring = new Ring(64);
+        var connection = CreateConnection(ring, []);
+        try
+        {
+            connection.TryDeferReceiveEof().Should().BeFalse();
+            connection.ReceiveEofPending.Should().BeFalse();
+        }
+        finally
+        {
+            connection.ForceCleanupAfterRingClosed();
+        }
+    }
+
+    [Fact]
+    public async Task EofBehindQueuedData_IsDeferredUntilTheDataIsDelivered()
+    {
+        if (!Ring.IsSupported) return;
+        using var ring = new Ring(64);
+        var resubmit = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var scheduler = new IoUringPipeScheduler(static () => { });
+        var connection = CreateConnection(ring, [], (_, _) => resubmit.TrySetResult(), scheduler);
+        try
+        {
+            DriveIntoBackpressure(connection);
+            const int QueuedTail = 3 * ReceiveBufferSize;
+            for (int i = 0; i < 3; i++)
+            {
+                connection.OnRecvCompleteFromBuffer(new byte[ReceiveBufferSize])
+                    .Should().Be(IoUringConnection.RecvOutcome.Deferred);
+            }
+
+            connection.TryDeferReceiveEof().Should().BeTrue("data is still queued behind the paused pipe");
+            connection.ReceiveEofPending.Should().BeTrue();
+
+            // The application drains the pipe, which completes the pending flush and requests the resubmit.
+            var input = connection.Transport.Input;
+            var first = await input.ReadAsync();
+            long delivered = first.Buffer.Length;
+            input.AdvanceTo(first.Buffer.End);
+            // Stands in for the IO loop, which runs the pipe's continuations through the scheduler.
+            scheduler.DrainWorkItems();
+            await resubmit.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            connection.ResumeReceiveAfterFlush().Should().Be(IoUringConnection.RecvOutcome.Continue);
+
+            var second = await input.ReadAsync();
+            delivered += second.Buffer.Length;
+            input.AdvanceTo(second.Buffer.End);
+
+            delivered.Should().Be(PauseThreshold + QueuedTail, "everything received before the EOF must reach the application");
+            connection.ReceiveEofPending.Should().BeTrue("the listener completes the input only now, after the data");
         }
         finally
         {

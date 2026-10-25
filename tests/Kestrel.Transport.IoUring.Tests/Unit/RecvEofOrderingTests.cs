@@ -33,6 +33,9 @@ public class RecvEofOrderingTests
         var listener = ListenerLoopFailureTests.CreateListener();
         try
         {
+            // Without the provided-buffer ring the receive is single-shot and this race cannot occur.
+            listener.UsesBufferRing.Should().BeTrue("the EOF-overtakes-data race only exists with multishot receive");
+
             var failures = new List<string>();
             for (int round = 0; round < Totals.Length * 6; round++)
             {

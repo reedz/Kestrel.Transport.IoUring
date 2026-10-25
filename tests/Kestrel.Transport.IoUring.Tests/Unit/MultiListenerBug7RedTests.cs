@@ -303,6 +303,34 @@ public class MultiListenerBug7RedTests
     }
 
     [Fact]
+    public async Task UnbindAsync_CancelledWhileTheSharedUnbindCompletes_NeverThrows()
+    {
+        // Caller cancellation races the shared unbind finishing; neither order may surface an exception.
+        for (int i = 0; i < 300; i++)
+        {
+            var worker1 = new FakeWorker(releaseUnbindByDefault: false);
+            var worker2 = new FakeWorker(releaseUnbindByDefault: false);
+            var listener = CreateListener(mergedCapacity: 1, worker1, worker2);
+            using var source = new CancellationTokenSource();
+            try
+            {
+                var unbind = listener.UnbindAsync(source.Token).AsTask();
+                var release = Task.Run(() => { worker1.ReleaseUnbind(); worker2.ReleaseUnbind(); });
+                var cancel = Task.Run(source.Cancel);
+
+                await WithTimeout(Task.WhenAll(release, cancel));
+                await WithTimeout(unbind);
+            }
+            finally
+            {
+                worker1.ReleaseUnbind();
+                worker2.ReleaseUnbind();
+                await SafeDisposeAsync(listener);
+            }
+        }
+    }
+
+    [Fact]
     public async Task DisposeAsync_ContinuesCleanupWhenAWorkerUnbindFails()
     {
         var mergedConnection = new TrackedConnectionContext("merged");
