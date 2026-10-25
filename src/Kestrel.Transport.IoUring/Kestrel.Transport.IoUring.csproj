@@ -16,7 +16,7 @@
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
 
     <PackageId>Kestrel.Transport.IoUring</PackageId>
-    <Version>2.3.0</Version>
+    <Version>2.4.0</Version>
     <Authors>reedz</Authors>
     <Description>Production-oriented io_uring transport for ASP.NET Core Kestrel with multishot accept/receive, provided buffer rings, lifecycle-safe cancellation, multi-ring listeners, and SocketTransport fallback.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -27,6 +27,21 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <Copyright>Copyright (c) 2026 reedz</Copyright>
     <PackageReleaseNotes>
+v2.4.0
+- UnbindAsync only stops accepting; Kestrel's graceful shutdown can drain live connections (previously every
+  connection was aborted). DisposeAsync force-aborts what is left and now waits for connection finalization.
+- ConnectionClosed/RequestAborted fire promptly on peer EOF/reset; recv EOF no longer overtakes data queued behind
+  backpressure; slow uploads no longer abort at 1 MiB of queued receive data.
+- Receive retry after provided-buffer exhaustion is progress-driven, bounded and fair (fixes an ENOBUFS storm and
+  client timeouts at thousands of connections); BufferRingSize 0 (default) sizes itself from MaxConnections.
+- Send path gathers many pipe segments into one SENDMSG (about 2x static-file throughput).
+- A dead IO loop no longer hangs UnbindAsync/DisposeAsync and stops accepting; a fatal ring error after unbind still
+  aborts connections; multi-ring UnbindAsync no longer throws for a cancelled token.
+- Multishot receive is used only on Linux 6.0+; kernels older than 5.6 fall back to SocketTransport. The single-ring
+  listener no longer shares its port via SO_REUSEPORT; bind conflicts raise Kestrel's AddressInUseException.
+- RequireIoUring / IOURING_REQUIRE and IoUringTransportFactory.Bindings report what actually serves each bind.
+- Unique process-wide ConnectionId values.
+
 v2.3.0
 - Fix default ring sizing so the transport binds with default options.
 - Drain final response buffers and close connection-churn sockets without fd leaks.

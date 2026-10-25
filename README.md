@@ -131,7 +131,14 @@ On the repository's 2-CPU Linux witness host, the current matrix produced:
 - **Zero request errors**.
 
 See [BENCHMARKS.md](BENCHMARKS.md) for prerequisites, raw methodology, per-cell
-results, and the exact command.
+results, and the exact command. A local Phoronix Test Suite profile that compares
+the transports on ASP.NET Core workloads (static file, plaintext, JSON; .NET 10 and
+.NET 11 RC2) lives in [`phoronix/`](phoronix/README.md); it is not published anywhere.
+
+## More documentation
+
+- [docs/DOTNET11.md](docs/DOTNET11.md): evidence that stock .NET 11 has no io_uring socket transport.
+- [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md): review findings that are not fixed.
 
 ## License
 

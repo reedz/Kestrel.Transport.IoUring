@@ -3,7 +3,7 @@
 <PhoronixTestSuite>
   <TestInformation>
     <Title>ASP.NET Core Kestrel (transport comparison)</Title>
-    <AppVersion>2.3.0</AppVersion>
+    <AppVersion>2.4.0</AppVersion>
     <Description>HTTP/1.1 throughput of ASP.NET Core's Kestrel server with either its default epoll socket transport or the Kestrel.Transport.IoUring transport (Linux io_uring), measured with wrk. Workloads: the nginx/apache profiles' 118 KB static test.html, a 13-byte plaintext response and a per-request serialized JSON response. The profile starts the server with the chosen transport and .NET runtime, verifies from /proc and over HTTP that this process serves the port with the requested transport and runtime (a silent fall back to sockets fails the run), checks the workload's response, warms it up, and fails any measured run that has socket errors or HTTP error responses.</Description>
     <ResultScale>Requests Per Second</ResultScale>
     <Proportion>HIB</Proportion>
