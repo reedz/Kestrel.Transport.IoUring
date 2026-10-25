@@ -98,12 +98,13 @@ if [ "$NO_EGRESS" = "1" ]; then
     done
     [ "${#FORWARD_ENV[@]}" -eq 0 ] || echo "run-local: forwarding into the namespace: ${FORWARD_ENV[*]}"
     # Always creates a fresh namespace (never trusts an inherited marker) and checks that it has only loopback.
+    # ${arr[@]+"${arr[@]}"} keeps an empty array from tripping `set -u` on bash older than 4.4.
     exec sudo unshare -n bash -c '
         ip link set lo up || exit 1
         [ "$(ip -o link show | wc -l)" = 1 ] || { echo "run-local: the namespace has more than the loopback interface" >&2; exit 1; }
         user="$0"
         exec sudo -u "$user" -H env "$@"' \
-        "$(id -un)" PATH="$PATH" PTS="$PTS_BIN" "${FORWARD_ENV[@]}" "$SELF" "${FORWARD_ARGS[@]}"
+        "$(id -un)" PATH="$PATH" PTS="$PTS_BIN" ${FORWARD_ENV[@]+"${FORWARD_ENV[@]}"} "$SELF" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
 fi
 
 if ! config_check; then

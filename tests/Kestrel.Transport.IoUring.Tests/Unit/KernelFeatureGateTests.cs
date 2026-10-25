@@ -79,10 +79,23 @@ public class KernelFeatureGateTests
         if (!IoUringKernelFeatures.MeetsCoreMinimum(IoUringKernelFeatures.CurrentKernel()))
             return;
 
-        // Ring.IsSupported now includes the probe, so a host that supports io_uring at all passes it; this asserts the
-        // probe call itself against the real kernel rather than only the parser.
-        using var ring = new Ring(8);
-        IoUringKernelFeatures.RingSupportsRequiredOpcodes(ring.Fd).Should().BeTrue();
+        // Asserts the probe call itself against the real kernel rather than only the parser. Ring.IsSupported cannot be
+        // the guard: it includes the probe, so a broken probe would make this test skip instead of fail. io_uring
+        // being blocked (seccomp, kernel.io_uring_disabled) is a valid SocketTransport environment, not a failure.
+        Ring ring;
+        try
+        {
+            ring = new Ring(8);
+        }
+        catch (InvalidOperationException)
+        {
+            return;
+        }
+
+        using (ring)
+        {
+            IoUringKernelFeatures.RingSupportsRequiredOpcodes(ring.Fd).Should().BeTrue();
+        }
     }
 
     [Fact]
