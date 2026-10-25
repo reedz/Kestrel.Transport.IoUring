@@ -60,19 +60,38 @@ use `services.AddIoUringTransport(...)`.
 | Option | Default | Description |
 |---|---:|---|
 | `RingSize` | 1024 | SQ/CQ depth; power of two, maximum 32768. |
-| `BufferRingSize` | 0 (auto) | Provided receive buffers per ring; power of two, or 0 to size from `MaxConnections` (1024-4096). Keep it at least the number of concurrent connections per ring: with fewer buffers, receives hit `ENOBUFS` and are re-armed as buffers are recycled, which costs throughput and can time out under thousands of simultaneously active connections. |
+| `BufferRingSize` | 0 (auto) | Provided receive buffers per ring; power of two, or 0 to size from the connections the ring is expected to serve (`MaxConnections`, or its even share per ring with `ThreadCount` > 1; 1024-4096). Keep it at least the number of concurrent connections per ring: with fewer buffers, receives hit `ENOBUFS` and are re-armed as buffers are recycled, which costs throughput and can time out under thousands of simultaneously active connections. |
 | `ReceiveBufferSize` | 2048 | Bytes per receive buffer. |
-| `MaxConnections` | 16384 | Aggregate simultaneous connection limit. |
-| `AcceptQueueCapacity` | 1024 | Accepted connections waiting for Kestrel. |
-| `ThreadCount` | 1 | Rings/listener threads. More than 1 uses `SO_REUSEPORT`, so another process doing the same can bind the same port without an error and share the traffic; the default single-ring listener does not (a second instance fails with Kestrel's "address already in use"). |
+| `MaxConnections` | 16384 | Simultaneous connection limit for the listener, shared by all of its rings (one admission count, so the kernel's `SO_REUSEPORT` hashing cannot make one ring refuse connections while another has room). |
+| `AcceptQueueCapacity` | 1024 | Accepted connections waiting for Kestrel. When it is full the transport pauses accepting (clients wait in the listen backlog) instead of aborting connections. |
+| `ThreadCount` | 1 | Rings/listener threads. More than 1 binds one `SO_REUSEPORT` socket per ring; an explicit port is first checked with an exclusive bind, so a second instance fails with Kestrel's "address already in use" like the default single-ring listener (a process binding in the instant between that check and the rings can still share the port). |
 | `EnableMultishotAccept` | `true` | Multishot accept with kernel fallback. |
 | `EnableBufferRing` | `true` | Provided-buffer multishot receive. |
 | `EnableRegisteredFiles` | `false` | Fixed-file table; adds synchronous updates on connection churn. |
 | `UnsafeInlineScheduling` | `true` | Runs Kestrel processing on the IO thread; disable for blocking middleware. |
 | `RequireIoUring` | `false` | Throw instead of silently falling back to SocketTransport when io_uring is unavailable or ring setup fails (also `IOURING_REQUIRE=1`). |
+| `ListenBacklog` | 512 | `listen(2)` backlog. When not set, `SocketTransportOptions.Backlog` applies. |
 
 `EnableCoopTaskRun`, `EnableSingleIssuer`, `EnableDeferTaskRun`, and
-`EnableSqPoll` are advanced kernel options and default to `false`.
+`EnableSqPoll` are advanced kernel options and default to `false`. With `EnableSingleIssuer` the ring is created
+disabled and enabled by its IO loop thread, which becomes the ring's only issuer; whether the kernel accepted the flag
+is visible in `Bindings[..].SetupFlags`.
+
+### SocketTransportOptions
+
+The `SocketTransportOptions` settings that mean the same thing here are honoured: `NoDelay` (default `true`),
+`Backlog` (unless `ListenBacklog` is set explicitly), and `MaxReadBufferSize` / `MaxWriteBufferSize` (the input and
+output pipe limits; `null` means unlimited). Configure them with
+`services.Configure<SocketTransportOptions>(...)`. Socket-specific settings such as `IOQueueCount`,
+`WaitForDataBeforeAllocatingBuffer` and `UnsafePreferInlineScheduling` do not apply; see `UnsafeInlineScheduling`.
+
+### Shutdown
+
+`UnbindAsync` only stops accepting. `DisposeAsync` aborts what the application has not closed, then the ring's
+owner thread cancels every outstanding request and consumes completions until each request has ended, and only
+then is memory released (closing the ring alone does not stop the kernel from using it). If that cannot be shown
+within 5 seconds, the listener and its memory are kept for the rest of the process instead (logged as an error)
+rather than risk the kernel writing into released memory.
 
 ### Verifying which transport is active
 
@@ -115,11 +134,13 @@ Each SQE carries a 64-bit routing value:
 
 ```text
 bits 63..24: connection slot (40 bits)
-bits 23..8 : slot generation (16 bits)
+bits 23..8 : low 16 bits of the slot generation
 bits 7..0  : operation type (8 bits)
 ```
 
-Accept and eventfd operations use reserved sentinel values.
+Accept and eventfd operations use reserved sentinel values. The listener's own control queues compare the full
+64-bit generation; 16 bits suffice in completions because a slot is reused only after every request of its previous
+occupant has completed.
 
 ## Performance
 

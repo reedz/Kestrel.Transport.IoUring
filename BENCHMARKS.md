@@ -90,8 +90,9 @@ Server CPU per 1,000 requests (ms, lower is better): static file 361/382 (base/n
 * **Gather send is kept.** Sending a response that arrives as many pipe segments with one `SENDMSG` instead of one
   `SEND` plus completion per segment roughly **doubles** the static-file throughput and halves its CPU per request
   (the `no-gather` variant matches `base`). Single small segments (plaintext, JSON) still use the scratch `SEND`.
-* **Static file versus sockets:** io_uring is behind by about 0-15% at 20-100 connections and ahead by about 20% at
-  500 on this machine; the remaining gap is the cost of one cross-thread hand-off per flushed chunk.
+* **Static file versus sockets:** io_uring was behind by about 0-15% at 20-100 connections and ahead by about 20% at
+  500 on this machine. The follow-up below, with an A/A control, puts the 20-100 connection difference within
+  run-to-run noise.
 * **JSON** is consistently 27-30% faster than sockets at 20/100 connections with 18-25% less CPU per request.
   The earlier small-connection plaintext figures are too noisy on this VM to quote.
 * **Sustained gates through the PTS pipeline** (90 s, 1 run, one ring, no errors of any kind): plaintext at 4,000
@@ -100,6 +101,30 @@ Server CPU per 1,000 requests (ms, lower is better): static file 361/382 (base/n
   timeouts) before the receive-retry rewrite; it now completes with zero errors.
 * Not measured here: more than one ring, TLS/HTTP2, any machine with more than 2 CPUs. Run
   `phoronix/run-local.sh` on a larger machine for those (see `phoronix/README.md`).
+
+### Follow-up: static file versus sockets after the shutdown/admission work
+
+Same VM, current branch, one ring, a fresh server process per run on CPU 0 and `wrk -t1` on CPU 1, 3 s warm-up
+then 6 s measured, 5 rounds with every (variant, workload) pair in shuffled order per round. `io_uring (A/A)` is a second, identical io_uring
+variant whose spread shows the run-to-run noise. CPU is server CPU per 1,000 requests.
+
+| Workload | Conns | io_uring RPS | io_uring (A/A) RPS | Sockets RPS | CPU io_uring / sockets (ms) |
+|---|---:|---:|---:|---:|---:|
+| Static 118 KB | 20 | 5,479 ± 35 | 5,227 ± 466 | 5,296 ± 832 | 175 / 178 |
+| Static 118 KB | 100 | 4,706 ± 679 | 4,943 ± 200 | 5,292 ± 194 | 208 / 185 |
+| Static 118 KB | 500 | 4,464 ± 94 | 4,416 ± 157 | 4,316 ± 88 | 222 / 228 |
+| Plaintext | 100 | 38,642 ± 390 | 37,733 ± 3,022 | 32,092 ± 3,680 | 25.0 / 28.7 |
+| JSON | 100 | 42,451 ± 1,176 | 38,530 ± 4,420 | 32,588 ± 3,198 | 22.3 / 28.5 |
+
+(± is the 95% confidence interval of the mean.) Per request, measured with `perf stat` on the server process for the
+static file at 20 / 100 connections: io_uring 0.71 / 0.29 context switches, 0.45 / 0.10 `io_uring_enter` and
+0.23 / 0.09 eventfd `write`s; sockets 1.69 / 1.35 context switches, 2.0 `sendmsg` and 0.82 / 0.71 `epoll_wait`.
+
+* Plaintext (+20%) and JSON (+30%) stay clearly ahead with less CPU per request.
+* The static file is at parity within the noise: io_uring is ahead at 20 and 500 connections and behind at 100,
+  where the A/A pair itself differs by 5%. The per-flush cross-thread hand-off suspected earlier does not show up
+  in the counts (well under one wake-up per request, and fewer context switches than sockets). No change was made;
+  a candidate would need to show a win larger than this noise.
 
 ## Prerequisites
 

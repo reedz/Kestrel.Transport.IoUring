@@ -29,18 +29,29 @@
     <PackageReleaseNotes>
 v2.4.0
 - UnbindAsync only stops accepting; Kestrel's graceful shutdown can drain live connections (previously every
-  connection was aborted). DisposeAsync force-aborts what is left and now waits for connection finalization.
+  connection was aborted). DisposeAsync force-aborts what the application has not disposed and waits for connection
+  finalization.
+- Disposal releases memory only after every io_uring request has completed (closing the ring is not a barrier for
+  the kernel); a ring that cannot be shown idle within 5 s is quarantined (kept alive) instead. Sockets the kernel
+  accepted during shutdown, or while the IO loop was failing, are always closed.
+- SINGLE_ISSUER rings are enabled by their IO thread (no more endless EEXIST retries); a failed fixed-file unregister
+  shuts the socket down and is retried.
+- MaxConnections is one limit shared by all rings; a full accept queue pauses accepting instead of aborting accepted
+  connections; multi-ring listeners refuse an explicit port that is already bound.
+- SocketTransportOptions NoDelay, Backlog, MaxReadBufferSize and MaxWriteBufferSize are honoured.
 - ConnectionClosed/RequestAborted fire promptly on peer EOF/reset; recv EOF no longer overtakes data queued behind
   backpressure; slow uploads no longer abort at 1 MiB of queued receive data.
 - Receive retry after provided-buffer exhaustion is progress-driven, bounded and fair (fixes an ENOBUFS storm and
   client timeouts at thousands of connections); BufferRingSize 0 (default) sizes itself from MaxConnections.
 - Send path gathers many pipe segments into one SENDMSG (about 2x static-file throughput).
 - A dead IO loop no longer hangs UnbindAsync/DisposeAsync and stops accepting; a fatal ring error after unbind still
-  aborts connections; multi-ring UnbindAsync no longer throws for a cancelled token.
+  aborts connections; multi-ring UnbindAsync no longer throws for a cancelled token; the merged accept channel
+  completes when every ring has stopped.
+- Retry timers that fire early (coarse clock) re-arm instead of leaving an idle loop parked.
 - Multishot receive is used only on Linux 6.0+; kernels older than 5.10, or rings that fail an opcode probe, fall back to SocketTransport. The single-ring
   listener no longer shares its port via SO_REUSEPORT; bind conflicts raise Kestrel's AddressInUseException.
 - RequireIoUring / IOURING_REQUIRE and IoUringTransportFactory.Bindings report what actually serves each bind.
-- Unique process-wide ConnectionId values.
+- Unique process-wide ConnectionId values; stale control requests cannot reach a reused slot (64-bit generations).
 
 v2.3.0
 - Fix default ring sizing so the transport binds with default options.
