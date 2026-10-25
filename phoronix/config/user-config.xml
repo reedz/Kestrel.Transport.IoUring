@@ -79,7 +79,10 @@
     </BatchMode>
     <Networking>
       <NoInternetCommunication>FALSE</NoInternetCommunication>
-      <NoNetworkCommunication>TRUE</NoNetworkCommunication>
+      <!-- FALSE only so that `install` can restore NuGet packages (the profile declares InstallRequiresInternet).
+           Uploads stay off via the settings above. Run `setup-local-pts.sh --offline` before measuring to set
+           this to TRUE, and see README.md for a literal no-egress run. -->
+      <NoNetworkCommunication>FALSE</NoNetworkCommunication>
       <Timeout>20</Timeout>
       <ProxyAddress></ProxyAddress>
       <ProxyPort></ProxyPort>

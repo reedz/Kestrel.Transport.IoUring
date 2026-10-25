@@ -8,6 +8,7 @@
 #                     (SDK tarballs, wrk, http-test-files). Copied into PTS's download cache so the install
 #                     does not re-download them. Optional: PTS downloads anything missing.
 #   --no-config       leave ~/.phoronix-test-suite/user-config.xml alone (then YOU must make sure uploads are off)
+#   --offline         set NoNetworkCommunication=TRUE in the installed config (use after `install`, before measuring)
 #
 # Run phoronix/make-bundle.sh first.
 
@@ -18,14 +19,23 @@ DIST="${DIST:-$REPO/phoronix/dist}"
 PTS_USER="$HOME/.phoronix-test-suite"
 ARTIFACTS=""
 WRITE_CONFIG=1
+OFFLINE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --no-config) WRITE_CONFIG=0; shift ;;
+        --offline) OFFLINE=1; shift ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+if [ "$OFFLINE" = "1" ]; then
+    [ -f "$PTS_USER/user-config.xml" ] || { echo "No $PTS_USER/user-config.xml; run without --offline first." >&2; exit 1; }
+    sed -i 's#<NoNetworkCommunication>FALSE</NoNetworkCommunication>#<NoNetworkCommunication>TRUE</NoNetworkCommunication>#' "$PTS_USER/user-config.xml"
+    echo "NoNetworkCommunication=TRUE in $PTS_USER/user-config.xml"
+    exit 0
+fi
 
 [ -f "$DIST/aspnet-kestrel-iouring-src.tar.gz" ] || { echo "Run phoronix/make-bundle.sh first." >&2; exit 1; }
 
