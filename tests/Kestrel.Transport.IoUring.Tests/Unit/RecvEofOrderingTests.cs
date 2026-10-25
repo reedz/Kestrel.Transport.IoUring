@@ -33,8 +33,13 @@ public class RecvEofOrderingTests
         var listener = ListenerLoopFailureTests.CreateListener();
         try
         {
-            // Without the provided-buffer ring the receive is single-shot and this race cannot occur.
-            listener.UsesBufferRing.Should().BeTrue("the EOF-overtakes-data race only exists with multishot receive");
+            // The race only exists with multishot receive, which needs Linux 6.0+ (older kernels use single-shot
+            // receive by design). On a capable kernel the provided-buffer ring must really be in use.
+            bool capable = Kestrel.Transport.IoUring.Native.IoUringKernelFeatures.ShouldUseBufferRing(
+                true, Kestrel.Transport.IoUring.Native.IoUringKernelFeatures.CurrentKernel());
+            if (!capable)
+                return;
+            listener.UsesBufferRing.Should().BeTrue("a kernel with multishot receive must use the provided-buffer ring");
 
             var failures = new List<string>();
             for (int round = 0; round < Totals.Length * 6; round++)

@@ -100,7 +100,9 @@ public sealed class IoUringTransportFactory :
                 RecordIoUringBinding(multiListener);
                 return multiListener;
             }
-            catch (InvalidOperationException ex)
+            // AddressInUseException derives from InvalidOperationException but is not a ring setup problem:
+            // falling back to SocketTransport would only fail again with a misleading reason.
+            catch (InvalidOperationException ex) when (ex is not AddressInUseException)
             {
                 return await FallbackOrThrowAsync(
                     endpoint,

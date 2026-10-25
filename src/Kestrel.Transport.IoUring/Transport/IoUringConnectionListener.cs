@@ -191,17 +191,31 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
     public void Bind(int listenBacklog, bool reusePort = false)
     {
-        _listenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-
+        // Only the worker sockets of a multi-ring listener share a port. Setting ReuseAddress unconditionally (as
+        // before) is both unnecessary (plain sockets rebind fine through TIME_WAIT) and harmful: .NET also enables
+        // SO_REUSEPORT for it on Linux, so a second instance of the application would bind the same port without
+        // error and silently split the traffic, unlike stock Kestrel, which fails with "address already in use".
         if (reusePort)
+        {
+            _listenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             SetSocketOption(_listenSocket, IoUringConstants.SOL_SOCKET, IoUringConstants.SO_REUSEPORT);
+        }
 
         // Enable dual-stack for IPv6 sockets (accept both IPv4 and IPv6 connections),
         // matching the default Kestrel socket transport behavior.
         if (_listenSocket.AddressFamily == AddressFamily.InterNetworkV6)
             _listenSocket.DualMode = true;
 
-        _listenSocket.Bind(EndPoint);
+        try
+        {
+            _listenSocket.Bind(EndPoint);
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
+        {
+            // Kestrel's address binder expects this exception type (as thrown by SocketTransport) to produce its
+            // standard "address already in use" error and to tolerate it for localhost dual binding.
+            throw new AddressInUseException(ex.Message, ex);
+        }
         EndPoint = _listenSocket.LocalEndPoint ?? EndPoint;
         _listenSocket.Listen(listenBacklog);
 
@@ -220,7 +234,16 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         }
 
         // Provided buffer ring for multishot recv — eliminates per-recv Pin()/Dispose().
-        if (_options.EnableBufferRing)
+        Version? kernel = IoUringKernelFeatures.CurrentKernel();
+        if (_options.EnableBufferRing && !IoUringKernelFeatures.ShouldUseBufferRing(true, kernel))
+        {
+            _logger.LogInformation(
+                "Kernel {Kernel} has no multishot receive (needs {Minimum}+); using single-shot receive.",
+                kernel?.ToString() ?? "unknown",
+                IoUringKernelFeatures.MultishotRecvMinimum);
+            _bufferRing = null;
+        }
+        else if (_options.EnableBufferRing)
         {
             try
             {

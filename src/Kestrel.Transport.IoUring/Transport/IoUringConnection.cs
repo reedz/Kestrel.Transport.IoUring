@@ -153,6 +153,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     // on loopback). That data was already received and cannot be dropped, so this is a runaway guard, not the
     // backpressure mechanism: once the cancel lands, TCP flow control throttles the peer.
     private const int MinPendingRecvLimitBytes = 8 * 1024 * 1024;
+    private static long s_connectionOrdinal;
     private readonly int _maxPendingRecvBytes;
 
     // Widened so a cap near int.MaxValue (huge ring x huge buffers) still rejects instead of wrapping negative.
@@ -193,7 +194,9 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             int.MaxValue,
             Math.Max(MinPendingRecvLimitBytes, (long)ring.CqEntries * receiveBufferSize));
         UsingBufferRing = useBufferRing;
-        ConnectionId = $"iouring:{connectionId}";
+        // Process-wide, not the slot/generation pair: that repeats across workers and listeners, and Kestrel logs
+        // and correlates by this string.
+        ConnectionId = "iouring:" + Interlocked.Increment(ref s_connectionOrdinal).ToString("x");
         RemoteEndPoint = remoteEndPoint;
         LocalEndPoint = localEndPoint;
 

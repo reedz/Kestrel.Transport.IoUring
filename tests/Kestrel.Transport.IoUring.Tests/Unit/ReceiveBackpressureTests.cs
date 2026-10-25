@@ -167,6 +167,26 @@ public class ReceiveBackpressureTests
     }
 
     [Fact]
+    public void ConnectionIds_AreUniqueEvenWhenSlotAndGenerationRepeat()
+    {
+        if (!Ring.IsSupported) return;
+        using var ring = new Ring(64);
+        var first = CreateConnection(ring, []);
+        var second = CreateConnection(ring, []);
+        try
+        {
+            // Both use connectionId 0 / generation 1, as two workers (or listeners) do for their first connection.
+            first.ConnectionId.Should().NotBe(second.ConnectionId);
+            first.ConnectionId.Should().StartWith("iouring:");
+        }
+        finally
+        {
+            first.ForceCleanupAfterRingClosed();
+            second.ForceCleanupAfterRingClosed();
+        }
+    }
+
+    [Fact]
     public void PendingLimit_DoesNotWrapNearIntMaxValue()
     {
         IoUringConnection.ExceedsPendingRecvLimit(0, 1024, 8 * 1024 * 1024).Should().BeFalse();

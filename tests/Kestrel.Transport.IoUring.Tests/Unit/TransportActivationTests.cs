@@ -30,6 +30,20 @@ public class TransportActivationTests
     private static IPEndPoint LoopbackAnyPort() => new(IPAddress.Loopback, 0);
 
     [Fact]
+    public async Task Bind_WhenTheAddressIsInUse_ThrowsKestrelsAddressInUseException()
+    {
+        var factory = CreateFactory(new IoUringTransportOptions { RequireIoUring = true });
+        await using var first = await factory.BindAsync(LoopbackAnyPort());
+        var taken = (IPEndPoint)first.EndPoint;
+
+        Func<Task> bindAgain = async () => await factory.BindAsync(new IPEndPoint(IPAddress.Loopback, taken.Port));
+
+        // Kestrel's AddressBinder keys off this type; a raw SocketException would escape its handling.
+        await bindAgain.Should().ThrowAsync<Microsoft.AspNetCore.Connections.AddressInUseException>();
+        factory.Bindings.Should().ContainSingle("the failed bind must not be reported as an active binding");
+    }
+
+    [Fact]
     public async Task Bind_WhenIoUringUnavailable_AndRequired_Throws()
     {
         var factory = CreateFactory(

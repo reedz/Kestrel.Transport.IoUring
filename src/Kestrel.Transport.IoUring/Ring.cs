@@ -75,6 +75,8 @@ public sealed class Ring : IDisposable
             return false;
         if (!OperatingSystem.IsLinux())
             return false;
+        if (!IoUringKernelFeatures.MeetsCoreMinimum(IoUringKernelFeatures.CurrentKernel()))
+            return false;
 
         try
         {

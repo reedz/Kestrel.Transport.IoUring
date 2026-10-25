@@ -20,9 +20,9 @@ A Linux `io_uring` transport for ASP.NET Core Kestrel. It is registered as an
 
 ## Requirements
 
-- Linux 5.1+ for core `io_uring` operations.
-- Linux 5.19+/6.0+ for provided-buffer and multishot features; unsupported
-  features fall back automatically.
+- Linux 6.0+ for the default receive path (multishot receive with provided buffer rings).
+- Linux 5.6-5.19 works through automatic single-shot receive, which is slower and not covered by CI.
+  Kernels older than 5.6 use SocketTransport. Only Linux 6.17 has been tested.
 - .NET 8 or later.
 
 Containers or hosts that block `io_uring_setup` through seccomp,
@@ -58,7 +58,7 @@ use `services.AddIoUringTransport(...)`.
 | Option | Default | Description |
 |---|---:|---|
 | `RingSize` | 1024 | SQ/CQ depth; power of two, maximum 32768. |
-| `BufferRingSize` | 0 (auto) | Provided receive buffers per ring; power of two, or 0 to size from `MaxConnections` (1024-4096). Keep it at least the number of concurrent connections per ring, or receives fail with `ENOBUFS` and stall. |
+| `BufferRingSize` | 0 (auto) | Provided receive buffers per ring; power of two, or 0 to size from `MaxConnections` (1024-4096). Keep it at least the number of concurrent connections per ring: with fewer buffers, receives hit `ENOBUFS` and are re-armed as buffers are recycled, which costs throughput and can time out under thousands of simultaneously active connections. |
 | `ReceiveBufferSize` | 2048 | Bytes per receive buffer. |
 | `MaxConnections` | 16384 | Aggregate simultaneous connection limit. |
 | `AcceptQueueCapacity` | 1024 | Accepted connections waiting for Kestrel. |

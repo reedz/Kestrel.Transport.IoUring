@@ -50,14 +50,32 @@ public class ListenerLoopFailureTests
                 throw new InvalidOperationException("injected io loop fault");
         });
 
-        fail.Set();
-        // A connection attempt wakes the parked IO loop; six consecutive faults then make it give up and exit.
-        using (var waker = new TcpClient())
-            await waker.ConnectAsync((IPEndPoint)listener.EndPoint);
-        await Task.Delay(500);
+        try
+        {
+            fail.Set();
+            await WakeLoopAsync((IPEndPoint)listener.EndPoint);
+            await listener.IoLoopStopped.WaitAsync(Limit);
 
-        await WithinLimit(listener.UnbindAsync().AsTask(), "UnbindAsync must not wait for a dead IO loop");
-        await WithinLimit(listener.DisposeAsync().AsTask(), "DisposeAsync must not wait for a dead IO loop");
+            await WithinLimit(listener.UnbindAsync().AsTask(), "UnbindAsync must not wait for a dead IO loop");
+        }
+        finally
+        {
+            await WithinLimit(listener.DisposeAsync().AsTask(), "DisposeAsync must not wait for a dead IO loop");
+        }
+    }
+
+    // A connection attempt wakes the parked IO loop so it runs the armed fault; six consecutive faults make it give
+    // up and exit. The loop can fail and shut the listener down before the attempt completes, so a refusal is fine.
+    private static async Task WakeLoopAsync(IPEndPoint endpoint)
+    {
+        try
+        {
+            using var waker = new TcpClient();
+            await waker.ConnectAsync(endpoint);
+        }
+        catch (SocketException)
+        {
+        }
     }
 
     [Fact]
@@ -76,8 +94,7 @@ public class ListenerLoopFailureTests
         {
             var endpoint = (IPEndPoint)listener.EndPoint;
             fail.Set();
-            using (var waker = new TcpClient())
-                await waker.ConnectAsync(endpoint); // wakes the parked loop so it can fail
+            await WakeLoopAsync(endpoint);
             await listener.IoLoopStopped.WaitAsync(Limit);
 
             await WithinLimit(listener.UnbindAsync().AsTask(), "UnbindAsync after the loop died");
