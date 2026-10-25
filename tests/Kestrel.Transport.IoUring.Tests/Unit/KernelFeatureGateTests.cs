@@ -32,11 +32,57 @@ public class KernelFeatureGateTests
     [Fact]
     public void CoreMinimum_RejectsOnlyKernelsKnownToBeTooOld()
     {
-        IoUringKernelFeatures.MeetsCoreMinimum(new Version(5, 5)).Should().BeFalse();
-        IoUringKernelFeatures.MeetsCoreMinimum(new Version(5, 6)).Should().BeTrue();
+        IoUringKernelFeatures.MeetsCoreMinimum(new Version(5, 6)).Should().BeFalse("5.6-5.7 cannot park on the eventfd READ");
+        IoUringKernelFeatures.MeetsCoreMinimum(new Version(5, 9)).Should().BeFalse();
+        IoUringKernelFeatures.MeetsCoreMinimum(new Version(5, 10)).Should().BeTrue();
         IoUringKernelFeatures.MeetsCoreMinimum(new Version(6, 17)).Should().BeTrue();
-        // io_uring_setup itself still decides when the kernel cannot be identified.
+        // The opcode probe still decides when the kernel cannot be identified.
         IoUringKernelFeatures.MeetsCoreMinimum(null).Should().BeTrue();
+    }
+
+    private static byte[] ProbeBuffer(int opsLength, params byte[] supported)
+    {
+        var probe = new byte[16 + 64 * 8];
+        probe[1] = (byte)opsLength;
+        foreach (byte opcode in supported)
+            probe[16 + opcode * 8 + 2] = 1;
+        return probe;
+    }
+
+    [Fact]
+    public void Probe_AcceptsABufferWhereEveryRequiredOpcodeIsSupported()
+    {
+        var probe = ProbeBuffer(50, IoUringKernelFeatures.RequiredOpcodes);
+
+        IoUringKernelFeatures.AllOpcodesSupported(probe, IoUringKernelFeatures.RequiredOpcodes).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Probe_RejectsAMissingOpcodeAnEmulatedRingAndATruncatedAnswer()
+    {
+        byte[] required = IoUringKernelFeatures.RequiredOpcodes;
+        byte[] allButAccept = required.Where(o => o != IoUringConstants.IORING_OP_ACCEPT).ToArray();
+
+        // gVisor-style: only a couple of opcodes implemented.
+        IoUringKernelFeatures.AllOpcodesSupported(ProbeBuffer(50, allButAccept), required).Should().BeFalse();
+        IoUringKernelFeatures.AllOpcodesSupported(ProbeBuffer(50, IoUringConstants.IORING_OP_READV), required).Should().BeFalse();
+        // The kernel reports fewer opcodes than the transport needs.
+        IoUringKernelFeatures.AllOpcodesSupported(ProbeBuffer(10, required), required).Should().BeFalse();
+        IoUringKernelFeatures.AllOpcodesSupported(new byte[8], required).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Probe_AcceptsTheRealKernelsRing()
+    {
+        if (!OperatingSystem.IsLinux() || Environment.GetEnvironmentVariable("IOURING_FORCE_FALLBACK") == "1")
+            return;
+        if (!IoUringKernelFeatures.MeetsCoreMinimum(IoUringKernelFeatures.CurrentKernel()))
+            return;
+
+        // Ring.IsSupported now includes the probe, so a host that supports io_uring at all passes it; this asserts the
+        // probe call itself against the real kernel rather than only the parser.
+        using var ring = new Ring(8);
+        IoUringKernelFeatures.RingSupportsRequiredOpcodes(ring.Fd).Should().BeTrue();
     }
 
     [Fact]

@@ -79,6 +79,35 @@ public class ListenerLoopFailureTests
     }
 
     [Fact]
+    public async Task ConnectionIds_AreUniqueAcrossListeners()
+    {
+        if (!Ring.IsSupported) return;
+
+        // The first connection of every listener uses slot 0 / generation 1; the public ConnectionId must still differ.
+        var firstListener = ListenerLoopFailureTests.CreateListener();
+        var secondListener = ListenerLoopFailureTests.CreateListener();
+        try
+        {
+            using var firstClient = new TcpClient();
+            using var secondClient = new TcpClient();
+            await firstClient.ConnectAsync((IPEndPoint)firstListener.EndPoint);
+            await secondClient.ConnectAsync((IPEndPoint)secondListener.EndPoint);
+            var first = await firstListener.AcceptAsync();
+            var second = await secondListener.AcceptAsync();
+
+            first.Should().NotBeNull();
+            second.Should().NotBeNull();
+            first!.ConnectionId.Should().NotBe(second!.ConnectionId);
+            first.ConnectionId.Should().StartWith("iouring:");
+        }
+        finally
+        {
+            await firstListener.DisposeAsync();
+            await secondListener.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task AfterTheIoLoopDied_TheListenPortStopsAccepting()
     {
         if (!Ring.IsSupported) return;

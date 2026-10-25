@@ -32,6 +32,9 @@ public class TransportActivationTests
     [Fact]
     public async Task Bind_WhenTheAddressIsInUse_ThrowsKestrelsAddressInUseException()
     {
+        // The io_uring-required factory throws NotSupportedException when the CI fallback lane forces io_uring off.
+        if (!Ring.IsSupported) return;
+
         var factory = CreateFactory(new IoUringTransportOptions { RequireIoUring = true });
         await using var first = await factory.BindAsync(LoopbackAnyPort());
         var taken = (IPEndPoint)first.EndPoint;

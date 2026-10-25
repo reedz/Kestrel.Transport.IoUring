@@ -326,7 +326,6 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         int s = (int)slot;
         _slotGenerations[s]++;
         conn.Generation = _slotGenerations[s];
-        conn.ConnectionId = $"iouring:{s}:{conn.Generation}";
         _connectionSlots[s] = conn;
         _activeConnectionCount++;
         Interlocked.Increment(ref s_activeConnections);

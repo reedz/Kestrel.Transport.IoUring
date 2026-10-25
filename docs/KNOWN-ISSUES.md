@@ -34,8 +34,10 @@ probe showed it; otherwise it was established by two independent source reviews.
   `max(8 MiB, CQ entries x receive buffer size)`; with the defaults and 16,384 connections that is an allowance of
   about 128 GiB in total. It is a runaway guard for completions already in flight, not memory-DoS protection, which
   would need an aggregate budget.
-* **Kernels older than 6.0** use single-shot receive by design (5.6-5.19) or SocketTransport (older). That path is not
-  covered by CI; only Linux 6.17 has been tested.
+* **Kernels older than 6.0** use single-shot receive by design (5.10-5.19), and kernels older than 5.10 or rings that do
+  not implement the transport's opcodes (checked with `IORING_REGISTER_PROBE`) use SocketTransport. The single-shot
+  path is not covered by CI; only Linux 6.17 has been tested. The version floor is a heuristic (it exists because the
+  non-blocking eventfd `READ` used for wake-ups does not wait correctly on 5.6-5.7); the probe is the real check.
 * **16-bit generation wrap (NEW-10).** A delayed abort from a connection whose slot has since been reused 65,536 times
   could in theory hit the new occupant; control queues should carry the connection object, not slot and generation.
 

@@ -21,8 +21,10 @@ A Linux `io_uring` transport for ASP.NET Core Kestrel. It is registered as an
 ## Requirements
 
 - Linux 6.0+ for the default receive path (multishot receive with provided buffer rings).
-- Linux 5.6-5.19 works through automatic single-shot receive, which is slower and not covered by CI.
-  Kernels older than 5.6 use SocketTransport. Only Linux 6.17 has been tested.
+- Linux 5.10-5.19 works through automatic single-shot receive, which is slower and not covered by CI.
+  Older kernels, and environments whose io_uring does not implement the opcodes the transport needs (checked with
+  `IORING_REGISTER_PROBE`, for example gVisor's experimental support), use SocketTransport. Only Linux 6.17 has
+  been tested.
 - .NET 8 or later.
 
 Containers or hosts that block `io_uring_setup` through seccomp,

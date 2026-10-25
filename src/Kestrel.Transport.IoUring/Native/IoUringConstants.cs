@@ -104,6 +104,7 @@ internal static class IoUringConstants
     // io_uring_register opcodes for file and ring registration.
     public const uint IORING_REGISTER_FILES = 2;
     public const uint IORING_REGISTER_FILES_UPDATE = 6;
+    public const uint IORING_REGISTER_PROBE = 8;
 
     // io_uring_setup flags.
     public const uint IORING_SETUP_COOP_TASKRUN = 1u << 8;

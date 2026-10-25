@@ -86,8 +86,9 @@ public sealed class Ring : IDisposable
                 int fd = IoUringNative.IoUringSetup(2, &p);
                 if (fd >= 0)
                 {
+                    bool supported = IoUringKernelFeatures.RingSupportsRequiredOpcodes(fd);
                     Libc.close(fd);
-                    return true;
+                    return supported;
                 }
                 return false;
             }

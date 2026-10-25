@@ -37,7 +37,7 @@ v2.4.0
 - Send path gathers many pipe segments into one SENDMSG (about 2x static-file throughput).
 - A dead IO loop no longer hangs UnbindAsync/DisposeAsync and stops accepting; a fatal ring error after unbind still
   aborts connections; multi-ring UnbindAsync no longer throws for a cancelled token.
-- Multishot receive is used only on Linux 6.0+; kernels older than 5.6 fall back to SocketTransport. The single-ring
+- Multishot receive is used only on Linux 6.0+; kernels older than 5.10, or rings that fail an opcode probe, fall back to SocketTransport. The single-ring
   listener no longer shares its port via SO_REUSEPORT; bind conflicts raise Kestrel's AddressInUseException.
 - RequireIoUring / IOURING_REQUIRE and IoUringTransportFactory.Bindings report what actually serves each bind.
 - Unique process-wide ConnectionId values.
