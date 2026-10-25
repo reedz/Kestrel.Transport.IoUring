@@ -431,6 +431,14 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     private byte[]? _smallSendBuffer;
     private nint _smallSendBasePtr;
     private nint _sendPtr;
+
+    // Gather send: one SENDMSG covers up to MaxGatherSegments pipe segments. A 118 KB static file arrives as
+    // ~29 segments of 4 KB; sending them one SEND + CQE at a time costs ~29 IO-loop round trips per response.
+    private const int MaxGatherSegments = 64;
+    private const int MsgHdrSize = 56; // sizeof(struct msghdr) on 64-bit Linux
+    private byte[]? _gatherBlock;      // pinned: msghdr followed by the iovec array
+    private nint _gatherBlockPtr;
+    private List<MemoryHandle>? _gatherPins;
     // Diagnostic shadow state: timestamp + byte count of the current pin (0 when no pin held).
     private long _sendPinStartTs;
     private int _sendPinByteLen;
@@ -562,6 +570,67 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             _smallSendBasePtr = (nint)pointer;
     }
 
+    /// <summary>
+    /// Pins up to <see cref="MaxGatherSegments"/> segments of <paramref name="remaining"/> and describes them
+    /// with an iovec array for one SENDMSG. Returns the number of bytes described. IO-loop thread only.
+    /// </summary>
+    private unsafe int PrepareGather(in ReadOnlySequence<byte> remaining)
+    {
+        if (_gatherBlock == null)
+        {
+            _gatherBlock = GC.AllocateArray<byte>(
+                MsgHdrSize + MaxGatherSegments * sizeof(IoUringIoVec),
+                pinned: true);
+            fixed (byte* pointer = _gatherBlock)
+                _gatherBlockPtr = (nint)pointer;
+        }
+
+        byte* block = (byte*)_gatherBlockPtr;
+        var iov = (IoUringIoVec*)(block + MsgHdrSize);
+        int count = 0;
+        long total = 0;
+        foreach (ReadOnlyMemory<byte> segment in remaining)
+        {
+            if (segment.IsEmpty)
+                continue;
+            if (count == MaxGatherSegments)
+                break;
+
+            MemoryHandle pin = segment.Pin();
+            (_gatherPins ??= new List<MemoryHandle>(MaxGatherSegments)).Add(pin);
+            iov[count].Base = (nint)pin.Pointer;
+            iov[count].Len = (nuint)segment.Length;
+            total += segment.Length;
+            count++;
+        }
+
+        // struct msghdr: name, namelen, iov, iovlen, control, controllen, flags (only iov/iovlen are used).
+        new Span<byte>(block, MsgHdrSize).Clear();
+        *(IoUringIoVec**)(block + 16) = iov;
+        *(nuint*)(block + 24) = (nuint)count;
+        return (int)Math.Min(total, int.MaxValue);
+    }
+
+    private unsafe bool TrySubmitPreparedSendMsg()
+    {
+        if (!_ring.TryGetSqe(out IoUringSqe* sqe))
+        {
+            _ring.Submit();
+            if (!_ring.TryGetSqe(out sqe))
+                return false;
+        }
+
+        sqe->Opcode = IoUringConstants.IORING_OP_SENDMSG;
+        SetSqeFd(sqe);
+        sqe->AddrOrSpliceOffIn = (ulong)_gatherBlockPtr;
+        sqe->Len = 1;
+        sqe->OpFlags = 0;
+        sqe->IoPrio = 0;
+        sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Send);
+        HasSendInFlight = true;
+        return true;
+    }
+
     private unsafe bool TrySubmitPreparedSend(int length)
     {
         if (!_ring.TryGetSqe(out IoUringSqe* sqe))
@@ -614,6 +683,12 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         {
             _sendHandle.Dispose();
             SendDiagnostics.OnPinDispose(_sendPinStartTs, _sendPinByteLen);
+        }
+        if (_gatherPins is { Count: > 0 })
+        {
+            foreach (MemoryHandle pin in _gatherPins)
+                pin.Dispose();
+            _gatherPins.Clear();
         }
         _sendHandle = default;
         _sendPtr = nint.Zero;
@@ -673,37 +748,44 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
                     continue;
                 }
 
-                // Send across all segments of the buffer (multi-segment safe).
-                // Bug history: previously only buffer.First was sent and the rest
-                // was silently dropped via AdvanceTo(examined: buffer.End).
+                // Send the whole buffer, gathering many pipe segments into one SENDMSG where needed.
+                // A short send (peer window full) resubmits exactly the unsent remainder, so byte order
+                // is preserved across segments.
                 long totalConsumed = 0;
                 bool aborted = false;
-                foreach (var segment in buffer)
+                while (totalConsumed < buffer.Length)
                 {
-                    int segOffset = 0;
-                    while (segOffset < segment.Length)
+                    ReadOnlySequence<byte> remaining = buffer.Slice(totalConsumed);
+                    bool gather;
+                    int requestedLen;
+                    if (remaining.IsSingleSegment && remaining.First.Length <= SmallSendBufferSize)
                     {
-                        var slice = segment.Slice(segOffset);
-                        PrepareSendSlice(slice);
-                        int requestedLen = slice.Length;
-                        try
-                        {
-                            while (!TrySubmitPreparedSend(requestedLen))
-                                await WaitForSendRetry().ConfigureAwait(false);
-                        }
-                        catch
-                        {
-                            DisposeSendPin();
-                            throw;
-                        }
-
-                        int sent = await AwaitSendCompletion().ConfigureAwait(false);
-                        if (sent <= 0) { aborted = true; break; }
-                        if (sent < requestedLen) SendDiagnostics.OnShortSendResubmit();
-                        segOffset += sent;
-                        totalConsumed += sent;
+                        // Typical small response (plaintext/JSON): copy into the per-connection scratch buffer.
+                        gather = false;
+                        PrepareSendSlice(remaining.First);
+                        requestedLen = remaining.First.Length;
                     }
-                    if (aborted) break;
+                    else
+                    {
+                        gather = true;
+                        requestedLen = PrepareGather(remaining);
+                    }
+
+                    try
+                    {
+                        while (!(gather ? TrySubmitPreparedSendMsg() : TrySubmitPreparedSend(requestedLen)))
+                            await WaitForSendRetry().ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        DisposeSendPin();
+                        throw;
+                    }
+
+                    int sent = await AwaitSendCompletion().ConfigureAwait(false);
+                    if (sent <= 0) { aborted = true; break; }
+                    if (sent < requestedLen) SendDiagnostics.OnShortSendResubmit();
+                    totalConsumed += sent;
                 }
 
                 // Tell the pipe how many bytes we consumed; examined = consumed so the
