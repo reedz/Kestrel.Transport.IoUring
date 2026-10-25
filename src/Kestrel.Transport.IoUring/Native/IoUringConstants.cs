@@ -45,8 +45,10 @@ internal static class IoUringConstants
     public const nint MAP_FAILED = -1;
 
     public const uint IORING_SQ_NEED_WAKEUP = 1u;
+    public const uint IORING_SQ_CQ_OVERFLOW = 1u << 1;
 
     public const uint IORING_FEAT_SINGLE_MMAP = 1u;
+    public const uint IORING_FEAT_NODROP = 1u << 1;
 
     /// <summary>User-data sentinel for the persistent eventfd READ SQE used to wake the IO loop on sends.</summary>
     public const ulong EVENTFD_USER_DATA = ulong.MaxValue - 1;

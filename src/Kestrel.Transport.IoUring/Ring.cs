@@ -6,9 +6,38 @@ namespace Kestrel.Transport.IoUring;
 /// <summary>Managed wrapper around a Linux io_uring instance.</summary>
 public sealed class Ring : IDisposable
 {
+    internal const int TeardownEnterEintrRetryLimit = 4;
+    internal const int TeardownOverflowDrainRoundLimit = 4;
+
+    internal readonly struct EnterInvocationResult
+    {
+        public EnterInvocationResult(int returnValue, int errno)
+        {
+            ReturnValue = returnValue;
+            Errno = errno;
+        }
+
+        public int ReturnValue { get; }
+
+        public int Errno { get; }
+
+        public static EnterInvocationResult Success(int returnValue) => new(returnValue, 0);
+
+        public static EnterInvocationResult Failure(int errno) => new(-1, errno);
+    }
+
+    internal readonly record struct TeardownCompletionSnapshot(
+        uint AvailableCompletions,
+        int MaterializationErrno,
+        bool HasNodropOverflowBacklog);
+
+    internal delegate EnterInvocationResult IoUringEnterInvoker(int fd, uint toSubmit, uint minComplete, uint flags);
+
     private readonly int _ringFd;
     private readonly SubmissionQueue _sq;
     private readonly CompletionQueue _cq;
+    private readonly IoUringEnterInvoker? _enterInvoker;
+    private readonly uint _features;
 
     // mmap regions owned by Ring — disposed in Dispose().
     private readonly nint _sqRingPtr;
@@ -70,8 +99,15 @@ public sealed class Ring : IDisposable
     /// <summary>Initializes a new io_uring instance with the specified queue depth and optional setup flags.
     /// On EINVAL (typically older kernels lacking newer flag support), drops the optional flags
     /// in the order DEFER_TASKRUN → SINGLE_ISSUER → COOP_TASKRUN → SQPOLL → none, and retries.</summary>
-    public unsafe Ring(uint entries, uint setupFlags = 0)
+    public Ring(uint entries, uint setupFlags = 0)
+        : this(entries, setupFlags, enterInvoker: null)
     {
+    }
+
+    internal unsafe Ring(uint entries, uint setupFlags, IoUringEnterInvoker? enterInvoker)
+    {
+        _enterInvoker = enterInvoker;
+
         // Order matters: drop newest/most-restrictive flags first so older kernels still benefit
         // from older flags (e.g. COOP_TASKRUN on a 5.19 kernel that doesn't support DEFER_TASKRUN).
         // Each entry is a flag-mask removed from setupFlags on retry.
@@ -125,6 +161,7 @@ public sealed class Ring : IDisposable
             fd = IoUringNative.IoUringSetup(entries, &p);
         }
         SetupFlags = setupFlags;
+        _features = p.Features;
         _ringFd = fd;
 
         bool singleMmap = (p.Features & IoUringConstants.IORING_FEAT_SINGLE_MMAP) != 0;
@@ -318,26 +355,50 @@ public sealed class Ring : IDisposable
     /// <summary>True iff DEFER_TASKRUN is enabled — callers must always pass GETEVENTS to drain completions.</summary>
     internal bool RequiresGetEventsToDrain => (SetupFlags & IoUringConstants.IORING_SETUP_DEFER_TASKRUN) != 0;
 
+    private bool SupportsNodropOverflowMaterialization => (_features & IoUringConstants.IORING_FEAT_NODROP) != 0;
+
+    // Live SQ flag reporting hidden NODROP overflow-list completions that still
+    // exist outside the visible CQ ring snapshot.
+    private bool HasNodropOverflowBacklog =>
+        SupportsNodropOverflowMaterialization && _sq.HasOverflowBacklog;
+
+    private bool UsesSqPollThread => (SetupFlags & IoUringConstants.IORING_SETUP_SQPOLL) != 0;
+
+    // Non-SQPOLL callers re-account kernel-visible pending SQEs on each enter/retry.
+    // SQPOLL intentionally stays flush-gated so retries preserve the poll-thread behavior.
+    private uint GetSubmitBudget(uint flushed) => UsesSqPollThread ? flushed : _sq.PendingSubmit;
+
+    private uint GetRetryBudget() => UsesSqPollThread ? 0u : _sq.PendingSubmit;
+
     /// <summary>Flushes pending submission queue entries and submits them to the kernel.</summary>
+    /// <returns>
+    /// The number of SQEs accepted by the kernel for this enter call. On non-SQPOLL rings, this can
+    /// include earlier or concurrently flushed kernel-visible SQEs that were still pending at enter time.
+    /// </returns>
     public int Submit()
     {
-        uint toSubmit;
-        lock (SubmitLock) { toSubmit = _sq.Flush(); }
+        uint flushed;
+        lock (SubmitLock) { flushed = _sq.Flush(); }
         // With DEFER_TASKRUN, completions only run when we enter with GETEVENTS — pass it
         // even on a "submit-only" call so the kernel processes any queued task work.
         uint flags = RequiresGetEventsToDrain ? IoUringConstants.IORING_ENTER_GETEVENTS : 0u;
         if (_sq.NeedsWakeup)
             flags |= IoUringConstants.IORING_ENTER_SQ_WAKEUP;
+        uint toSubmit = GetSubmitBudget(flushed);
         if (toSubmit == 0 && flags == 0)
             return 0;
         return Enter(toSubmit, 0, flags);
     }
 
     /// <summary>Submits pending entries and waits for at least <paramref name="minComplete"/> completions.</summary>
+    /// <returns>
+    /// The number of SQEs accepted by the kernel for this enter call. On non-SQPOLL rings, this can
+    /// include earlier or concurrently flushed kernel-visible SQEs that were still pending at enter time.
+    /// </returns>
     public int SubmitAndWait(uint minComplete)
     {
-        uint toSubmit;
-        lock (SubmitLock) { toSubmit = _sq.Flush(); }
+        uint flushed;
+        lock (SubmitLock) { flushed = _sq.Flush(); }
         // With DEFER_TASKRUN, ALWAYS pass GETEVENTS — even when minComplete is 0 — so the
         // kernel actually drains task work into CQEs.
         uint flags = (minComplete > 0 || RequiresGetEventsToDrain)
@@ -345,6 +406,7 @@ public sealed class Ring : IDisposable
             : 0u;
         if (_sq.NeedsWakeup)
             flags |= IoUringConstants.IORING_ENTER_SQ_WAKEUP;
+        uint toSubmit = GetSubmitBudget(flushed);
         return Enter(toSubmit, minComplete, flags);
     }
 
@@ -352,18 +414,31 @@ public sealed class Ring : IDisposable
     /// Calls io_uring_enter. Thread-safe — the kernel serializes concurrent calls.
     /// Called OUTSIDE SubmitLock.
     /// </summary>
+    private int InvokeEnter(uint toSubmit, uint minComplete, uint flags, out int errno)
+    {
+        if (_enterInvoker is null)
+        {
+            int ret = IoUringNative.IoUringEnter(_ringFd, toSubmit, minComplete, flags);
+            errno = ret < 0 ? Marshal.GetLastPInvokeError() : 0;
+            return ret;
+        }
+
+        EnterInvocationResult result = _enterInvoker(_ringFd, toSubmit, minComplete, flags);
+        errno = result.Errno;
+        return result.ReturnValue;
+    }
+
     private int Enter(uint toSubmit, uint minComplete, uint flags)
     {
         int ret;
         while (true)
         {
-            ret = IoUringNative.IoUringEnter(_ringFd, toSubmit, minComplete, flags);
+            ret = InvokeEnter(toSubmit, minComplete, flags, out int err);
             if (ret >= 0)
                 break;
-            int err = Marshal.GetLastPInvokeError();
             if (err == IoUringConstants.EINTR)
             {
-                toSubmit = 0;
+                toSubmit = GetRetryBudget();
                 continue;
             }
             if (err == IoUringConstants.EAGAIN)
@@ -373,12 +448,62 @@ public sealed class Ring : IDisposable
             if (err == IoUringConstants.EEXIST)
             {
                 Thread.Yield();
-                toSubmit = 0;
+                toSubmit = GetRetryBudget();
                 continue;
             }
             throw new InvalidOperationException($"io_uring_enter failed with errno {err}");
         }
         return ret;
+    }
+
+    /// <summary>
+    /// Performs the teardown-only nonblocking GETEVENTS enter used to materialize deferred
+    /// task work or NODROP overflow-list CQEs without waiting for a not-yet-complete accept.
+    /// This path never submits SQEs and bounds retry-on-EINTR so disposal cannot hang.
+    /// </summary>
+    internal EnterInvocationResult EnterForTeardown()
+    {
+        const uint flags = IoUringConstants.IORING_ENTER_GETEVENTS;
+        int eintrRetriesRemaining = TeardownEnterEintrRetryLimit;
+
+        while (true)
+        {
+            int ret = InvokeEnter(0, 0, flags, out int err);
+            if (ret >= 0)
+                return EnterInvocationResult.Success(ret);
+
+            switch (err)
+            {
+                case IoUringConstants.EINTR when eintrRetriesRemaining-- > 0:
+                    continue;
+                case IoUringConstants.EAGAIN:
+                case IoUringConstants.EBUSY:
+                    return EnterInvocationResult.Success(0);
+                default:
+                    return EnterInvocationResult.Failure(err);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns a snapshot of CQEs available to teardown after at most one bounded
+    /// nonblocking GETEVENTS step. The initial boundary capture uses this to
+    /// materialize DEFER_TASKRUN work, while later overflow-drain rounds can opt in to
+    /// one hidden NODROP overflow-list materialization step per round. The returned
+    /// flag reports whether hidden overflow-list work still remains separate from the
+    /// visible CQ entries in this snapshot.
+    /// </summary>
+    internal TeardownCompletionSnapshot CaptureCompletionSnapshotForTeardown(
+        bool materializeNodropOverflowBacklog = false)
+    {
+        int materializationErrno = 0;
+        if (RequiresGetEventsToDrain || (materializeNodropOverflowBacklog && HasNodropOverflowBacklog))
+            materializationErrno = EnterForTeardown().Errno;
+
+        return new(
+            AvailableCompletions,
+            materializationErrno,
+            HasNodropOverflowBacklog);
     }
 
     internal bool TryPeekCompletion(out IoUringCqe cqe) => _cq.TryPeekCompletion(out cqe);
@@ -389,7 +514,7 @@ public sealed class Ring : IDisposable
     /// <summary>Gets the number of completion queue entries ready to be consumed.</summary>
     public uint AvailableCompletions => _cq.Available;
 
-    /// <summary>Returns the kernel's CQ overflow counter. Non-zero means completions were dropped.</summary>
+    /// <summary>Returns the kernel's CQ overflow counter.</summary>
     internal uint CqOverflowCount => _cq.OverflowCount;
 
     /// <summary>Releases all io_uring resources and unmaps shared memory regions.</summary>

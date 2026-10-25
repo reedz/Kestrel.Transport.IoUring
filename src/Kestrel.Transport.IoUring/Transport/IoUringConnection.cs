@@ -101,6 +101,12 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     /// <summary>Tracks whether a RECV SQE is currently in-flight for this connection.</summary>
     internal bool HasRecvInFlight { get; set; }
 
+    /// <summary>
+    /// Monotonically tracks successful receive arms so cancel retries can target
+    /// the same live receive and diagnostics can detect stale retry origins.
+    /// </summary>
+    internal ulong RecvEpoch { get; private set; }
+
     /// <summary>Tracks whether a SEND SQE is currently in-flight for this connection.</summary>
     internal bool HasSendInFlight { get; set; }
 
@@ -224,6 +230,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             sqe->IoPrio = 0;
             sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Recv);
             HasRecvInFlight = true;
+            RecvEpoch++;
             return true;
         }
 
@@ -255,6 +262,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         sqe->BufIndexOrGroup = bufferGroupId;
         sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Recv);
         HasRecvInFlight = true;
+        RecvEpoch++;
         return true;
     }
 
@@ -711,16 +719,8 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         if (Interlocked.Exchange(ref _transportAborted, 1) != 0)
             return;
 
-        _connectionCts.Cancel();
-        CancelSendRetry();
-        try
-        {
-            _inputPipe.Writer.Complete(reason);
-        }
-        catch (InvalidOperationException) { }
-        _outputPipe.Reader.CancelPendingRead();
-
-        ShutdownSocket();
+        var abortAdapter = new ProductionTransportAbortAdapter(this);
+        ConnectionTransportAbort.Run(_connectionCts, reason, ref abortAdapter);
     }
 
     internal void ShutdownSocket()
@@ -737,16 +737,16 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     }
 
     /// <summary>Closes the socket fd. Called by the listener after in-flight ops are drained.</summary>
+    /// <remarks>
+    /// This requests <c>ConnectionClosed</c> cancellation and still attempts fixed-file unregister plus
+    /// <c>close(2)</c> reclamation before surfacing callback or cleanup/logging failures.
+    /// Callers must contain those post-reclamation failures; <c>ListenerCloseFinalization.Run</c> and
+    /// <see cref="IoUringConnectionListener.DisposeAsync"/> are the finalization and dispose containment layers.
+    /// </remarks>
     internal void CloseSocketFd()
     {
-        if (Interlocked.Exchange(ref _socketClosed, 1) != 0)
-            return;
-
-        _connectionCts.Cancel();
-        if (_fileIndex >= 0 && !_ring.UnregisterFd(_fileIndex))
-            _logger.LogWarning("Failed to unregister fixed-file slot {Slot}.", _fileIndex);
-        if (Libc.close(_socketFd) < 0)
-            _logger.LogWarning("close(fd={Fd}) failed with errno {Errno}", _socketFd, Marshal.GetLastPInvokeError());
+        var closeAdapter = new ConnectionSocketClose.ProductionCloseAdapter(_ring, _logger);
+        ConnectionSocketClose.Run(_connectionCts, _fileIndex, _socketFd, ref _socketClosed, ref closeAdapter);
     }
 
     /// <summary>Releases managed transport resources after the ring has stopped and closed.</summary>
@@ -764,5 +764,33 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     {
         public PipeReader Input { get; } = reader;
         public PipeWriter Output { get; } = writer;
+    }
+
+    private readonly struct ProductionTransportAbortAdapter(IoUringConnection connection)
+        : ConnectionTransportAbort.IAbortAdapter<ProductionTransportAbortAdapter>
+    {
+        private readonly IoUringConnection _connection = connection;
+
+        public static void CancelSendRetry(ref ProductionTransportAbortAdapter self) =>
+            self._connection.CancelSendRetry();
+
+        public static void CompleteInput(
+            ref ProductionTransportAbortAdapter self,
+            ConnectionAbortedException reason) =>
+            self._connection._inputPipe.Writer.Complete(reason);
+
+        public static void CancelOutputPendingRead(ref ProductionTransportAbortAdapter self) =>
+            self._connection._outputPipe.Reader.CancelPendingRead();
+
+        public static void ShutdownSocket(ref ProductionTransportAbortAdapter self) =>
+            self._connection.ShutdownSocket();
+
+        public static void LogConnectionClosedCallbackFailure(
+            ref ProductionTransportAbortAdapter self,
+            Exception exception) =>
+            self._connection._logger.LogWarning(
+                exception,
+                "ConnectionClosed callbacks failed during transport abort for connection {Id}; continuing cleanup.",
+                self._connection._connectionId);
     }
 }
