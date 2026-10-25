@@ -79,6 +79,37 @@ public class RingEnterBudgetTests
     }
 
     [Fact]
+    public Task HasUnsubmittedSqes_StaysTrueAfterShortOrEagainEnter_UntilKernelConsumesEverything()
+        => RunWithTimeout(HasUnsubmittedSqes_StaysTrueAfterShortOrEagainEnter_UntilKernelConsumesEverythingCore);
+
+    private unsafe void HasUnsubmittedSqes_StaysTrueAfterShortOrEagainEnter_UntilKernelConsumesEverythingCore()
+    {
+        if (!Ring.IsSupported) return;
+
+        var enter = new ScriptedEnterInvoker(
+            _ => Ring.EnterInvocationResult.Success(1),
+            _ => Ring.EnterInvocationResult.Failure(IoUringConstants.EAGAIN),
+            call => Ring.EnterInvocationResult.Success((int)call.ToSubmit));
+
+        using var ring = CreateRing(enter);
+        ring.HasUnsubmittedSqes.Should().BeFalse();
+        StageNops(ring, 2);
+        ring.HasUnsubmittedSqes.Should().BeTrue("staged SQEs are owed a submit");
+
+        ring.Submit().Should().Be(1);
+        ring.HasStagedSqes.Should().BeFalse("Flush published both SQEs");
+        ring.HasUnsubmittedSqes.Should().BeTrue(
+            "a short enter leaves a published SQE the kernel has not consumed; the IO loop's fairness point must " +
+            "still submit it (G3-01: a pending accept cancel would otherwise stall under sustained CQ traffic)");
+
+        ring.Submit().Should().Be(0);
+        ring.HasUnsubmittedSqes.Should().BeTrue("EAGAIN consumed nothing");
+
+        ring.Submit().Should().Be(1);
+        ring.HasUnsubmittedSqes.Should().BeFalse();
+    }
+
+    [Fact]
     public Task Submit_RetryAfterEintr_PreservesPendingBudget()
         => RunWithTimeout(Submit_RetryAfterEintr_PreservesPendingBudgetCore);
 

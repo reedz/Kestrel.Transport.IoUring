@@ -420,6 +420,12 @@ public sealed class Ring : IDisposable
     /// <summary>True when SQEs have been prepared but not yet submitted.</summary>
     internal bool HasStagedSqes => _sq.HasStaged;
 
+    /// <summary>
+    /// True when SQEs are staged locally or were published but not yet consumed by the kernel (a short or EAGAIN
+    /// enter leaves them in the SQ ring). Either way a <see cref="Submit"/> is still owed.
+    /// </summary>
+    internal bool HasUnsubmittedSqes => _sq.HasStaged || _sq.PendingSubmit != 0;
+
     internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
     private int _enabled;

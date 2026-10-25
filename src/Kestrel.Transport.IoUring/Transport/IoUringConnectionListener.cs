@@ -408,6 +408,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     // that its 16-bit wire value repeats an earlier occupant's. Call only while the slot is free and the loop idle.
     internal void SetSlotGenerationForTests(int slot, long generation) => _slotGenerations[slot] = generation;
 
+    internal void WakeIoLoopForTests() => WakeIoLoop();
+
     /// <summary>
     /// Returns the admission reservations and gauge share of connections still counted. Only the ring's owner (or
     /// disposal once no loop runs) may call it; it zeroes the count, so it releases each reservation once.
@@ -1319,9 +1321,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 // accepts waiting for room in the accept channel.
                 ProcessLifecycleCommands();
                 FlushPendingAccepts();
-                // Whatever this batch staged (sends, re-arms, accept pause/resume, cancels) reaches the kernel now
-                // rather than after the CQ finally drains.
-                if (_ring.HasStagedSqes)
+                // Whatever this batch staged (sends, re-arms, accept pause/resume, cancels), and anything an earlier
+                // short or EAGAIN enter left in the SQ ring, reaches the kernel now rather than after the CQ drains.
+                if (_ring.HasUnsubmittedSqes)
                     _ring.Submit();
             }
         }

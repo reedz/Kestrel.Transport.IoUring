@@ -24,7 +24,9 @@ public class RecvRetryGaugeTests
         if (!Ring.IsSupported) return;
 
         const int connections = 300;
-        using var hold = new ManualResetEventSlim(true);
+        using var parked = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(true);
+        int parkRequested = 0;
         var options = TestTransport.Apply(new IoUringTransportOptions
         {
             ThreadCount = 1,
@@ -37,7 +39,14 @@ public class RecvRetryGaugeTests
             options,
             NullLogger<IoUringConnectionListener>.Instance)
         {
-            IoLoopIterationHook = () => hold.Wait(),
+            IoLoopIterationHook = () =>
+            {
+                if (Volatile.Read(ref parkRequested) == 1)
+                {
+                    parked.Set();
+                    release.Wait();
+                }
+            },
         };
         listener.Bind(options.ListenBacklog);
         // Only the provided-buffer ring can run out of buffers (multishot receive: Linux 6.0+, not the single-shot lane).
@@ -64,14 +73,21 @@ public class RecvRetryGaugeTests
                    DateTime.UtcNow < deadline)
                 await Task.Delay(20);
 
-            // With the loop parked, every receive armed on a readable socket completes into the eight buffers before
-            // any of them can be recycled: the rest end with ENOBUFS and wait in the retry set.
-            hold.Reset();
-            await Task.Delay(50);
+            // Park the loop at the top of an iteration (explicit wake, then wait for the hook to acknowledge) so no
+            // completion is processed and no buffer recycled while every client sends. Whenever the kernel posts
+            // those receives (task work while parked, or the loop's next enter), only eight find a buffer; the rest
+            // end with ENOBUFS and wait in the retry set once the loop runs again.
+            release.Reset();
+            Volatile.Write(ref parkRequested, 1);
+            listener.WakeIoLoopForTests();
+            parked.Wait(Limit).Should().BeTrue("the IO loop parks at the top of its next iteration");
             foreach (var client in clients)
                 await client.GetStream().WriteAsync("x"u8.ToArray());
+            // Loopback delivery is immediate; this only lets softirq processing catch up. More than eight readable
+            // sockets in the first batch is enough to exhaust the ring.
             await Task.Delay(300);
-            hold.Set();
+            Volatile.Write(ref parkRequested, 0);
+            release.Set();
 
             while (RecvDiagnostics.RecvRetryDepthHighWater <= baseline && DateTime.UtcNow < deadline)
                 await Task.Delay(20);
@@ -79,7 +95,8 @@ public class RecvRetryGaugeTests
         }
         finally
         {
-            hold.Set();
+            Volatile.Write(ref parkRequested, 0);
+            release.Set();
             await listener.DisposeAsync().AsTask().WaitAsync(Limit);
             foreach (var client in clients)
                 client.Dispose();
