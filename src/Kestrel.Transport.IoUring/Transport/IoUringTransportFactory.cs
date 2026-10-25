@@ -72,8 +72,9 @@ public sealed class IoUringTransportFactory :
         EndPoint endpoint,
         CancellationToken cancellationToken = default)
     {
-        _options.Validate();
         var listenerOptions = _options.ResolveWith(_socketOptions);
+        // Validate what listeners will actually use, including values taken from SocketTransportOptions.
+        listenerOptions.Validate();
 
         if (!CanBind(endpoint))
         {

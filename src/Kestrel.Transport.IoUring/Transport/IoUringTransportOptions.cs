@@ -236,6 +236,12 @@ public sealed class IoUringTransportOptions
             throw new ArgumentOutOfRangeException(nameof(MaxConnections), "MaxConnections must be positive.");
         if (ListenBacklog < 1)
             throw new ArgumentOutOfRangeException(nameof(ListenBacklog), "ListenBacklog must be positive.");
+        if (MaxReadBufferSize < 0)
+            throw new ArgumentOutOfRangeException(nameof(MaxReadBufferSize),
+                "SocketTransportOptions.MaxReadBufferSize cannot be negative (null or 0 means unlimited).");
+        if (MaxWriteBufferSize < 0)
+            throw new ArgumentOutOfRangeException(nameof(MaxWriteBufferSize),
+                "SocketTransportOptions.MaxWriteBufferSize cannot be negative (null or 0 means unlimited).");
         if (AcceptQueueCapacity < 1)
             throw new ArgumentOutOfRangeException(nameof(AcceptQueueCapacity), "AcceptQueueCapacity must be positive.");
         if (ReceiveBufferSize < 1)

@@ -408,6 +408,21 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     // that its 16-bit wire value repeats an earlier occupant's. Call only while the slot is free and the loop idle.
     internal void SetSlotGenerationForTests(int slot, long generation) => _slotGenerations[slot] = generation;
 
+    /// <summary>
+    /// Returns the admission reservations and gauge share of connections still counted. Only the ring's owner (or
+    /// disposal once no loop runs) may call it; it zeroes the count, so it releases each reservation once.
+    /// </summary>
+    private void ReleaseResidualAccounting()
+    {
+        int residual = _activeConnectionCount;
+        if (residual == 0)
+            return;
+
+        _activeConnectionCount = 0;
+        Interlocked.Add(ref s_activeConnections, -residual);
+        _admission.Release(residual);
+    }
+
     private void RemoveConnection(long slot)
     {
         int s = (int)slot;
@@ -732,6 +747,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             Volatile.Write(ref _teardownOutcome, (int)outcome);
             // Nothing will retry receives for this listener any more.
             ReportRecvRetryDepth(loopEnded: true);
+            // Nor release connections through the normal close path: return their admission (shared with sibling
+            // rings, which must not be starved by a ring that stopped or was quarantined) and gauge share now.
+            ReleaseResidualAccounting();
 
             // The loop can make no further progress. Release anything still awaiting finalization so a
             // Kestrel connection DisposeAsync cannot hang; the sockets are closed later by DisposeAsync.
@@ -1297,9 +1315,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 _pipeScheduler?.DrainWorkItems();
                 DrainCloseRequestQueue();
                 DrainRecvResubmitQueue();
-                // A CQ that is never empty must not starve an unbind or dispose waiting for the loop.
+                // A CQ that is never empty must not starve an unbind or dispose waiting for the loop, nor parked
+                // accepts waiting for room in the accept channel.
                 ProcessLifecycleCommands();
-                if (_pipeScheduler?.LastDrainedCount > 0 || _acceptStopBegun && !_acceptStopped.Task.IsCompleted)
+                FlushPendingAccepts();
+                // Whatever this batch staged (sends, re-arms, accept pause/resume, cancels) reaches the kernel now
+                // rather than after the CQ finally drains.
+                if (_ring.HasStagedSqes)
                     _ring.Submit();
             }
         }
@@ -1343,6 +1365,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             _pipeScheduler?.DrainWorkItems();
             DrainCloseRequestQueue();
             DrainRecvResubmitQueue();
+            // AcceptAsync wakes the loop through the eventfd when it makes room for parked accepts.
+            FlushPendingAccepts();
             if (!_cts.IsCancellationRequested)
             {
                 var eventFdReadAdapter = new EventFdReadSubmitAdapter(this);
@@ -1425,8 +1449,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             }
             else
             {
-                _acceptInFlight = false;
-                _acceptRetryRequired = true;
+                // A multishot accept that posted F_MORE is still armed; only a final completion ends it.
+                bool stillArmed = (cqe.Flags & IoUringConstants.IORING_CQE_F_MORE) != 0;
+                _acceptInFlight = stillArmed;
+                _acceptRetryRequired = !stillArmed;
             }
             return;
         }
@@ -2056,10 +2082,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
         Array.Clear(_connectionSlots);
         _closingConnections.Clear();
-        // The IO loop has stopped, so connections still counted were never released through the normal close path.
-        Interlocked.Add(ref s_activeConnections, -_activeConnectionCount);
-        _admission.Release(_activeConnectionCount);
-        _activeConnectionCount = 0;
+        // Connections still counted were never released through the normal close path (only reachable here when no
+        // IO loop ever ran; a loop returns its residue when it ends).
+        ReleaseResidualAccounting();
 
         RunDisposeCleanupStep("send diagnostics timer dispose", () => _diagTimer?.Dispose());
         RunDisposeCleanupStep("recv diagnostics timer dispose", () => _recvDiagTimer?.Dispose());
@@ -2161,10 +2186,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             static conn => conn.CloseSocketFd());
         ReleaseListenSocket(unregisterFixedFile: false);
 
-        // The quarantined connections are dead to the application; their admission and gauge share is returned.
-        Interlocked.Add(ref s_activeConnections, -_activeConnectionCount);
-        _admission.Release(_activeConnectionCount);
-        _activeConnectionCount = 0;
+        // Normally already returned by the loop when it ended; covers a ring whose loop never ran.
+        ReleaseResidualAccounting();
 
         RunDisposeCleanupStep("send diagnostics timer dispose", () => _diagTimer?.Dispose());
         RunDisposeCleanupStep("recv diagnostics timer dispose", () => _recvDiagTimer?.Dispose());

@@ -417,6 +417,9 @@ public sealed class Ring : IDisposable
     /// </summary>
     internal void SealSubmissions() => _submissionsSealed = true;
 
+    /// <summary>True when SQEs have been prepared but not yet submitted.</summary>
+    internal bool HasStagedSqes => _sq.HasStaged;
+
     internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
     private int _enabled;

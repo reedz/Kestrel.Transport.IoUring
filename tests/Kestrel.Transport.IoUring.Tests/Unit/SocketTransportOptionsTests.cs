@@ -90,6 +90,23 @@ public class SocketTransportOptionsTests
         }
     }
 
+    [Theory]
+    [InlineData(-4L, null, 512)]
+    [InlineData(null, -1L, 512)]
+    [InlineData(null, null, 0)]
+    public async Task InvalidSocketTransportOptions_AreRejectedAtBind(long? maxRead, long? maxWrite, int backlog)
+    {
+        if (!Ring.IsSupported) return;
+
+        var factory = CreateFactory(
+            new SocketTransportOptions { MaxReadBufferSize = maxRead, MaxWriteBufferSize = maxWrite, Backlog = backlog },
+            threadCount: 1);
+
+        Func<Task> bind = async () => await factory.BindAsync(new IPEndPoint(IPAddress.Loopback, 0));
+        await bind.Should().ThrowAsync<ArgumentOutOfRangeException>(
+            "an invalid limit must fail at startup, not make every accepted connection fail");
+    }
+
     [Fact]
     public async Task SocketBacklog_ReachesListen()
     {

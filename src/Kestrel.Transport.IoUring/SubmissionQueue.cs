@@ -49,6 +49,9 @@ internal sealed unsafe class SubmissionQueue
         }
     }
 
+    /// <summary>SQEs handed out but not yet published to the kernel by <see cref="Flush"/>.</summary>
+    public bool HasStaged => _sqeTail != _sqeHead;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetSqe(out IoUringSqe* sqe)
     {
