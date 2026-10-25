@@ -16,7 +16,9 @@ namespace Kestrel.Transport.IoUring.Tests.Integration;
 
 /// <summary>
 /// End-to-end integration tests: HttpClient → Kestrel with io_uring transport.
+/// Some tests assert the process-wide active-connection count, so the class runs alone.
 /// </summary>
+[Collection(ProcessWideResourcesCollection.Name)]
 public class KestrelIntegrationTests : IAsyncLifetime
 {
     private WebApplication _app = null!;

@@ -256,7 +256,7 @@ public class MultiListenerBug7RedTests
 
             cancellationTokenSource.Cancel();
 
-            await WithTimeout(Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelledUnbind));
+            await WithTimeout(cancelledUnbind);
 
             worker.ReleaseUnbind();
 
@@ -268,6 +268,36 @@ public class MultiListenerBug7RedTests
         finally
         {
             worker.ReleaseUnbind();
+            await SafeDisposeAsync(listener);
+        }
+    }
+
+    [Fact]
+    public async Task UnbindAsync_WithAlreadyCancelledToken_DoesNotThrowAndWorkersStillDispose()
+    {
+        // Kestrel passes an already-cancelled token once its shutdown timeout expires; a throw here would skip
+        // worker disposal. Unbind must still be pending so WaitAsync actually observes the token.
+        var worker1 = new FakeWorker(releaseUnbindByDefault: false);
+        var worker2 = new FakeWorker(releaseUnbindByDefault: false);
+        var listener = CreateListener(mergedCapacity: 1, worker1, worker2);
+        using var cancelledSource = new CancellationTokenSource();
+        cancelledSource.Cancel();
+
+        try
+        {
+            await WithTimeout(listener.UnbindAsync(cancelledSource.Token).AsTask());
+
+            worker1.ReleaseUnbind();
+            worker2.ReleaseUnbind();
+            await WithTimeout(listener.DisposeAsync());
+
+            worker1.DisposeCallCount.Should().Be(1);
+            worker2.DisposeCallCount.Should().Be(1);
+        }
+        finally
+        {
+            worker1.ReleaseUnbind();
+            worker2.ReleaseUnbind();
             await SafeDisposeAsync(listener);
         }
     }

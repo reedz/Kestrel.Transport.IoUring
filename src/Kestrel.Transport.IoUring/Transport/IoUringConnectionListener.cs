@@ -87,6 +87,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     // Consecutive ENOBUFS completions with no successful buffer receive in between.
     private int _enobufsStreak;
     private volatile bool _stopping;
+    private int _ringFailed;
+    // Test seam: invoked at the top of every IO-loop iteration so tests can inject loop faults. Null in production.
+    internal Action? IoLoopIterationHook { get; set; }
     private int _unbindStarted;
     private int _disposeStarted;
     private bool _ioLoopStarted;
@@ -505,6 +508,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             {
                 try
                 {
+                    IoLoopIterationHook?.Invoke();
                     ProcessLifecycleCommands();
                     // Drain pipe scheduler work items (send loop continuations).
                     _pipeScheduler?.DrainWorkItems();
@@ -598,6 +602,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 conn?.MarkFinalized();
             foreach (var conn in _closingConnections.Values)
                 conn.MarkFinalized();
+            // Nothing will service lifecycle commands again: an unbind or dispose waiting for the IO loop to
+            // stop accepting or to drain connections would otherwise wait forever. The listen socket is
+            // released by DisposeAsync.
+            _acceptStopped.TrySetResult();
+            _connectionsDrained.TrySetResult();
             _ioLoopStopped.TrySetResult();
         }
     }
@@ -706,6 +715,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 var outcome = conn.ResumeReceiveAfterFlush();
                 if (outcome == IoUringConnection.RecvOutcome.Closed)
                 {
+                    BeginCloseConnection(request.ConnectionId, conn);
+                    continue;
+                }
+                if (outcome == IoUringConnection.RecvOutcome.Continue && conn.ReceiveEofPending)
+                {
+                    // Everything queued ahead of the peer's EOF has been delivered; complete it now.
+                    _inputPipeComplete(conn);
                     BeginCloseConnection(request.ConnectionId, conn);
                     continue;
                 }
@@ -828,7 +844,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
     private void FailRing(Exception error)
     {
-        if (_stopping)
+        // Not _stopping: unbind sets that while the loop keeps serving app-owned connections, and a fatal ring
+        // error during that drain must still abort them and stop the loop.
+        if (Interlocked.Exchange(ref _ringFailed, 1) != 0)
             return;
 
         _stopping = true;
@@ -883,7 +901,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 _pipeScheduler?.DrainWorkItems();
                 DrainCloseRequestQueue();
                 DrainRecvResubmitQueue();
-                if (_pipeScheduler?.LastDrainedCount > 0)
+                // A CQ that is never empty must not starve an unbind or dispose waiting for the loop.
+                ProcessLifecycleCommands();
+                if (_pipeScheduler?.LastDrainedCount > 0 || _acceptStopBegun && !_acceptStopped.Task.IsCompleted)
                     _ring.Submit();
             }
         }
@@ -1219,6 +1239,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 else if (result == -ECONNRESET) Diagnostics.RecvDiagnostics.OnRecvEconnreset();
                 else Diagnostics.RecvDiagnostics.OnRecvOtherError();
 
+                // A clean EOF can overtake data still queued behind pipe backpressure (the multishot receive
+                // keeps posting until its cancel lands). Deliver that data first; a reset discards it anyway.
+                if (result == 0 && conn.TryDeferReceiveEof())
+                    return false;
+
                 _inputPipeComplete(conn);
                 BeginCloseConnection(connectionId, conn);
                 return false;
@@ -1513,6 +1538,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
         Array.Clear(_connectionSlots);
         _closingConnections.Clear();
+        // The IO loop has stopped, so connections still counted were never released through the normal close path.
+        Interlocked.Add(ref s_activeConnections, -_activeConnectionCount);
+        _activeConnectionCount = 0;
 
         RunDisposeCleanupStep("send diagnostics timer dispose", () => _diagTimer?.Dispose());
         RunDisposeCleanupStep("recv diagnostics timer dispose", () => _recvDiagTimer?.Dispose());

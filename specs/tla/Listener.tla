@@ -2196,7 +2196,7 @@ LoopStop ==
     /\ loopPhase \in {"top", "wait", "after", "parked"}
     /\ stopping
     /\ ~HasStagedOps
-    /\ (ringFailed \/ (disposeStarted /\ (AllSlotsFree \/ unbindTimeoutElapsed \/ disposeStarted)))
+    /\ (ringFailed \/ (disposeStarted /\ (AllSlotsFree \/ unbindTimeoutElapsed)))
     /\ loopPhase' = "stopped"
     /\ UNCHANGED << ConnVars, RetryVars, QueueVars, acceptArmed,
                     acceptArmedMultishot, eventfdReadArmed, cqQueue, sqAvail,

@@ -64,6 +64,17 @@ EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC
 \*      completion" concurrency obligation stay outside this ownership model.
 \*      They remain runtime-test obligations covered by
 \*      MultiListenerBug7RedTests rather than formal claims here.
+\*   7. KNOWN GAP: worker unbind is still abstracted as completing only after the
+\*      worker's live connections are gone (CompleteWorkerUnbind requires
+\*      WorkerLiveCount(w) = 0; UnboundHasNoLiveConnections). The repaired runtime
+\*      does not abort app-owned connections in UnbindAsync: they stay live until
+\*      Kestrel closes them or the worker's DisposeAsync force-aborts the remainder.
+\*      The ownership claims checked here (forwarder / merged-queue / app handoff)
+\*      do not depend on that timing, but the unbind-completion and
+\*      "unbound => no live connections" claims describe the pre-repair worker.
+\*      The unbind-alone contract is checked in Listener.tla
+\*      (UnbindAloneKeepsLoopRunning) and by GracefulShutdownTests and
+\*      StopUnderLoadTests.
 
 CONSTANTS
     WorkerCount,

@@ -103,6 +103,17 @@ public class ReceiveBackpressureTests
     }
 
     [Fact]
+    public void PendingLimit_DoesNotWrapNearIntMaxValue()
+    {
+        IoUringConnection.ExceedsPendingRecvLimit(0, 1024, 8 * 1024 * 1024).Should().BeFalse();
+        IoUringConnection.ExceedsPendingRecvLimit(8 * 1024 * 1024 - 1024, 1024, 8 * 1024 * 1024).Should().BeFalse();
+        IoUringConnection.ExceedsPendingRecvLimit(8 * 1024 * 1024, 1, 8 * 1024 * 1024).Should().BeTrue();
+
+        // An int sum would wrap negative here and be accepted even though it exceeds the cap.
+        IoUringConnection.ExceedsPendingRecvLimit(int.MaxValue - 10, 100, int.MaxValue).Should().BeTrue();
+    }
+
+    [Fact]
     public void Ring_ReportsItsCompletionQueueSize()
     {
         if (!Ring.IsSupported) return;

@@ -124,6 +124,25 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
 
     /// <summary>True when an async flush is pending and will trigger a recv rearm on completion.</summary>
     internal bool RecvRearmPending { get; set; }
+
+    /// <summary>
+    /// True when the peer's EOF arrived while earlier data was still queued behind input-pipe backpressure.
+    /// The input is completed (and closure signalled) only after that data has been delivered.
+    /// </summary>
+    internal bool ReceiveEofPending { get; private set; }
+
+    /// <summary>
+    /// Records a receive EOF that must wait for already-received data to reach the application.
+    /// Returns false when nothing is queued and the EOF can complete immediately.
+    /// </summary>
+    internal bool TryDeferReceiveEof()
+    {
+        if (!RecvRearmPending)
+            return false;
+
+        ReceiveEofPending = true;
+        return true;
+    }
     internal bool RecvCancelPending { get; set; }
     private Queue<byte[]>? _pendingRecvData;
     private int _pendingRecvBytes;
@@ -135,6 +154,10 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     // backpressure mechanism: once the cancel lands, TCP flow control throttles the peer.
     private const int MinPendingRecvLimitBytes = 8 * 1024 * 1024;
     private readonly int _maxPendingRecvBytes;
+
+    // Widened so a cap near int.MaxValue (huge ring x huge buffers) still rejects instead of wrapping negative.
+    internal static bool ExceedsPendingRecvLimit(int pendingBytes, int incomingBytes, int limitBytes) =>
+        (long)pendingBytes + incomingBytes > limitBytes;
 
     /// <summary>True after the output-pipe send loop has stopped and cannot submit more sends.</summary>
     internal bool SendLoopCompleted { get; private set; } = true;
@@ -347,7 +370,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     {
         if (RecvRearmPending)
         {
-            if (_pendingRecvBytes + data.Length > _maxPendingRecvBytes)
+            if (ExceedsPendingRecvLimit(_pendingRecvBytes, data.Length, _maxPendingRecvBytes))
             {
                 _requestClose?.Invoke(
                     _connectionId,

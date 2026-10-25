@@ -273,12 +273,18 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         }
     }
 
-    public ValueTask UnbindAsync(CancellationToken cancellationToken = default)
+    public async ValueTask UnbindAsync(CancellationToken cancellationToken = default)
     {
         Task unbindTask = EnsureUnbindTask();
-        return cancellationToken.CanBeCanceled
-            ? new ValueTask(unbindTask.WaitAsync(cancellationToken))
-            : new ValueTask(unbindTask);
+        try
+        {
+            await unbindTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested && !unbindTask.IsCompleted)
+        {
+            // Best effort, like SocketTransport: Kestrel passes an already-cancelled token once its shutdown
+            // timeout expires and must still dispose the workers. The shared unbind keeps running.
+        }
     }
 
     public ValueTask DisposeAsync() =>
