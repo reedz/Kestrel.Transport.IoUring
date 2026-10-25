@@ -200,10 +200,12 @@ public class ConnectionCorrectnessTests
             UnsafeInlineScheduling = false,
         };
 
-        var worker = IoUringMultiListener.CreateWorkerOptions(options, maxConnections: 4);
+        var worker = IoUringMultiListener.CreateWorkerOptions(options, connectionShare: 4);
 
         worker.RingSize.Should().Be(options.RingSize);
-        worker.MaxConnections.Should().Be(4);
+        worker.MaxConnections.Should().Be(options.MaxConnections,
+            "admission is shared, so every worker can hold the whole limit");
+        worker.BufferRingConnectionShare.Should().Be(4);
         worker.ListenBacklog.Should().Be(options.ListenBacklog);
         worker.AcceptQueueCapacity.Should().Be(options.AcceptQueueCapacity);
         worker.LogPoolStatsInterval.Should().Be(options.LogPoolStatsInterval);
@@ -221,14 +223,14 @@ public class ConnectionCorrectnessTests
     }
 
     [Fact]
-    public void MultiListener_DistributesExactConnectionCapacity()
+    public void MultiListener_SplitsTheBufferSizingShareExactly()
     {
-        int[] capacities = Enumerable.Range(0, 3)
-            .Select(i => IoUringMultiListener.GetWorkerMaxConnections(11, 3, i))
+        int[] shares = Enumerable.Range(0, 3)
+            .Select(i => IoUringMultiListener.GetWorkerConnectionShare(11, 3, i))
             .ToArray();
 
-        capacities.Should().Equal(4, 4, 3);
-        capacities.Sum().Should().Be(11);
+        shares.Should().Equal(4, 4, 3);
+        shares.Sum().Should().Be(11);
     }
 
 }

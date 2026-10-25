@@ -30,7 +30,7 @@ internal static class RecvDiagnostics
     // ── Submission failure counters (monotonic) ──
     private static long _multishotRearmSqFull;    // SubmitMultishotRecv returned false
     private static long _singleshotRearmSqFull;   // SubmitRecv returned false
-    private static long _acceptChannelDrops;      // BoundedChannel TryWrite=false
+    private static long _acceptPauses;            // accept paused: accept channel full
 
     // ── Backpressure counters (monotonic) ──
     private static long _asyncFlushPending;       // OnRecvCompleteFromBuffer flush returned async
@@ -48,7 +48,7 @@ internal static class RecvDiagnostics
     public static void OnRecvCleanClose()    { if (Enabled) Interlocked.Increment(ref _recvCleanClose); }
     public static void OnMultishotRearmSqFull()  { if (Enabled) Interlocked.Increment(ref _multishotRearmSqFull); }
     public static void OnSingleshotRearmSqFull() { if (Enabled) Interlocked.Increment(ref _singleshotRearmSqFull); }
-    public static void OnAcceptChannelDrop()  { if (Enabled) Interlocked.Increment(ref _acceptChannelDrops); }
+    public static void OnAcceptPaused()       { if (Enabled) Interlocked.Increment(ref _acceptPauses); }
     public static void OnAsyncFlushPending() { if (Enabled) Interlocked.Increment(ref _asyncFlushPending); }
 
     /// <summary>A listener's receive-retry set grew or shrank by <paramref name="delta"/> entries.</summary>
@@ -71,7 +71,7 @@ internal static class RecvDiagnostics
     public sealed class Snapshot
     {
         public long Enobufs, Epipe, Econnreset, OtherError, CleanClose;
-        public long MultishotRearmSqFull, SingleshotRearmSqFull, AcceptChannelDrops;
+        public long MultishotRearmSqFull, SingleshotRearmSqFull, AcceptPauses;
         public long AsyncFlushPending;
         public long RecvRetryDepth, RecvRetryDepthHighWater;
     }
@@ -87,7 +87,7 @@ internal static class RecvDiagnostics
         CleanClose               = Volatile.Read(ref _recvCleanClose),
         MultishotRearmSqFull     = Volatile.Read(ref _multishotRearmSqFull),
         SingleshotRearmSqFull    = Volatile.Read(ref _singleshotRearmSqFull),
-        AcceptChannelDrops       = Volatile.Read(ref _acceptChannelDrops),
+        AcceptPauses       = Volatile.Read(ref _acceptPauses),
         AsyncFlushPending        = Volatile.Read(ref _asyncFlushPending),
         RecvRetryDepth           = Volatile.Read(ref _recvRetryDepth),
         RecvRetryDepthHighWater  = Volatile.Read(ref _recvRetryDepthHighWater),
@@ -112,7 +112,7 @@ internal static class RecvDiagnostics
                 _last = cur;
                 double inv = 1.0 / intervalSeconds;
                 string line = string.Format(
-                    "[io_uring recv-diag] enobufs/s={0:F0} epipe/s={1:F0} econnreset/s={2:F0} otherErr/s={3:F0} cleanClose/s={4:F0} msRearmSqFull/s={5:F0} ssRearmSqFull/s={6:F0} acceptDrop/s={7:F0} asyncFlush/s={8:F0} recvRetryQ={9} recvRetryHi={10}",
+                    "[io_uring recv-diag] enobufs/s={0:F0} epipe/s={1:F0} econnreset/s={2:F0} otherErr/s={3:F0} cleanClose/s={4:F0} msRearmSqFull/s={5:F0} ssRearmSqFull/s={6:F0} acceptPause/s={7:F0} asyncFlush/s={8:F0} recvRetryQ={9} recvRetryHi={10}",
                     (cur.Enobufs - prev.Enobufs) * inv,
                     (cur.Epipe - prev.Epipe) * inv,
                     (cur.Econnreset - prev.Econnreset) * inv,
@@ -120,7 +120,7 @@ internal static class RecvDiagnostics
                     (cur.CleanClose - prev.CleanClose) * inv,
                     (cur.MultishotRearmSqFull - prev.MultishotRearmSqFull) * inv,
                     (cur.SingleshotRearmSqFull - prev.SingleshotRearmSqFull) * inv,
-                    (cur.AcceptChannelDrops - prev.AcceptChannelDrops) * inv,
+                    (cur.AcceptPauses - prev.AcceptPauses) * inv,
                     (cur.AsyncFlushPending - prev.AsyncFlushPending) * inv,
                     cur.RecvRetryDepth, cur.RecvRetryDepthHighWater);
                 // Logger AND Console — benchmark scenarios often suppress info-level

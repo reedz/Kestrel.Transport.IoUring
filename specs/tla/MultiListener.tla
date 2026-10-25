@@ -6,7 +6,7 @@ EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC
 \* Traceability to the current implementation:
 \*   - src/Kestrel.Transport.IoUring/Transport/IoUringMultiListener.cs:18-184
 \*     (IoUringMultiListener constructor chain, CreateWorkerBuild,
-\*      CreateWorkerOptions, GetWorkerMaxConnections, CreateMergedChannel,
+\*      CreateWorkerOptions, GetWorkerConnectionShare, CreateMergedChannel,
 \*      GetSetupFlags, CreateWorkerSet, and startup forwarders)
 \*   - src/Kestrel.Transport.IoUring/Transport/IoUringMultiListener.cs:186-522
 \*     (ForwardAcceptsAsync, explicit in-transit handoff, shutdown-time
@@ -26,8 +26,10 @@ EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC
 \*     (phase-4 worker-listener accept/dispose contract and focused liveness style)
 \*
 \* Worker abstraction for this phase:
-\*   1. Each worker is reduced to a bounded accept channel, a fixed max-live
-\*      capacity, and the phase-4 listener lifecycle boundary: it can publish
+\*   1. Each worker is reduced to a bounded accept channel, admission against
+\*      the listener-wide connection limit shared by all workers (H-06; a
+\*      connection that finds the channel full stays live until there is room,
+\*      H-03), and the phase-4 listener lifecycle boundary: it can publish
 \*      accepted connections, its AcceptAsync returns the FIFO head or null after
 \*      cancellation/completion, UnbindAsync only stops accepting (application-owned
 \*      connections stay live until Kestrel closes them or DisposeAsync aborts the
@@ -191,6 +193,9 @@ ExplicitMembershipCount(c) ==
 WorkerLiveCount(w) ==
     Cardinality({ c \in Connections : connWorker[c] = w /\ connState[c] = "live" })
 
+TotalLiveCount ==
+    Cardinality({ c \in Connections : connState[c] = "live" })
+
 AllForwardersDone ==
     \A w \in Workers : forwarderState[w] = "done"
 
@@ -295,15 +300,6 @@ QueueCore(w, c) ==
                     connWorker, forwardHistory, appOwned, closedRefs,
                     droppedRefs, listenerPhase, disposeRequested,
                     appCancelObserved >>
-
-AbortQueueFullCore(w, c) ==
-    /\ workerLive' = [workerLive EXCEPT ![w] = @ \ {c}]
-    /\ connState' = [connState EXCEPT ![c] = "aborted"]
-    /\ closedRefs' = closedRefs \cup {c}
-    /\ UNCHANGED << workerState, workerQueueCompleted, workerQueue, inTransit,
-                    mergedQueue, mergedCompleted, ctsCancelled, forwarderState,
-                    connWorker, forwardHistory, appOwned, droppedRefs,
-                    listenerPhase, disposeRequested, appCancelObserved >>
 
 TakeTransitCore(w, c) ==
     /\ workerQueue' = [workerQueue EXCEPT ![w] = TailOrEmpty(@)]
@@ -475,8 +471,9 @@ DisposeCore ==
                     appCancelObserved >>
 
 \* Running-phase worker behavior abstracts the worker listener's accept channel:
-\* a fresh connection becomes live, is either queued, or is aborted if the worker
-\* channel is full.
+\* a fresh connection becomes live and is queued when the channel has room. The
+\* connection limit is one admission shared by every worker (H-06), so a worker
+\* may hold any number of live connections as long as the total stays within it.
 WorkerCreateAny(w, c) ==
     /\ Scenario \in {"safety", "forward-progress", "shutdown-drain",
                      "shutdown-late-merged-complete"}
@@ -484,7 +481,7 @@ WorkerCreateAny(w, c) ==
     /\ workerState[w] = "running"
     /\ ~workerQueueCompleted[w]
     /\ connState[c] = "fresh"
-    /\ WorkerLiveCount(w) < WorkerCap(w)
+    /\ TotalLiveCount < TotalMaxConnections
     /\ CreateCore(w, c)
 
 WorkerPublishAny(w, c) ==
@@ -497,14 +494,9 @@ WorkerPublishAny(w, c) ==
     /\ Len(workerQueue[w]) < WorkerAcceptCapacity
     /\ QueueCore(w, c)
 
-WorkerAbortQueueFullAny(w, c) ==
-    /\ Scenario = "safety"
-    /\ listenerPhase = "running"
-    /\ workerState[w] = "running"
-    /\ ~workerQueueCompleted[w]
-    /\ c \in workerLive[w]
-    /\ Len(workerQueue[w]) = WorkerAcceptCapacity
-    /\ AbortQueueFullCore(w, c)
+\* A live connection that finds its worker's accept channel full is not aborted
+\* (H-03): it stays live and unpublished (the worker parks it and pauses
+\* accepting) until WorkerPublishAny finds room.
 
 \* ForwardTake / ForwardEnqueue refine ForwardAcceptsAsync and its explicit
 \* local variable handoff before WriteAsync into _mergedChannel.
@@ -727,9 +719,6 @@ AnyCreate ==
 AnyQueue ==
     \E w \in Workers, c \in Connections : WorkerPublishAny(w, c)
 
-AnyQueueFullAbort ==
-    \E w \in Workers, c \in Connections : WorkerAbortQueueFullAny(w, c)
-
 AnyForwardTake ==
     \E w \in Workers : ForwardTake(w)
 
@@ -789,7 +778,6 @@ AnyAppRelease ==
 SafetyBodyStep ==
     \/ AnyCreate
     \/ AnyQueue
-    \/ AnyQueueFullAbort
     \/ AnyForwardTake
     \/ AnyForwardEnqueue
     \/ AnyForwarderCompleteNatural
@@ -966,9 +954,12 @@ BoundedChannels ==
     /\ \A w \in Workers : Len(workerQueue[w]) <= WorkerAcceptCapacity
     /\ Len(mergedQueue) <= MergedCapacity
 
-WorkerCapacityBound ==
-    \A w \in Workers : WorkerLiveCount(w) <= WorkerCap(w)
+\* H-06: one admission for all workers; any worker may hold the whole limit.
+SharedAdmissionBound ==
+    TotalLiveCount <= TotalMaxConnections
 
+\* WorkerCap is now each worker's buffer-sizing share (GetWorkerConnectionShare),
+\* not a per-worker connection limit; the shares still split the total exactly.
 TotalCapacityExact ==
     TotalWorkerCapacity = TotalMaxConnections
 

@@ -41,7 +41,7 @@ public class SocketTransportOptionsTests
         resolved.MaxReadBufferSize.Should().Be(4096);
         resolved.MaxWriteBufferSize.Should().BeNull();
 
-        var worker = IoUringMultiListener.CreateWorkerOptions(resolved, maxConnections: 4);
+        var worker = IoUringMultiListener.CreateWorkerOptions(resolved, connectionShare: 4);
         worker.NoDelay.Should().BeFalse();
         worker.MaxReadBufferSize.Should().Be(4096);
         worker.MaxWriteBufferSize.Should().BeNull();

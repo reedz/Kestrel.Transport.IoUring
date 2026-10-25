@@ -30,6 +30,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private readonly Stack<int> _freeSlots;
     private readonly CancellationTokenSource _cts = new();
     private readonly int _maxConnections;
+    private readonly ConnectionAdmission _admission;
     private readonly int _receiveBufferSize;
     private readonly IoUringTransportOptions _options;
 
@@ -139,6 +140,12 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private int _acceptStopRequested;   // set by UnbindAsync (any thread), consumed by the IO loop
     private bool _acceptStopBegun;      // IO loop only
     private bool _acceptCancelInFlight; // IO loop only
+    // A cancel was submitted against the current accept request (unbind or pause); its ECANCELED is expected.
+    private bool _acceptCancelRequested; // IO loop only
+    // H-03: accepted connections waiting for room in the accept channel, while accepting is paused.
+    private readonly Queue<IoUringConnection> _pendingAccepts = new(); // IO loop only
+    private bool _acceptPaused; // IO loop only
+    private int _acceptPausedSignal; // read by AcceptAsync, so a consumer wakes the loop to resume
     private int _forceCloseRequested;   // set by DisposeAsync (any thread), consumed by the IO loop
     private bool _forceCloseBegun;      // IO loop only
     private int _listenSocketReleased;
@@ -156,9 +163,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         long Generation,
         ConnectionAbortedException? Reason);
 
-    // Process-wide counter of accept-channel drops (S0.1). Inspected by
-    // diagnostics; reset is not supported because it would race the writer.
-    internal static long s_acceptChannelDrops;
+    // Process-wide count of accept pauses (accept channel full; see DeliverAccepted).
+    internal static long s_acceptPauses;
     internal static long s_activeConnections;
 
     public EndPoint EndPoint { get; private set; }
@@ -169,11 +175,18 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
     bool IIoUringListenerInfo.UsesProvidedBufferRing => _bufferRing != null;
 
-    public IoUringConnectionListener(EndPoint endPoint, Ring ring, IoUringTransportOptions options, ILogger logger)
+    public IoUringConnectionListener(
+        EndPoint endPoint,
+        Ring ring,
+        IoUringTransportOptions options,
+        ILogger logger,
+        ConnectionAdmission? admission = null)
     {
         EndPoint = endPoint;
         _ring = ring;
         _logger = logger;
+        // A multi-ring listener passes one admission shared by all of its rings.
+        _admission = admission ?? new ConnectionAdmission(options.MaxConnections);
         _maxConnections = options.MaxConnections;
         _receiveBufferSize = options.ReceiveBufferSize;
         _options = options;
@@ -404,6 +417,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             _connectionSlots[s] = null;
             _activeConnectionCount--;
             Interlocked.Decrement(ref s_activeConnections);
+            _admission.Release();
             _freeSlots.Push(s);
             if (_stopping && _activeConnectionCount == 0)
                 _connectionsDrained.TrySetResult();
@@ -439,6 +453,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             _acceptMultishotActive = _useMultishotAccept;
             _acceptInFlight = true;
             _acceptRetryRequired = false;
+            _acceptCancelRequested = false;
             return true;
         }
 
@@ -613,6 +628,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 {
                     IoLoopIterationHook?.Invoke();
                     ProcessLifecycleCommands();
+                    FlushPendingAccepts();
                     // Drain pipe scheduler work items (send loop continuations).
                     _pipeScheduler?.DrainWorkItems();
                     DrainCloseRequestQueue();
@@ -654,7 +670,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                         bool acceptRetryDueNow = ListenerAcceptRetryState.IsDueNow(
                             _acceptRetryRequired,
                             _acceptInFlight,
-                            _stopping,
+                            _stopping || _acceptPaused || _acceptCancelInFlight,
                             _cts.IsCancellationRequested,
                             now,
                             Volatile.Read(ref _acceptRetryNotBeforeTimestamp));
@@ -987,6 +1003,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         sqe->AddrOrSpliceOffIn = IoUringConstants.ACCEPT_USER_DATA;
         sqe->UserData = IoUringConstants.ACCEPT_CANCEL_USER_DATA;
         _acceptCancelInFlight = true;
+        _acceptCancelRequested = true;
     }
 
     /// <summary>
@@ -1141,7 +1158,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         if (ListenerAcceptRetryState.IsDueNow(
             _acceptRetryRequired,
             _acceptInFlight,
-            _stopping,
+            _stopping || _acceptPaused || _acceptCancelInFlight,
             _cts.IsCancellationRequested,
             now,
             acceptNotBefore))
@@ -1290,6 +1307,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         RetryFailedRecvs();
         RetryControlOperations();
         ResumeSendRetries();
+        FlushPendingAccepts();
         // Retry passes and closes remove entries; keep the process-wide gauge live.
         ReportRecvRetryDepth();
     }
@@ -1346,6 +1364,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             // cancel if the accept is somehow still live.
             _acceptCancelInFlight = false;
             TryCompleteAcceptStop();
+            ResumeAcceptIfIdle();
             return;
         }
 
@@ -1456,14 +1475,22 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 return;
             }
 
-            if (!_cts.IsCancellationRequested)
-                _logger.LogWarning("Accept failed with errno {Errno}", errno);
-            if (errno is not IoUringConstants.EAGAIN and
-                not IoUringConstants.EINTR and
-                not IoUringConstants.ECONNABORTED)
+            if (errno == IoUringConstants.ECANCELED && _acceptCancelRequested)
             {
-                ScheduleAcceptRetry(errno);
-                delayedRetry = true;
+                // Our own cancel (accept paused because the accept channel is full). It is re-armed when the
+                // backlog is delivered (FlushPendingAccepts) or when the cancel completes, whichever is last.
+            }
+            else
+            {
+                if (!_cts.IsCancellationRequested)
+                    _logger.LogWarning("Accept failed with errno {Errno}", errno);
+                if (errno is not IoUringConstants.EAGAIN and
+                    not IoUringConstants.EINTR and
+                    not IoUringConstants.ECONNABORTED)
+                {
+                    ScheduleAcceptRetry(errno);
+                    delayedRetry = true;
+                }
             }
         }
         else
@@ -1478,11 +1505,19 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 return;
             }
 
-            // Round-7: acquire a slot from the free-list. If none available, close the
-            // accepted fd cleanly instead of orphaning a live connection by slot-reuse.
-            if (!_freeSlots.TryPop(out int slot))
+            // Admission first (shared by every ring of the listener), before any connection resource exists. It is
+            // released exactly once: here on any failure before SetConnection, else by RemoveConnection or disposal.
+            if (!_admission.TryReserve())
             {
-                _logger.LogWarning("Connection limit ({Limit}) reached; rejecting new connection.", _maxConnections);
+                _logger.LogWarning(
+                    "Connection limit ({Limit}) reached; rejecting new connection.",
+                    _admission.Limit);
+                Libc.close(socketFd);
+            }
+            else if (!_freeSlots.TryPop(out int slot))
+            {
+                _admission.Release();
+                _logger.LogWarning("No free connection slot ({Limit}); rejecting new connection.", _maxConnections);
                 Libc.close(socketFd);
             }
             else
@@ -1496,6 +1531,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                         socketFd,
                         Marshal.GetLastPInvokeError());
                     _freeSlots.Push(slot);
+                    _admission.Release();
                     Libc.close(socketFd);
                     goto AcceptCompleted;
                 }
@@ -1532,6 +1568,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                     if (fileIndex >= 0)
                         _ring.UnregisterFd(fileIndex);
                     _freeSlots.Push(slot);
+                    _admission.Release();
                     Libc.close(socketFd);
                     throw;
                 }
@@ -1542,47 +1579,92 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                     RequestSendRetry,
                     RequestClose);
 
-                // S0.1: bounded accept channel (capacity AcceptQueueCapacity, default 128).
-                // If full under burst, the accepted connection would previously be leaked
-                // (slot allocated, send loop running, recv armed, but never observed by
-                // Kestrel). Tear it down cleanly so the slot is freed.
-                if (!_acceptChannel.Writer.TryWrite(conn))
-                {
-                    Interlocked.Increment(ref s_acceptChannelDrops);
-                    Diagnostics.RecvDiagnostics.OnAcceptChannelDrop();
-                    conn.BeginTransportAbort(new ConnectionAbortedException("Accept channel full"));
-                    BeginCloseConnection(connId, conn);
-                }
-                else
-                {
-                    conn.StartSendLoop();
+                conn.StartSendLoop();
 
-                    // Submit multishot recv if buffer ring is available; otherwise single-shot.
-                    if (_bufferRing != null)
+                // Submit multishot recv if buffer ring is available; otherwise single-shot.
+                if (_bufferRing != null)
+                {
+                    if (!conn.SubmitBufferRingRecv(RECV_BUF_GROUP_ID))
                     {
-                        if (!conn.SubmitBufferRingRecv(RECV_BUF_GROUP_ID))
-                        {
-                            Diagnostics.RecvDiagnostics.OnMultishotRearmSqFull();
-                            _recvRetryState.AddRecvRetry(connId);
-                            ReportRecvRetryDepth();
-                        }
-                    }
-                    else if (!conn.SubmitRecv())
-                    {
-                        Diagnostics.RecvDiagnostics.OnSingleshotRearmSqFull();
+                        Diagnostics.RecvDiagnostics.OnMultishotRearmSqFull();
                         _recvRetryState.AddRecvRetry(connId);
                         ReportRecvRetryDepth();
                     }
                 }
+                else if (!conn.SubmitRecv())
+                {
+                    Diagnostics.RecvDiagnostics.OnSingleshotRearmSqFull();
+                    _recvRetryState.AddRecvRetry(connId);
+                    ReportRecvRetryDepth();
+                }
+
+                DeliverAccepted(conn);
             }
 
         AcceptCompleted:
             _acceptMultishotActive = more;
         }
 
-        // If multishot ended (F_MORE not set), rearm.
-        if (!more && !delayedRetry && !_stopping && !_cts.IsCancellationRequested)
-            SubmitAccept();
+        // If the accept request ended (F_MORE not set), rearm, unless it is paused or a cancel of it is still
+        // outstanding (ResumeAcceptIfIdle runs when that completes).
+        if (!more && !delayedRetry)
+            ResumeAcceptIfIdle();
+    }
+
+    /// <summary>
+    /// H-03: hands an accepted connection to <see cref="AcceptAsync"/>. When the accept channel is full the
+    /// connection is parked (IO-loop owned, in arrival order) and accepting pauses: the multishot accept is
+    /// cancelled, so further clients wait in the kernel's listen backlog (TCP backpressure, like SocketTransport
+    /// when Kestrel stops calling AcceptAsync) instead of being accepted and then aborted. Connections the kernel
+    /// accepted before the cancel landed are parked too. The admission limit bounds the parked set.
+    /// </summary>
+    private void DeliverAccepted(IoUringConnection conn)
+    {
+        if (_pendingAccepts.Count == 0 && _acceptChannel.Writer.TryWrite(conn))
+            return;
+
+        _pendingAccepts.Enqueue(conn);
+        if (_acceptPaused)
+            return;
+
+        _acceptPaused = true;
+        Volatile.Write(ref _acceptPausedSignal, 1);
+        Interlocked.Increment(ref s_acceptPauses);
+        Diagnostics.RecvDiagnostics.OnAcceptPaused();
+        if (_acceptInFlight && _acceptMultishotActive)
+            TrySubmitAcceptCancel();
+    }
+
+    /// <summary>Moves parked connections into the accept channel as it drains; resumes accepting once all are delivered.</summary>
+    private void FlushPendingAccepts()
+    {
+        if (!_acceptPaused)
+            return;
+
+        while (_pendingAccepts.Count > 0)
+        {
+            if (!_acceptChannel.Writer.TryWrite(_pendingAccepts.Peek()))
+            {
+                // Still full. A pause cancel that raced the accept's start (ENOENT) leaves it accepting: re-issue.
+                if (_acceptInFlight && _acceptMultishotActive && !_acceptCancelInFlight)
+                    TrySubmitAcceptCancel();
+                return;
+            }
+            _pendingAccepts.Dequeue();
+        }
+
+        _acceptPaused = false;
+        Volatile.Write(ref _acceptPausedSignal, 0);
+        ResumeAcceptIfIdle();
+    }
+
+    /// <summary>Re-arms accepting once nothing is paused and neither the accept nor a cancel of it is outstanding.</summary>
+    private void ResumeAcceptIfIdle()
+    {
+        if (_acceptPaused || _acceptInFlight || _acceptCancelInFlight || _stopping || _cts.IsCancellationRequested)
+            return;
+
+        SubmitAccept();
     }
 
     /// <summary>Returns true if a submission was queued (caller should call Submit).</summary>
@@ -1818,7 +1900,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     {
         try
         {
-            return await _acceptChannel.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            var connection = await _acceptChannel.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            // Room was made in the accept channel: let the loop deliver what it parked and resume accepting.
+            if (Volatile.Read(ref _acceptPausedSignal) != 0)
+                WakeIoLoop();
+            return connection;
         }
         catch (OperationCanceledException)
         {
@@ -1972,6 +2058,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         _closingConnections.Clear();
         // The IO loop has stopped, so connections still counted were never released through the normal close path.
         Interlocked.Add(ref s_activeConnections, -_activeConnectionCount);
+        _admission.Release(_activeConnectionCount);
         _activeConnectionCount = 0;
 
         RunDisposeCleanupStep("send diagnostics timer dispose", () => _diagTimer?.Dispose());
@@ -2073,6 +2160,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             RunDisposeCleanupStep,
             static conn => conn.CloseSocketFd());
         ReleaseListenSocket(unregisterFixedFile: false);
+
+        // The quarantined connections are dead to the application; their admission and gauge share is returned.
+        Interlocked.Add(ref s_activeConnections, -_activeConnectionCount);
+        _admission.Release(_activeConnectionCount);
+        _activeConnectionCount = 0;
 
         RunDisposeCleanupStep("send diagnostics timer dispose", () => _diagTimer?.Dispose());
         RunDisposeCleanupStep("recv diagnostics timer dispose", () => _recvDiagTimer?.Dispose());

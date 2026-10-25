@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Channels;
@@ -84,17 +85,19 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
 
     internal static IoUringTransportOptions CreateWorkerOptions(
         IoUringTransportOptions options,
-        int maxConnections)
+        int connectionShare)
     {
         // A full copy, so every behavioural setting (including those resolved from SocketTransportOptions) reaches
-        // the workers.
+        // the workers. MaxConnections stays the full limit: admission is shared (ConnectionAdmission), so any
+        // worker may hold up to all of it; only the buffers are sized for the worker's share.
         var worker = options.Clone();
-        worker.MaxConnections = maxConnections;
+        worker.BufferRingConnectionShare = connectionShare;
         worker.ThreadCount = 1;
         return worker;
     }
 
-    internal static int GetWorkerMaxConnections(int total, int workers, int workerIndex) =>
+    /// <summary>The even share of <paramref name="total"/> connections one of <paramref name="workers"/> rings expects.</summary>
+    internal static int GetWorkerConnectionShare(int total, int workers, int workerIndex) =>
         total / workers + (workerIndex < total % workers ? 1 : 0);
 
     private static Channel<ConnectionContext> CreateMergedChannel(int mergedCapacity) =>
@@ -130,6 +133,8 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         EndPoint publishedEndPoint = endPoint;
         int createdWorkers = 0;
         uint setupFlags = GetSetupFlags(options);
+        var admission = new ConnectionAdmission(options.MaxConnections);
+        EnsurePortIsFree(endPoint);
 
         try
         {
@@ -137,7 +142,7 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
             {
                 var workerOptions = CreateWorkerOptions(
                     options,
-                    GetWorkerMaxConnections(options.MaxConnections, threadCount, i));
+                    GetWorkerConnectionShare(options.MaxConnections, threadCount, i));
                 Ring? ring = null;
                 IoUringConnectionListener? worker = null;
                 try
@@ -148,7 +153,8 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
                         workerEndPoint,
                         ring,
                         workerOptions,
-                        logger);
+                        logger,
+                        admission);
                     worker.Bind(options.ListenBacklog, reusePort: true);
                     if (i == 0)
                         publishedEndPoint = worker.EndPoint;
@@ -173,6 +179,31 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         }
 
         return new WorkerSet(publishedEndPoint, workers);
+    }
+
+    /// <summary>
+    /// The workers share the port through SO_REUSEPORT, which would also let another process (a second instance of
+    /// the application) bind it without error and silently split the traffic. Binding an exclusive socket first
+    /// fails with Kestrel's <see cref="AddressInUseException"/>, as SocketTransport does. A process that binds in
+    /// the short window between this probe and the workers can still share the port; an ephemeral port (0) needs
+    /// no probe because nobody else can be bound to the one the kernel picks.
+    /// </summary>
+    internal static void EnsurePortIsFree(EndPoint endPoint)
+    {
+        if (endPoint is not IPEndPoint { Port: not 0 } ipEndPoint)
+            return;
+
+        using var probe = new Socket(ipEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+        if (ipEndPoint.AddressFamily == AddressFamily.InterNetworkV6)
+            probe.DualMode = true;
+        try
+        {
+            probe.Bind(ipEndPoint);
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
+        {
+            throw new AddressInUseException(ex.Message, ex);
+        }
     }
 
     private async Task ForwardAcceptsAsync(IMultiListenerWorker worker)

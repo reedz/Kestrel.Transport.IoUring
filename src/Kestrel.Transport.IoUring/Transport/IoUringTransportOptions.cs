@@ -37,6 +37,12 @@ public sealed class IoUringTransportOptions
     internal IoUringTransportOptions Clone() => (IoUringTransportOptions)MemberwiseClone();
 
     /// <summary>
+    /// Multi-ring workers: the ring's even share of <see cref="MaxConnections"/>. Every worker can hold the full
+    /// limit (admission is shared), but buffers are sized for the share, as the kernel spreads connections evenly.
+    /// </summary>
+    internal int? BufferRingConnectionShare { get; set; }
+
+    /// <summary>
     /// The options listeners actually use: these options plus the <see cref="SocketTransportOptions"/> settings
     /// that mean the same thing for this transport (<c>NoDelay</c>, <c>Backlog</c>, <c>MaxReadBufferSize</c>,
     /// <c>MaxWriteBufferSize</c>). An explicitly set <see cref="ListenBacklog"/> wins over <c>Backlog</c>.
@@ -196,7 +202,9 @@ public sealed class IoUringTransportOptions
 
     /// <summary>
     /// The provided buffer ring size actually used: <see cref="BufferRingSize"/>, or when that is 0 a power of
-    /// two derived from <see cref="MaxConnections"/> (per ring: multi-ring listeners split the limit).
+    /// two derived from the connections this ring is expected to serve (<see cref="BufferRingConnectionShare"/>
+    /// for a worker of a multi-ring listener, else <see cref="MaxConnections"/>). Also drives the receive-retry
+    /// budget and ENOBUFS backoff, so allocation and retry control always agree.
     /// </summary>
     internal int EffectiveBufferRingSize
     {
@@ -205,7 +213,10 @@ public sealed class IoUringTransportOptions
             if (BufferRingSize != 0)
                 return BufferRingSize;
 
-            long wanted = Math.Clamp((long)MaxConnections, AutoBufferRingMin, AutoBufferRingMax);
+            long wanted = Math.Clamp(
+                (long)(BufferRingConnectionShare ?? MaxConnections),
+                AutoBufferRingMin,
+                AutoBufferRingMax);
             int size = AutoBufferRingMin;
             while (size < wanted)
                 size <<= 1;

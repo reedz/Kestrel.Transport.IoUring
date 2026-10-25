@@ -164,8 +164,8 @@ Listener_LifecycleFocused.cfg|pass|focused safety|pass|TypeOK, SlotPartition, Fd
 Listener_RecvFocused.cfg|pass|focused safety|pass|TypeOK, SlotPartition, FixedFileSafety, RecvTokenOrder, FdAccounting|200
 Listener_RecvResubmitFocused.cfg|pass|focused liveness|pass|EventuallyRecvResubmitDrainRearms|2
 Listener_SendFocused.cfg|pass|focused safety|pass|TypeOK, SlotPartition, SendTokenOrder, SendPinSafety, FdAccounting|5000
-MultiListener_CorrectedSafety.cfg|pass|exhaustive safety|pass|TypeOK, OwnershipPartition, BoundedChannels, WorkerCapacityBound, TotalCapacityExact, RemainderAllocation, MergedCapacityWithinSourceBound, UniqueForwardHistory, ClosedRefsTerminal, DroppedRefsSeparate, DroppedRefsNeverMerged, UnboundHasNoLiveConnections, DisposedQuiescesListenerLocations, DisposedHasNoDroppedRefs|20000
-MultiListener_CurrentSourceSafety.cfg|pass|exhaustive safety|pass|TypeOK, OwnershipPartition, BoundedChannels, WorkerCapacityBound, TotalCapacityExact, RemainderAllocation, MergedCapacityWithinSourceBound, UniqueForwardHistory, ClosedRefsTerminal, DroppedRefsSeparate, DroppedRefsNeverMerged, UnboundHasNoLiveConnections|50000
+MultiListener_CorrectedSafety.cfg|pass|exhaustive safety|pass|TypeOK, OwnershipPartition, BoundedChannels, SharedAdmissionBound, TotalCapacityExact, RemainderAllocation, MergedCapacityWithinSourceBound, UniqueForwardHistory, ClosedRefsTerminal, DroppedRefsSeparate, DroppedRefsNeverMerged, UnboundHasNoLiveConnections, DisposedQuiescesListenerLocations, DisposedHasNoDroppedRefs|20000
+MultiListener_CurrentSourceSafety.cfg|pass|exhaustive safety|pass|TypeOK, OwnershipPartition, BoundedChannels, SharedAdmissionBound, TotalCapacityExact, RemainderAllocation, MergedCapacityWithinSourceBound, UniqueForwardHistory, ClosedRefsTerminal, DroppedRefsSeparate, DroppedRefsNeverMerged, UnboundHasNoLiveConnections|50000
 # MultiListener shutdown-drain twins: the focused body must execute the real
 # WorkerAbortQueuedHead and ForwardCancelTransit actions under both flags; only
 # FixDrainOnUnbind flips whether shutdown preserves/disposes or consumes/drops

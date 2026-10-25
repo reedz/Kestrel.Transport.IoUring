@@ -34,6 +34,19 @@ public class BufferRingSizingTests
     }
 
     [Fact]
+    public void MultiRingWorker_SizesBuffersForItsShare_NotForTheWholeLimit()
+    {
+        // Admission is shared, so each worker's tables cover the whole limit, but its buffers (and the retry budget
+        // and ENOBUFS thresholds derived from them) follow the share it is expected to serve.
+        var worker = IoUringMultiListener.CreateWorkerOptions(
+            new IoUringTransportOptions { MaxConnections = 4096, ThreadCount = 4 },
+            connectionShare: 1024);
+
+        worker.MaxConnections.Should().Be(4096);
+        worker.EffectiveBufferRingSize.Should().Be(1024);
+    }
+
+    [Fact]
     public void Auto_NeverExceedsManagedArrayLimit()
     {
         var options = new IoUringTransportOptions { MaxConnections = 16384, ReceiveBufferSize = 1 << 20 };
