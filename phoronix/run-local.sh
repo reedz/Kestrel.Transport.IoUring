@@ -118,9 +118,11 @@ cleanup_server() {
 echo "Results: $NAME (stored under ${CFG_USER_PATH}test-results/, not uploaded)"
 echo "Options: $PRESET_OPTIONS_VALUES; $RUNS run(s)"
 
-"$PTS_BIN" batch-benchmark "local/$OPT" &
+# PTS runs in its own process group so an interrupt can take down the whole tree (PTS's sh wrapper, php, the
+# measured wrapper and wrk), not just the wrapper. The benchmark server has its own session and is stopped by PID.
+setsid "$PTS_BIN" batch-benchmark "local/$OPT" &
 PTS_PID=$!
-trap 'kill -TERM "$PTS_PID" 2>/dev/null' INT TERM
+trap 'kill -TERM -- "-$PTS_PID" 2>/dev/null' INT TERM
 while true; do
     wait "$PTS_PID"
     PTS_RC=$?

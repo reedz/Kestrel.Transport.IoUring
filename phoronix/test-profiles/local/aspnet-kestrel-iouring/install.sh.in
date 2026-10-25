@@ -84,7 +84,7 @@ publish() {
     local rt="$1"
     echo "Publishing PtsServer for .NET $rt (offline)"
     DOTNET_ROOT="$HOME/dotnet$rt" "$HOME/dotnet$rt/dotnet" publish "$PROJECT" -c Release \
-        --source "$HOME/nuget-offline" -p:NuGetAudit=false \
+        --source "$HOME/nuget-offline" -p:NuGetAudit=false -p:UseSharedCompilation=false \
         -p:PtsTargetFramework="net$rt.0" -p:PtsLibraryTfm=net10.0 -o "publish/net$rt" \
         > "publish-net$rt.log" 2>&1 || { tail -n 30 "publish-net$rt.log"; fail "dotnet publish for net$rt failed"; }
     [ -f "publish/net$rt/PtsServer.dll" ] || fail "publish/net$rt/PtsServer.dll missing"
@@ -93,6 +93,11 @@ publish() {
 rm -rf publish
 publish 10
 [ "${PTS_SKIP_NET11:-0}" = "1" ] || publish 11
+
+# Build servers (MSBuild, Razor, Roslyn) outlive the build and would compete with the benchmark for CPU.
+for rt in 10 11; do
+    [ -x "$HOME/dotnet$rt/dotnet" ] && DOTNET_ROOT="$HOME/dotnet$rt" "$HOME/dotnet$rt/dotnet" build-server shutdown > /dev/null 2>&1
+done
 
 # 6. Run wrapper (PTS runs ./aspnet-kestrel-iouring <options> for every repetition).
 cat > aspnet-kestrel-iouring <<'EOF' || fail "cannot write the run wrapper"

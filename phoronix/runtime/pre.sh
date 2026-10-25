@@ -67,7 +67,8 @@ for _ in $(seq 1 80); do
     kill -0 "$LAUNCH_PID" 2>/dev/null || break
     sleep 0.5
 done
-grep -q "PTS_SERVER_READY" "$PTS_SERVER_LOG" || fail "server did not become ready (see its log above)"
+grep -q "PTS_SERVER_READY" "$PTS_SERVER_LOG" \
+    || fail "server did not become ready: $(grep -m1 -E 'Exception|Unhandled|Requested transport|must be' "$PTS_SERVER_LOG" 2>/dev/null | cut -c1-220)"
 
 READY_LINE="$(grep "PTS_SERVER_READY" "$PTS_SERVER_LOG" | head -1)"
 PID="$(echo "$READY_LINE" | sed -n 's/.*"pid":\([0-9]*\).*/\1/p')"

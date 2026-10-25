@@ -8,6 +8,7 @@
 
 PTS_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PTS_HOME="${PTS_HOME:-$HOME}"
+PTS_HOME="${PTS_HOME%/}"   # PTS exports $HOME with a trailing slash; normalised so paths compare equal everywhere
 PTS_PORT="${PTS_KESTREL_PORT:-18099}"
 PTS_SERVER_PID_FILE="${PTS_HOME}/server.pid"
 PTS_SERVER_LOG="${PTS_HOME}/server.log"
@@ -125,7 +126,7 @@ server_alive() {
     pid="$(server_pid)" || return 1
     read -r _ recorded_start < "$PTS_SERVER_PID_FILE" || return 1
     [ -n "$recorded_start" ] && [ "$(proc_starttime "$pid")" = "$recorded_start" ] || return 1
-    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "${PTS_HOME}/publish/net1[01]/PtsServer.dll"
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "/publish/net1[01]/PtsServer.dll"
 }
 
 # Number of io_uring instances open in the server process, read from /proc (independent of the server's own report).
