@@ -173,14 +173,25 @@ if [ -s "$INSTALLED/invalid-runs.log" ]; then
     STATUS=1
 fi
 
-# Process exit codes and the invalid-runs log are not enough on their own: PTS can drop configurations without
-# any hook running. Count what was actually stored.
-RESULTS_FOUND=0
-if [ -f "$RESULT_DIR/composite.xml" ]; then
-    RESULTS_FOUND="$(php -r '$d = new DOMDocument(); echo @$d->load($argv[1]) ? $d->getElementsByTagName("Result")->length : -1;' "$RESULT_DIR/composite.xml")"
-fi
-if [ "$RESULTS_FOUND" != "$EXPECTED_RESULTS" ]; then
-    echo "run-local: expected $EXPECTED_RESULTS stored result(s) but found $RESULTS_FOUND" >&2
+# Process exit codes and the invalid-runs log are not enough on their own: PTS drops failed repetitions from the
+# average without saying so, records an empty stub for a failed configuration, and can skip configurations without
+# running any hook. So count what was actually stored: every configuration must hold exactly --runs valid numbers.
+COVERAGE="$(php -r '
+    $d = new DOMDocument();
+    if (!file_exists($argv[1]) || !@$d->load($argv[1])) { echo "0\n"; exit; }
+    $runs = (int) $argv[2]; $good = 0; $bad = [];
+    foreach ($d->getElementsByTagName("Result") as $r) {
+        $text = function ($tag) use ($r) { $n = $r->getElementsByTagName($tag); return $n->length ? trim($n->item(0)->nodeValue) : ""; };
+        $positive = fn($v) => is_numeric(trim($v)) && (float) $v > 0;
+        $values = array_values(array_filter(explode(":", $text("RawString")), $positive));
+        if (!$values && $positive($text("Value"))) { $values = [$text("Value")]; }
+        if (count($values) === $runs) { $good++; } else { $bad[] = $text("Description") . ": " . count($values) . " of $runs valid repetitions stored"; }
+    }
+    echo $good, "\n", implode("\n", $bad), "\n";' "$RESULT_DIR/composite.xml" "$RUNS")"
+RESULTS_GOOD="$(head -n 1 <<< "$COVERAGE")"
+if [ "$RESULTS_GOOD" != "$EXPECTED_RESULTS" ]; then
+    echo "run-local: $RESULTS_GOOD of $EXPECTED_RESULTS configuration(s) hold $RUNS valid repetition(s):" >&2
+    tail -n +2 <<< "$COVERAGE" | sed '/^$/d; s/^/  /' >&2
     STATUS=1
 fi
 exit "$STATUS"

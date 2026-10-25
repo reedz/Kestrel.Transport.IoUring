@@ -62,7 +62,7 @@ use `services.AddIoUringTransport(...)`.
 | `ReceiveBufferSize` | 2048 | Bytes per receive buffer. |
 | `MaxConnections` | 16384 | Aggregate simultaneous connection limit. |
 | `AcceptQueueCapacity` | 1024 | Accepted connections waiting for Kestrel. |
-| `ThreadCount` | 1 | Rings/listener threads using `SO_REUSEPORT`. |
+| `ThreadCount` | 1 | Rings/listener threads. More than 1 uses `SO_REUSEPORT`, so another process doing the same can bind the same port without an error and share the traffic; the default single-ring listener does not (a second instance fails with Kestrel's "address already in use"). |
 | `EnableMultishotAccept` | `true` | Multishot accept with kernel fallback. |
 | `EnableBufferRing` | `true` | Provided-buffer multishot receive. |
 | `EnableRegisteredFiles` | `false` | Fixed-file table; adds synchronous updates on connection churn. |

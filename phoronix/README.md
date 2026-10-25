@@ -13,7 +13,7 @@ their limits, and [Publishing](#publishing-not-done) for what publishing would i
 |---|---|
 | `transport` | `iouring`, `sockets` |
 | `workload` | `test.html` (118 KB static file, the nginx/apache profiles' file), `plaintext` (13 bytes), `json` (serialized per request) |
-| `connections` | `1` `20` `100` `200` `500` `1000` `4000` (any positive integer works with `run-local.sh`) |
+| `connections` | `1` `20` `100` `200` `500` `1000` `4000` (any integer from 1 to 999999 works with `run-local.sh`) |
 | `runtime` | `net10` (10.0.402), `net11` (11.0.100-rc.2.26504.105) |
 | `rings` | `1`, `auto` (one io_uring ring/event-loop thread per CPU core). Ignored by `sockets` |
 | `duration` | seconds per `wrk` run: `90` (default), `30`, `10` (smoke test). Recorded in the result identity |
@@ -26,10 +26,12 @@ Guards that make a run fail instead of producing a misleading number:
   requires at least one, sockets requires zero. The server itself refuses to start as io_uring when it cannot
   serve with a ring (`RequireIoUring`), so a silent fallback to sockets (for example under Docker's default
   seccomp profile) produces no result.
-* **Endpoint ownership.** The port must be free before the server starts, the server binds `127.0.0.1` only, and
-  before and after every measurement the profile asks `/__transport` and requires the answering process to be the
-  one it started, with the requested runtime and transport. (A same-user io_uring server could otherwise share the
-  port through `SO_REUSEPORT` and contribute responses.)
+* **Endpoint ownership (sampled).** The port must be free before the server starts, the server binds `127.0.0.1`
+  only, and before and after every measurement the profile asks `/__transport` and requires the answering process
+  to be the one it started, with the requested runtime and transport. These are samples, not exclusivity: another
+  same-user listener that joins afterwards through `SO_REUSEPORT` (multi-ring io_uring, or any server that sets it)
+  is not excluded. `run-local.sh --no-egress` runs in a private network namespace, where nothing else can bind
+  the port, and is the way to get exclusivity.
 * **Workload sanity.** One request must return HTTP 200 with the expected size (118047 bytes for `test.html`, 13
   for `plaintext`, `application/json` for `json`) before warm-up.
 * **Valid runs only.** A repetition fails on any `wrk` socket error or HTTP error response (`wrk` counts status
@@ -38,9 +40,13 @@ Guards that make a run fail instead of producing a misleading number:
 * **`wrk` thread rule.** `wrk` rejects fewer connections than threads and divides connections evenly across
   threads, so `-t` is the largest divisor of the connection count that is at most `min(cores, connections)`.
   (The nginx profile's `-t $NUM_CPU_CORES` makes `-c 1` fail on multi-core machines.)
-* **Invalid runs are never silent.** PTS averages whatever repetitions survive and does not say how many were
-  dropped, so every invalid repetition and every configuration whose setup failed is appended to
-  `invalid-runs.log`; `run-local.sh` prints it and **exits non-zero** if it is not empty.
+* **Invalid runs are never silent.** PTS averages whatever repetitions survive, records an empty stub for a failed
+  configuration, and does not say how many repetitions were dropped. Every invalid repetition and every
+  configuration whose setup failed is therefore appended to `invalid-runs.log`, and the hooks fail closed: the
+  setup hook latches "not completed" before doing anything, and each repetition starts with a failed status that
+  only its last line clears, so a hook killed halfway cannot leave a passing number. After PTS finishes,
+  `run-local.sh` prints the log and **exits non-zero** if it is not empty, if PTS failed, or if any requested
+  configuration does not hold exactly `--runs` valid numbers in the stored result.
 * **Cleanup by PID.** The server is stopped by its recorded PID and process start time (so a recycled PID is never
   signalled), never by name. `run-local.sh` also stops it when interrupted.
 * The result footnote records the actual transport, ring count, runtime build, kernel, open-file limit, `wrk`
@@ -80,8 +86,13 @@ phoronix-test-suite result-file-to-text kestrel-a-b       # stored in ~/.phoroni
 
 After every code change: commit, `make-bundle.sh`, `setup-local-pts.sh`, `force-install`. Use `force-install`:
 PTS keeps a download that already exists in an install directory without re-hashing it, which once silently
-installed stale code. The bundle name therefore carries the commit, and `install.sh` verifies its SHA-256 and
-records the commit it installed (`run-local.sh` warns when the installed commit differs from the last bundle).
+installed stale code. The bundle name therefore carries the commit, and `install.sh` verifies the SHA-256 of the
+source bundle **and of every third-party archive** (digests generated from `downloads.xml.in`) and records the
+commit it installed (`run-local.sh` warns when the installed commit differs from the last bundle). `run-local.sh`
+itself calls `batch-run`, never `batch-benchmark`: the latter always invokes PTS's installer first, which can
+reinstall (and run `apt`) in the middle of a measurement. It also refuses a `--name` that already exists: PTS
+silently skips configurations already stored under a name, before any hook runs, so a failed rerun would otherwise
+show the old numbers.
 
 `run-local.sh` takes every option by **value** and validates it. Do not drive the profile with PTS's own
 `PRESET_OPTIONS`: it matches menu *positions* first (so `connections=1` selects the second entry, `20`; `rings=1`
@@ -95,8 +106,11 @@ values it does not know. Results show raw values (`iouring`, `net10`) for that r
 |---|---|
 | `PTS_WARMUP` | warm-up seconds before the first run of a configuration (default 8; shown in the footnote) |
 | `PTS_KESTREL_PORT` | server port (default 18099; must be free) |
-| `PTS_SKIP_NET11=1` | at install time, skip the .NET 11 SDK and publish |
 | `IOURING_FORCE_FALLBACK=1` | test hook: forces the "io_uring unavailable" path; the io_uring configurations must then fail while sockets ones still run |
+
+`run-local.sh` refuses to run while PTS control variables that move files, load code, add shell prefixes or change
+which repetitions count are set (for example `PTS_TEST_INSTALL_ROOT_PATH`, `PTS_DOWNLOAD_CACHE`, `TEST_EXEC_PREPEND`,
+`SKIP_TESTS*`, `TOTAL_LOOP_*`); the list is in `runtime/check-pts-config.php`.
 
 ## Not uploading: what is and is not guaranteed
 
@@ -109,38 +123,61 @@ Done by the profile and its scripts:
 * The build is offline: `SourceLink` is not part of the PTS build, the `net10.0` reference packs that SDK 11 needs
   are linked from SDK 10 (which ships the same version), and `dotnet publish` restores from an empty local source
   with `NuGetAudit` off, so any attempt to reach nuget.org fails loudly instead of succeeding.
-* **The configuration is checked as PTS will read it**, not by grepping: `runtime/check-pts-config.php` parses
-  `user-config.xml` as XML, chooses the file the way PTS does (`PTS_USER_PATH_OVERRIDE` is appended literally
-  without a slash, otherwise the POSIX account's home, not `$HOME`), and requires every privacy key to appear
-  exactly once with the exact value. This matters because PTS silently falls back to defaults that **enable**
-  uploads when it cannot parse the file; a double hyphen inside an XML comment (`<!-- ... --offline ... -->`) is
-  malformed XML and triggered exactly that during development. Plain, well-formed comments are fine.
-* `run-local.sh` and every `pre.sh` refuse to proceed unless that check passes. `run-local.sh` additionally sets
+* **The configuration is checked as PTS will read it**, not by grepping: `runtime/check-pts-config.php` chooses the
+  file the way PTS does (`PTS_USER_PATH_OVERRIDE` is appended literally without a slash and must be absolute,
+  otherwise the POSIX account's home, not `$HOME`) and reads each value with the same traversal as PTS's own
+  `getXMLValue` (first matching descendant, exactly one leaf), so a shadowing `<Options>` or a duplicated leaf that
+  makes PTS ignore the real values is caught. It requires the four upload/usage keys `FALSE`,
+  `NoNetworkCommunication=TRUE`, `NoInternetCommunication=FALSE` (PTS tests the latter first, with an `else if`, so
+  `TRUE` there would leave network helpers enabled), empty `AutoLoadModules` and the standard directories. This
+  matters because PTS silently falls back to defaults that **enable** uploads whenever it cannot read a value; a
+  double hyphen inside an XML comment (`<!-- ... --offline ... -->`) is malformed XML and triggered exactly that
+  during development. Plain, well-formed comments are fine.
+* `run-local.sh` and every `pre.sh` refuse to proceed unless that check passes (the setup hook runs under the
+  environment PTS gives it, so a variable set only for the hook is checked too). `run-local.sh` additionally sets
   `PTS_IGNORE_MODULES=1` (modules such as Pushover or e-mail export use direct cURL/SMTP regardless of
-  `NoNetworkCommunication`), refuses to run a profile that is not installed (so `batch-benchmark` cannot start an
-  install on its own), and only ever calls `batch-benchmark`. Nothing in this directory calls `upload-result` or
-  `upload-test-profile`.
+  `NoNetworkCommunication`), refuses to run a profile that is not installed, and only ever calls `batch-run`.
+  Nothing in this directory calls `upload-result` or `upload-test-profile`.
+* The profile's own scripts make no requests except to `127.0.0.1`, and those `curl` calls ignore `~/.curlrc` and
+  proxy variables.
 
-Not guaranteed (these are PTS settings, not an OS sandbox):
+Not guaranteed (these are PTS settings and ordinary processes, not an OS sandbox):
 
-* PTS's own dependency installation (`apt`) and the profile's shell scripts are ordinary processes; the profile's
-  scripts make no requests except to `127.0.0.1`.
-* For a guarantee that does not depend on any setting, run the measured phase with only loopback available:
+* **PTS has network paths that `NoNetworkCommunication` does not gate.** Examples verified in its source: on
+  Google Compute Engine, hardware detection requests the metadata server directly; PTS modules (also when selected
+  through the environment by a bare `phoronix-test-suite` command rather than by `run-local.sh`) can use raw cURL or
+  mail; its dependency installer runs `apt`/`apt-file`, which have their own network access; a remote
+  `PTS_DOWNLOAD_CACHE` is fetched without that check (refused here). Only the first of these concerns a standard
+  setup, and `run-local.sh` only issues `batch-run`, so a standard run does not reach them. The .NET SDK's own
+  network behaviour is switched off (telemetry, workload update notices, offline restore) but that is not a proof of
+  silence either.
+* PTS's raw option strings are interpreted by a shell before this profile can validate them; `run-local.sh`
+  validates its inputs, but a hand-written `PRESET_OPTIONS`/`TEST_EXEC_PREPEND` is trusted input, which is why
+  `run-local.sh` refuses to run with such variables set.
+* **A guarantee about IP traffic that does not depend on any setting** is to run with only loopback available:
 
   ```bash
   phoronix/run-local.sh --no-egress --duration 10 --runs 1 --connections 100     # uses sudo + unshare -n
   ```
 
-  This was tested: the host reached the internet, the namespace did not, and the full matrix (including the
-  install, run the same way with `unshare -n`) completed.
+  `--no-egress` creates a fresh network namespace every time (it does not trust an inherited marker), verifies it has
+  only the loopback interface, drops back to your user inside it and forwards only an allowlist of `PTS_WARMUP`,
+  `PTS_KESTREL_PORT`, `PTS_USER_PATH_OVERRIDE`, `IOURING_*` and `DOTNET_*` variables (echoed, because `sudo` would
+  otherwise silently drop them). This was tested: the host reached the internet, the namespace did not, and both the
+  install (run with `unshare -n`) and measured matrices completed. A network namespace isolates IP networking only;
+  it does not confine the filesystem or host IPC such as Unix sockets.
+* The scripts write under `~/.phoronix-test-suite` and, for `make-bundle.sh`, under `phoronix/dist` and a temporary
+  directory; PTS itself also writes temporary lock files outside its directory.
 
 ## Methodology notes and caveats
 
 * The development machine had 2 vCPUs, shared by `wrk`, the server and the harness. It validates correctness
   and the PTS plumbing, **not** multi-ring scaling or absolute numbers. Run the real comparison on a machine with at
   least 8 cores; give `wrk` and the server separate CPU sets if you can (`taskset`).
-* The full default matrix is 2 transports x 3 workloads x 7 connection counts x 2 runtimes x 2 ring settings =
-  168 configurations of 3 x 90 s plus warm-up, roughly 14 hours of load. Pick subsets with `run-local.sh`.
+* The full matrix is 2 transports x 3 workloads x 7 connection counts x 2 runtimes x 2 ring settings = 168
+  configurations of 3 x 90 s plus warm-up (the 90 s duration; it is also an option), roughly 14 hours of load.
+  `run-local.sh` without list options runs only 2 (both transports, Plaintext, 100 connections); pick subsets with it.
+  `sockets` ignores `rings`, so those configurations are duplicates under both ring settings.
 * Compare like with like: the same runtime, and `rings` set explicitly for io_uring. Sockets ignores `rings`.
 * .NET 11 is a release candidate (RC2). Stock .NET 11 has no io_uring in its socket layer; see
   [`docs/DOTNET11.md`](../docs/DOTNET11.md). The library's `net10.0` asset is what a .NET 11 app consumes.
