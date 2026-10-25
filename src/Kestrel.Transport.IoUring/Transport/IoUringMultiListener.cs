@@ -28,6 +28,9 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
     private Task? _disposeTask;
     private int _acceptsClosedToApp;
     private int _mergedWriterCompleted;
+    // Forwarders still running. When the last one ends on its own (every worker stopped accepting, e.g. their IO
+    // loops failed) no connection can arrive any more, so the merged channel completes and AcceptAsync returns.
+    private int _activeForwarders;
 
     private readonly record struct WorkerBuild(WorkerSet WorkerSet, int MergedCapacity);
     private readonly record struct WorkerSet(EndPoint EndPoint, IMultiListenerWorker[] Workers);
@@ -71,6 +74,9 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         _workers = workers;
         _mergedChannel = CreateMergedChannel(mergedCapacity);
         _forwardTasks = new Task[workers.Length];
+        _activeForwarders = workers.Length;
+        if (workers.Length == 0)
+            CompleteMergedWriter();
 
         for (int i = 0; i < workers.Length; i++)
             _forwardTasks[i] = ForwardAcceptsAsync(workers[i]);
@@ -111,20 +117,7 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
                 SingleWriter = false,
             });
 
-    private static uint GetSetupFlags(IoUringTransportOptions options)
-    {
-        uint setupFlags = 0;
-        if (options.EnableSqPoll)
-            setupFlags |= IoUringConstants.IORING_SETUP_SQPOLL;
-        if (options.EnableCoopTaskRun)
-            setupFlags |= IoUringConstants.IORING_SETUP_COOP_TASKRUN;
-        if (options.EnableSingleIssuer)
-            setupFlags |= IoUringConstants.IORING_SETUP_SINGLE_ISSUER;
-        if (options.EnableDeferTaskRun && options.EnableSingleIssuer)
-            setupFlags |= IoUringConstants.IORING_SETUP_DEFER_TASKRUN;
-
-        return setupFlags;
-    }
+    private static uint GetSetupFlags(IoUringTransportOptions options) => options.SetupFlags;
 
     private static WorkerBuild CreateWorkerBuild(
         EndPoint endPoint,
@@ -234,6 +227,8 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         }
         finally
         {
+            if (Interlocked.Decrement(ref _activeForwarders) == 0)
+                CompleteMergedWriter();
             ThrowCapturedFailures(failures);
         }
     }

@@ -7,9 +7,9 @@ namespace Kestrel.Transport.IoUring.Transport;
 /// </summary>
 internal sealed class ListenerSendRetryState
 {
-    internal readonly struct SendRetryConnectionState(ushort generation)
+    internal readonly struct SendRetryConnectionState(long generation)
     {
-        internal ushort Generation { get; } = generation;
+        internal long Generation { get; } = generation;
     }
 
     internal interface ISendRetryResumePassAdapter<TSelf>
@@ -26,8 +26,10 @@ internal sealed class ListenerSendRetryState
             in SendRetryConnectionState connectionState);
     }
 
-    private readonly HashSet<(long ConnectionId, ushort Generation)> _sendRetrySet = [];
-    private readonly List<(long ConnectionId, ushort Generation)> _sendRetryScratch = [];
+    // Keyed by slot and the occupant's 64-bit generation, so a retry queued by an earlier occupant can never resume
+    // a later one (see IoUringConnection.Generation).
+    private readonly HashSet<(long ConnectionId, long Generation)> _sendRetrySet = [];
+    private readonly List<(long ConnectionId, long Generation)> _sendRetryScratch = [];
     private readonly Action _wakeIoLoop;
 
     internal ListenerSendRetryState(Action wakeIoLoop)
@@ -37,10 +39,10 @@ internal sealed class ListenerSendRetryState
 
     internal int SendRetryCount => _sendRetrySet.Count;
 
-    internal bool ContainsSendRetry(long connectionId, ushort generation) =>
+    internal bool ContainsSendRetry(long connectionId, long generation) =>
         _sendRetrySet.Contains((connectionId, generation));
 
-    internal void RequestSendRetry(long connectionId, ushort generation)
+    internal void RequestSendRetry(long connectionId, long generation)
     {
         _sendRetrySet.Add((connectionId, generation));
         _wakeIoLoop();
@@ -73,7 +75,7 @@ internal sealed class ListenerSendRetryState
     private static void ProcessSendRetry<TAdapter>(
         ref TAdapter adapter,
         long connectionId,
-        ushort generation)
+        long generation)
         where TAdapter : struct, ISendRetryResumePassAdapter<TAdapter>
     {
         if (!TAdapter.TryGetConnectionState(ref adapter, connectionId, out var connectionState))

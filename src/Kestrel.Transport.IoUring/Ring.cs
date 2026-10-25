@@ -325,14 +325,49 @@ public sealed class Ring : IDisposable
     }
 
     /// <summary>
-    /// Unregisters an fd from its slot (sets to -1).
+    /// Unregisters an fd from its slot (sets to -1). On failure the kernel still holds a reference to the file, so
+    /// the slot is not reused: it is remembered for <see cref="RetryFailedUnregisters"/> instead.
     /// </summary>
-    internal unsafe bool UnregisterFd(int slot)
+    internal bool UnregisterFd(int slot)
     {
         if (_registeredFiles == null || slot < 0 || slot >= _registeredFiles.Length)
             return false;
         if (_registeredFiles[slot] == -1)
             return true;
+
+        if (TryRemoveRegisteredFile(slot))
+            return true;
+
+        if (!_failedUnregisters.Contains(slot))
+            _failedUnregisters.Add(slot);
+        return false;
+    }
+
+    // Fixed-file slots whose removal failed (owner thread only).
+    private readonly List<int> _failedUnregisters = [];
+
+    /// <summary>Fixed-file slots still registered because their removal failed.</summary>
+    internal int FailedUnregisterCount => _failedUnregisters.Count;
+
+    // Test seam: while it returns true, removing a registered file fails as if FILES_UPDATE had.
+    internal Func<bool>? UnregisterFailureInjector { get; set; }
+
+    /// <summary>Retries removing the slots whose unregister failed. Returns how many are still registered.</summary>
+    internal int RetryFailedUnregisters()
+    {
+        for (int i = _failedUnregisters.Count - 1; i >= 0; i--)
+        {
+            if (TryRemoveRegisteredFile(_failedUnregisters[i]))
+                _failedUnregisters.RemoveAt(i);
+        }
+
+        return _failedUnregisters.Count;
+    }
+
+    private unsafe bool TryRemoveRegisteredFile(int slot)
+    {
+        if (UnregisterFailureInjector?.Invoke() == true)
+            return false;
 
         int emptyFd = -1;
         var update = new IoUringFilesUpdate
@@ -345,12 +380,71 @@ public sealed class Ring : IDisposable
         if (ret < 0)
             return false;
 
-        _registeredFiles[slot] = -1;
+        _registeredFiles![slot] = -1;
         _freeFileSlots.Push(slot);
         return true;
     }
 
-    internal unsafe bool TryGetSqe(out IoUringSqe* sqe) => _sq.TryGetSqe(out sqe);
+    internal unsafe bool TryGetSqe(out IoUringSqe* sqe)
+    {
+        if (_submissionsSealed || !_sq.TryGetSqe(out sqe))
+        {
+            sqe = null;
+            return false;
+        }
+
+        _acquiredSqes++;
+        return true;
+    }
+
+    // Operation ledger. Every SQE handed out is submitted eventually (Flush publishes it, and the kernel posts a
+    // completion even for one it rejects), and every request ends with exactly one completion that has
+    // IORING_CQE_F_MORE clear. Their difference is the number of requests the kernel may still be working on,
+    // and therefore whether it may still read or write memory they reference. Closing the ring fd does not end
+    // them synchronously: the kernel cancels them asynchronously after close() returns. Owner thread only.
+    private long _acquiredSqes;
+    private long _terminalCompletions;
+    private bool _submissionsSealed;
+
+    /// <summary>Submitted requests that have not yet posted their final completion.</summary>
+    /// <remarks>A ring that was never enabled cannot have handed anything to the kernel.</remarks>
+    internal long OutstandingOperations => IsDisabled ? 0 : _acquiredSqes - _terminalCompletions;
+
+    /// <summary>
+    /// Stops handing out SQEs (<see cref="TryGetSqe"/> reports a full queue from now on). Used once teardown has
+    /// established that the kernel holds nothing, so that no late caller can start a new request on memory that
+    /// is about to be released.
+    /// </summary>
+    internal void SealSubmissions() => _submissionsSealed = true;
+
+    internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
+    private int _enabled;
+
+    /// <summary>
+    /// True while a ring created with IORING_SETUP_R_DISABLED has not been enabled: the kernel rejects
+    /// io_uring_enter (EBADFD), so SQEs can be prepared but nothing is submitted.
+    /// </summary>
+    internal bool IsDisabled =>
+        (SetupFlags & IoUringConstants.IORING_SETUP_R_DISABLED) != 0 && Volatile.Read(ref _enabled) == 0;
+
+    /// <summary>
+    /// Enables a ring created with IORING_SETUP_R_DISABLED. With IORING_SETUP_SINGLE_ISSUER the calling thread
+    /// becomes the only thread allowed to submit to the ring (and, on newer kernels, to register with it).
+    /// </summary>
+    internal void EnableRings()
+    {
+        if (!IsDisabled)
+            return;
+
+        if (IoUringNative.IoUringRegister(_ringFd, IoUringConstants.IORING_REGISTER_ENABLE_RINGS, 0, 0) < 0)
+        {
+            throw new InvalidOperationException(
+                $"IORING_REGISTER_ENABLE_RINGS failed with errno {Marshal.GetLastPInvokeError()}");
+        }
+
+        Volatile.Write(ref _enabled, 1);
+    }
 
     /// <summary>The io_uring file descriptor — needed for buffer ring registration.</summary>
     internal int Fd => _ringFd;
@@ -450,9 +544,10 @@ public sealed class Ring : IDisposable
                 return 0;
             if (err == IoUringConstants.EEXIST)
             {
-                Thread.Yield();
-                toSubmit = GetRetryBudget();
-                continue;
+                // SINGLE_ISSUER: this thread is not the ring's issuer. That is a programming error, not a transient
+                // condition; retrying would spin forever.
+                throw new InvalidOperationException(
+                    "io_uring_enter failed with EEXIST: the calling thread is not the ring's single issuer.");
             }
             throw new InvalidOperationException($"io_uring_enter failed with errno {err}");
         }
@@ -512,7 +607,11 @@ public sealed class Ring : IDisposable
     internal bool TryPeekCompletion(out IoUringCqe cqe) => _cq.TryPeekCompletion(out cqe);
 
     /// <summary>Advances the completion queue head past the last peeked entry.</summary>
-    public void AdvanceCompletion() => _cq.AdvanceHead();
+    public void AdvanceCompletion()
+    {
+        if (_cq.AdvanceHead())
+            _terminalCompletions++;
+    }
 
     /// <summary>Gets the number of completion queue entries ready to be consumed.</summary>
     public uint AvailableCompletions => _cq.Available;

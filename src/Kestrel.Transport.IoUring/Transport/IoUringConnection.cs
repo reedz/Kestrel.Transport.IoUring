@@ -52,14 +52,21 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     private int _disposed;
     private readonly TaskCompletionSource _finalized = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    /// <summary>Generation counter — incremented on each connection using this slot.
-    /// Encoded into UserData to detect stale CQEs from previous connections.</summary>
-    internal ushort Generation { get; set; }
+    /// <summary>
+    /// Generation of this slot's occupant: incremented each time the slot is reused. It is 64-bit and never wraps,
+    /// so the listener's control queues (close, receive resubmit, send retry, cancel retry) use it to reject a
+    /// request left over from an earlier occupant. Only its low 16 bits fit in a completion's user_data
+    /// (<see cref="WireGeneration"/>); that is safe because a slot is reused only after every request of the
+    /// previous occupant has completed (TryFinalizeClose), so no completion can arrive for a stale occupant.
+    /// </summary>
+    internal long Generation { get; set; }
+
+    private ushort WireGeneration => (ushort)Generation;
 
     // Callback to request a RECV resubmission from the IO loop after async flush completes.
-    private Action<long, ushort>? _requestRecvResubmit;
-    private Action<long, ushort>? _requestSendRetry;
-    private Action<long, ushort, ConnectionAbortedException?>? _requestClose;
+    private Action<long, long>? _requestRecvResubmit;
+    private Action<long, long>? _requestSendRetry;
+    private Action<long, long, ConnectionAbortedException?>? _requestClose;
     private TaskCompletionSource? _sendRetryCompletion;
     private int _closeRequested;
     private int _abortRequested;
@@ -306,7 +313,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             sqe->Len = (uint)_receiveBufferSize;
             sqe->OpFlags = 0;
             sqe->IoPrio = 0;
-            sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Recv);
+            sqe->UserData = EncodeUserData(_connectionId, WireGeneration, OpType.Recv);
             HasRecvInFlight = true;
             RecvEpoch++;
             return true;
@@ -338,7 +345,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         sqe->IoPrio = (ushort)IoUringConstants.IORING_RECV_MULTISHOT;
         sqe->Flags |= IoUringConstants.IOSQE_BUFFER_SELECT;
         sqe->BufIndexOrGroup = bufferGroupId;
-        sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Recv);
+        sqe->UserData = EncodeUserData(_connectionId, WireGeneration, OpType.Recv);
         HasRecvInFlight = true;
         RecvEpoch++;
         return true;
@@ -351,8 +358,8 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
 
         sqe->Opcode = IoUringConstants.IORING_OP_ASYNC_CANCEL;
         sqe->Fd = -1;
-        sqe->AddrOrSpliceOffIn = EncodeUserData(_connectionId, Generation, OpType.Recv);
-        sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Cancel);
+        sqe->AddrOrSpliceOffIn = EncodeUserData(_connectionId, WireGeneration, OpType.Recv);
+        sqe->UserData = EncodeUserData(_connectionId, WireGeneration, OpType.Cancel);
         RecvCancelPending = true;
         return true;
     }
@@ -652,7 +659,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         sqe->Len = 1;
         sqe->OpFlags = 0;
         sqe->IoPrio = 0;
-        sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Send);
+        sqe->UserData = EncodeUserData(_connectionId, WireGeneration, OpType.Send);
         HasSendInFlight = true;
         return true;
     }
@@ -672,7 +679,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         sqe->Len = (uint)length;
         sqe->OpFlags = 0;
         sqe->IoPrio = 0;
-        sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Send);
+        sqe->UserData = EncodeUserData(_connectionId, WireGeneration, OpType.Send);
         HasSendInFlight = true;
         return true;
     }
@@ -727,9 +734,9 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     /// No drain task thread — the output pipe's readerScheduler routes continuations to the IO loop.
     /// </summary>
     public void InitializeIoCallbacks(
-        Action<long, ushort> requestRecvResubmit,
-        Action<long, ushort> requestSendRetry,
-        Action<long, ushort, ConnectionAbortedException?> requestClose)
+        Action<long, long> requestRecvResubmit,
+        Action<long, long> requestSendRetry,
+        Action<long, long, ConnectionAbortedException?> requestClose)
     {
         _requestRecvResubmit = requestRecvResubmit;
         _requestSendRetry = requestSendRetry;
@@ -850,6 +857,9 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         return new ValueTask(_finalized.Task);
     }
 
+    /// <summary>True once the application has disposed the connection (its final response may still be sending).</summary>
+    internal bool ApplicationDisposed => Volatile.Read(ref _disposed) != 0;
+
     /// <summary>
     /// Signals that the transport has finished with this connection: its socket is reclaimed (or the transport
     /// stopped and can make no further progress). Completes <see cref="DisposeAsync"/>.
@@ -927,6 +937,17 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         try { _outputPipe.Reader.Complete(); } catch (InvalidOperationException) { }
         _pendingRecvData?.Clear();
         _pendingRecvBytes = 0;
+        MarkFinalized();
+    }
+
+    /// <summary>
+    /// Ends the application-facing side of a connection whose ring was quarantined. The output pipe (whose
+    /// segments a send may still reference), the send pins and the receive buffer are deliberately left alone.
+    /// </summary>
+    internal void AbandonAfterFailedTeardown()
+    {
+        try { _inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
+        SignalReceiveClosed();
         MarkFinalized();
     }
 

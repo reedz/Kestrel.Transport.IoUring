@@ -2,6 +2,11 @@ using Kestrel.Transport.IoUring.Native;
 
 namespace Kestrel.Transport.IoUring.Transport;
 
+/// <summary>
+/// Best-effort reclamation of sockets accepted by completions already in the CQ when a listener is quarantined
+/// (its ring could not be drained to idle, see <see cref="IoUringConnectionListener"/>'s teardown). Normal disposal
+/// does not need it: the owning thread consumes every completion until each request has ended.
+/// </summary>
 internal static class ListenerStoppedCompletionDrain
 {
     internal readonly record struct DrainResult(int MaterializationErrno, Exception? Failure);

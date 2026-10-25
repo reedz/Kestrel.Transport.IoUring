@@ -21,7 +21,7 @@ internal sealed class ListenerRecvRetryState
     }
 
     internal readonly struct RecvRetryConnectionState(
-        ushort generation,
+        long generation,
         ulong recvEpoch,
         bool isClosing,
         bool hasRecvInFlight,
@@ -29,7 +29,7 @@ internal sealed class ListenerRecvRetryState
         bool usingBufferRing,
         bool recvRearmPending = false)
     {
-        internal ushort Generation { get; } = generation;
+        internal long Generation { get; } = generation;
         internal ulong RecvEpoch { get; } = recvEpoch;
         internal bool IsClosing { get; } = isClosing;
         internal bool HasRecvInFlight { get; } = hasRecvInFlight;
@@ -38,9 +38,11 @@ internal sealed class ListenerRecvRetryState
         internal bool RecvRearmPending { get; } = recvRearmPending;
     }
 
-    internal readonly struct RecvCancelRetryOrigin(ushort generation, ulong recvEpoch)
+    // The occupant's 64-bit generation plus the receive arm's epoch: the cancel must target the same live receive of
+    // the same occupant (see IoUringConnection.Generation).
+    internal readonly struct RecvCancelRetryOrigin(long generation, ulong recvEpoch)
     {
-        internal ushort Generation { get; } = generation;
+        internal long Generation { get; } = generation;
         internal ulong RecvEpoch { get; } = recvEpoch;
     }
 

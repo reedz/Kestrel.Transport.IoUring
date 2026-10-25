@@ -1,3 +1,5 @@
+using Kestrel.Transport.IoUring.Native;
+
 namespace Kestrel.Transport.IoUring.Transport;
 
 /// <summary>Configuration options for the io_uring transport.</summary>
@@ -59,9 +61,10 @@ public sealed class IoUringTransportOptions
     public bool EnableCoopTaskRun { get; set; } = false;
 
     /// <summary>
-    /// Enable IORING_SETUP_SINGLE_ISSUER (kernel 6.0+). Asserts a single submitter, allowing
-    /// kernel-side optimisations and is required for DEFER_TASKRUN. Defaults to true
-    /// (auto-fallback on older kernels).
+    /// Enable IORING_SETUP_SINGLE_ISSUER (kernel 6.0+). Asserts a single submitter, allowing kernel-side
+    /// optimisations, and is required for DEFER_TASKRUN. The ring is created disabled and enabled by its IO loop
+    /// thread, which makes that thread the issuer. Defaults to <c>false</c>; falls back automatically on older
+    /// kernels (check <see cref="IoUringTransportFactory.Bindings"/> for the flags actually accepted).
     /// </summary>
     public bool EnableSingleIssuer { get; set; } = false;
 
@@ -128,6 +131,29 @@ public sealed class IoUringTransportOptions
     /// accepted them, so queue depth must not scale with <see cref="MaxConnections"/>.
     /// </summary>
     internal int EffectiveRingSize => RingSize;
+
+    /// <summary>
+    /// io_uring_setup flags requested by these options. SINGLE_ISSUER rings are created disabled
+    /// (IORING_SETUP_R_DISABLED) so the IO loop thread, which enables them, becomes the issuer; the constructing
+    /// thread could not submit anything else.
+    /// </summary>
+    internal uint SetupFlags
+    {
+        get
+        {
+            uint flags = 0;
+            if (EnableSqPoll)
+                flags |= IoUringConstants.IORING_SETUP_SQPOLL;
+            if (EnableCoopTaskRun)
+                flags |= IoUringConstants.IORING_SETUP_COOP_TASKRUN;
+            if (EnableSingleIssuer)
+                flags |= IoUringConstants.IORING_SETUP_SINGLE_ISSUER | IoUringConstants.IORING_SETUP_R_DISABLED;
+            // DEFER_TASKRUN requires SINGLE_ISSUER; the kernel will EINVAL otherwise (and Ring will retry).
+            if (EnableDeferTaskRun && EnableSingleIssuer)
+                flags |= IoUringConstants.IORING_SETUP_DEFER_TASKRUN;
+            return flags;
+        }
+    }
 
     internal const int AutoBufferRingMin = 1024;
     internal const int AutoBufferRingMax = 4096;

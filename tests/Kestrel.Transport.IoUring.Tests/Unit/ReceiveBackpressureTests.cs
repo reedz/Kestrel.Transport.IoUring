@@ -19,7 +19,7 @@ public class ReceiveBackpressureTests
     private static IoUringConnection CreateConnection(
         Ring ring,
         List<ConnectionAbortedException?> closeRequests,
-        Action<long, ushort>? requestRecvResubmit = null,
+        Action<long, long>? requestRecvResubmit = null,
         IoUringPipeScheduler? scheduler = null)
     {
         var connection = new IoUringConnection(

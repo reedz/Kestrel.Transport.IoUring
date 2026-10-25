@@ -13,6 +13,8 @@ internal static class ConnectionSocketClose
     {
         static abstract bool UnregisterFixedFile(ref TSelf self, int fileIndex);
 
+        static abstract void ShutdownSocket(ref TSelf self, int socketFd);
+
         static abstract int CloseSocketFd(ref TSelf self, int socketFd);
 
         static abstract void LogFixedFileUnregisterFailure(ref TSelf self, int fileIndex);
@@ -42,9 +44,14 @@ internal static class ConnectionSocketClose
             CaptureFailure(ref failures, ex);
         }
 
+        // Until the unregister succeeds, the ring's fixed-file table holds its own reference to the socket.
+        bool fileStillRegistered = fileIndex >= 0;
         try
         {
-            TryUnregisterFixedFile(fileIndex, ref closeAdapter);
+            if (fileStillRegistered && TCloseAdapter.UnregisterFixedFile(ref closeAdapter, fileIndex))
+                fileStillRegistered = false;
+            else if (fileStillRegistered)
+                TCloseAdapter.LogFixedFileUnregisterFailure(ref closeAdapter, fileIndex);
         }
         catch (Exception ex)
         {
@@ -52,6 +59,20 @@ internal static class ConnectionSocketClose
         }
         finally
         {
+            // Closing our descriptor alone would leave the connection open while the table still references it;
+            // shutting it down makes the peer see the close now. The listener retries the unregister.
+            if (fileStillRegistered)
+            {
+                try
+                {
+                    TCloseAdapter.ShutdownSocket(ref closeAdapter, socketFd);
+                }
+                catch (Exception ex)
+                {
+                    CaptureFailure(ref failures, ex);
+                }
+            }
+
             try
             {
                 TryCloseSocket(socketFd, ref closeAdapter);
@@ -63,20 +84,6 @@ internal static class ConnectionSocketClose
         }
 
         ThrowCapturedFailures(failures);
-    }
-
-    private static void TryUnregisterFixedFile<TCloseAdapter>(
-        int fileIndex,
-        ref TCloseAdapter closeAdapter)
-        where TCloseAdapter : struct, ICloseAdapter<TCloseAdapter>
-    {
-        if (fileIndex < 0)
-            return;
-
-        if (TCloseAdapter.UnregisterFixedFile(ref closeAdapter, fileIndex))
-            return;
-
-        TCloseAdapter.LogFixedFileUnregisterFailure(ref closeAdapter, fileIndex);
     }
 
     private static void TryCloseSocket<TCloseAdapter>(
@@ -117,11 +124,16 @@ internal static class ConnectionSocketClose
         public static bool UnregisterFixedFile(ref ProductionCloseAdapter self, int fileIndex) =>
             self._ring.UnregisterFd(fileIndex);
 
+        public static void ShutdownSocket(ref ProductionCloseAdapter self, int socketFd) =>
+            Libc.shutdown(socketFd, IoUringConstants.SHUT_RDWR);
+
         public static int CloseSocketFd(ref ProductionCloseAdapter self, int socketFd) =>
             Libc.close(socketFd);
 
         public static void LogFixedFileUnregisterFailure(ref ProductionCloseAdapter self, int fileIndex) =>
-            self._logger.LogWarning("Failed to unregister fixed-file slot {Slot}.", fileIndex);
+            self._logger.LogWarning(
+                "Failed to unregister fixed-file slot {Slot}; the socket was shut down and the unregister is retried.",
+                fileIndex);
 
         public static void LogSocketCloseFailure(ref ProductionCloseAdapter self, int socketFd, int errno) =>
             self._logger.LogWarning("close(fd={Fd}) failed with errno {Errno}", socketFd, errno);

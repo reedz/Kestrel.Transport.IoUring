@@ -106,6 +106,7 @@ public class ConnectionSocketCloseTests
                 "callback:ok",
                 "unregister:17",
                 "log-unregister:17",
+                "shutdown:102",
                 "close:102",
                 "log-close:102:9",
             ],
@@ -161,6 +162,7 @@ public class ConnectionSocketCloseTests
                 "callback:ok",
                 "unregister:21",
                 "log-unregister:21",
+                "shutdown:122",
                 "close:122",
                 "log-close:122:9",
             ],
@@ -232,7 +234,7 @@ public class ConnectionSocketCloseTests
     }
 
     [Fact]
-    public void Run_WhenUnregisterFixedFileFails_LogsAndStillClosesSocket()
+    public void Run_WhenUnregisterFixedFileFails_LogsShutsTheSocketDownAndStillClosesIt()
     {
         using var connectionCts = new CancellationTokenSource();
         List<string> trace = [];
@@ -249,8 +251,10 @@ public class ConnectionSocketCloseTests
                 "callback:ok",
                 "unregister:13",
                 "log-unregister:13",
+                "shutdown:82",
                 "close:82",
-            ]);
+            ],
+            because: "the fixed-file table still references the socket, so only a shutdown ends the connection for the peer");
     }
 
     [Fact]
@@ -296,6 +300,9 @@ public class ConnectionSocketCloseTests
             self._trace.Add($"unregister:{fileIndex}");
             return self._unregisterResult;
         }
+
+        public static void ShutdownSocket(ref RecordingCloseAdapter self, int socketFd) =>
+            self._trace.Add($"shutdown:{socketFd}");
 
         public static int CloseSocketFd(ref RecordingCloseAdapter self, int socketFd)
         {

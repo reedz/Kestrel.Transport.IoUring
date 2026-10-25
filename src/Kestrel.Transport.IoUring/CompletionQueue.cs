@@ -44,10 +44,17 @@ internal sealed unsafe class CompletionQueue
         return true;
     }
 
+    /// <summary>
+    /// Consumes the entry at the head. Returns true when it was the request's last completion
+    /// (<c>IORING_CQE_F_MORE</c> clear): the kernel holds nothing of that request any more.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void AdvanceHead()
+    public bool AdvanceHead()
     {
-        Volatile.Write(ref *_head, *_head + 1);
+        uint head = *_head;
+        bool terminal = (_cqes[head & *_ringMask].Flags & IoUringConstants.IORING_CQE_F_MORE) == 0;
+        Volatile.Write(ref *_head, head + 1);
+        return terminal;
     }
 
     public uint Available => Volatile.Read(ref *_tail) - Volatile.Read(ref *_head);

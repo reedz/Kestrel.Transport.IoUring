@@ -86,13 +86,13 @@ load_config_catalog() {
     EXPECTED_MIN_DISTINCT["$cfg"]="$min_distinct"
   done <<'CATALOG'
 # cfg|outcome|label|kind|target|min_distinct
-BufferRing_CorrectedExhaustive.cfg|pass|exhaustive safety|pass|TypeOK, ExclusiveNonRingOwners, AllBufferConservation, ValidCompletionSemantics, RingAvailabilityAccounting, RingCapacityAndTail, CqCapacity, KernelTeardownReclaimsKernelOwners, KernelTeardownStopsRecv, NoLiveBuffersAfterUnmap, NoUnmapBeforeKernelTeardown, NoUnmapBeforeRingClosed|1000
+BufferRing_CorrectedExhaustive.cfg|pass|exhaustive safety|pass|TypeOK, ExclusiveNonRingOwners, AllBufferConservation, ValidCompletionSemantics, RingAvailabilityAccounting, RingCapacityAndTail, CqCapacity, QuiescenceMeansNoKernelOwners, QuiescenceStopsRecv, NoLiveBuffersAfterUnmap, NoUnmapBeforeQuiescence, NoUnmapBeforeRingClosed, QuarantineReleasesNothing, NoRingCloseBeforeQuiescence|1000
 BufferRing_CorrectedLiveness.cfg|pass|focused liveness|pass|ReceiveEventuallyRearmable|2000
-BufferRing_CorrectedSafety.cfg|pass|exhaustive safety|pass|TypeOK, ExclusiveNonRingOwners, AllBufferConservation, ValidCompletionSemantics, RingAvailabilityAccounting, RingCapacityAndTail, CqCapacity, KernelTeardownReclaimsKernelOwners, KernelTeardownStopsRecv, NoLiveBuffersAfterUnmap, NoUnmapBeforeKernelTeardown, NoUnmapBeforeRingClosed|1000
+BufferRing_CorrectedSafety.cfg|pass|exhaustive safety|pass|TypeOK, ExclusiveNonRingOwners, AllBufferConservation, ValidCompletionSemantics, RingAvailabilityAccounting, RingCapacityAndTail, CqCapacity, QuiescenceMeansNoKernelOwners, QuiescenceStopsRecv, NoLiveBuffersAfterUnmap, NoUnmapBeforeQuiescence, NoUnmapBeforeRingClosed, QuarantineReleasesNothing, NoRingCloseBeforeQuiescence|1000
 BufferRing_DoubleRecycleExpectedViolation.cfg|violation|focused safety|invariant|AllBufferConservation|10
 BufferRing_LoseRecycleExpectedViolation.cfg|violation|focused safety|invariant|AllBufferConservation|10
 BufferRing_UnmapBeforeRingCloseExpectedViolation.cfg|violation|focused safety|invariant|NoUnmapBeforeRingClosed|2
-BufferRing_UnmapBeforeTeardownExpectedViolation.cfg|violation|focused safety|invariant|NoLiveBuffersAfterUnmap|5
+BufferRing_FreeWithoutQuiescenceExpectedViolation.cfg|violation|focused safety|invariant|NoLiveBuffersAfterUnmap|5
 IoUringRing_CorrectedLiveness.cfg|pass|exhaustive liveness|pass|FlushedRequestsEventuallySubmitted|5
 IoUringRing_CorrectedOverflowFailSafe.cfg|pass|focused liveness|pass|OverflowEventuallyFailsSafe|5
 IoUringRing_CorrectedSafety.cfg|pass|exhaustive safety|pass|TypeOK, SqCursorRelation, CqCursorRelation, SqNoOverwrite, CqNoOverwrite, SqExactAccounting, CqExactAccounting|5
@@ -178,6 +178,18 @@ MultiListener_FixDrainOnUnbindCorrectedQuiescence.cfg|pass|focused liveness|pass
 MultiListener_FixDrainOnUnbindLateCompleteExpectedViolation.cfg|violation|focused liveness|temporal|DisposeEventuallyQuiesces|850
 MultiListener_FixDrainOnUnbindExpectedViolation.cfg|violation|focused safety|invariant|DisposedHasNoDroppedRefs|2000
 MultiListener_ForwardProgress.cfg|pass|focused liveness|pass|EventuallyInTransitWitness, EventuallyMergedWitness, TransitEventuallyAccepted|2
+# Teardown drain (NEW-01/NEW-02): memory handed to the kernel is released only
+# after the operation ledger is observed at zero; otherwise quarantine. The
+# mutations are the pre-fix trust-close order, free-after-timeout, and a ledger
+# blind to IORING_CQE_F_MORE; the old-kernel temporal violation is why the
+# drain needs a deadline at all.
+Teardown_CorrectedSafety.cfg|pass|exhaustive safety|pass|TypeOK, LedgerCountsLiveRequests, QuiescedMeansKernelIdle, NoReleaseWhileKernelOwns, NoAcceptedFdLeak, ReleaseOnlyAfterQuiescence|200
+Teardown_CorrectedOldKernelSafety.cfg|pass|exhaustive safety|pass|TypeOK, LedgerCountsLiveRequests, QuiescedMeansKernelIdle, NoReleaseWhileKernelOwns, NoAcceptedFdLeak, ReleaseOnlyAfterQuiescence|200
+Teardown_CorrectedLiveness.cfg|pass|exhaustive liveness|pass|DrainEnds|200
+Teardown_UntrackedRequestOldKernelExpectedViolation.cfg|violation|exhaustive liveness|temporal|DrainEnds|20
+Teardown_TrustCloseExpectedViolation.cfg|violation|exhaustive safety|invariant|NoReleaseWhileKernelOwns|3
+Teardown_FreeOnTimeoutExpectedViolation.cfg|violation|exhaustive safety|invariant|NoReleaseWhileKernelOwns|3
+Teardown_CountEveryCqeExpectedViolation.cfg|violation|exhaustive safety|invariant|QuiescedMeansKernelIdle|3
 CATALOG
 
   CHECK_SH_CONFIGS_LOADED=1

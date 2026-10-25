@@ -1814,12 +1814,16 @@ LoopMaybeFinishSend ==
 \* Queues a forced abort for connections the application still owns. Runs only after DisposeAsync has
 \* started: UnbindAsync alone must not abort live connections. Connections already closing gracefully
 \* ("closing") are left to drain their final response.
+\* DisposeAsync force-close (ProcessLifecycleCommands): abort every connection the
+\* application has not disposed, including one already closing because the peer
+\* ended its side (its send loop would otherwise wait for the application).
 LoopQueueUnbindClose ==
     /\ loopPhase = "top"
     /\ disposeStarted
-    /\ \E s \in Slots : slotState[s] = "open" /\ ~abortIssued[s]
+    /\ \E s \in Slots : slotState[s] \in {"open", "closing"} /\ ~appCloseIssued[s] /\ ~abortIssued[s]
     /\ \E s \in Slots :
-        /\ slotState[s] = "open"
+        /\ slotState[s] \in {"open", "closing"}
+        /\ ~appCloseIssued[s]
         /\ ~abortIssued[s]
         /\ abortIssued' = [abortIssued EXCEPT ![s] = TRUE]
         /\ closeRequestQueue' = Append(closeRequestQueue, CloseReq(s, slotGen[s], "abort"))
@@ -2805,8 +2809,12 @@ AfterResumeSend ==
                     unbindStarted, disposeStarted, unbindTimeoutElapsed,
                     ringDisposed, PoolVars, FileVars, BugVars >>
 
-\* Source traceability: after UnbindAsync observes _ioLoopStopped, DisposeAsync
-\* runs one bounded final-drain step before Ring.Dispose closes the ring. This
+\* Source traceability: this models the bounded snapshot drain
+\* (ListenerStoppedCompletionDrain) that DisposeAsync now runs only when a ring is
+\* quarantined. Normal disposal instead drains on the owner thread until the
+\* operation ledger is zero (DrainKernelOperations), which consumes every
+\* accepted-fd completion including ones posted after any snapshot; that
+\* protocol and its memory-safety argument are modeled in Teardown.tla. This
 \* snapshot accounts only for CQEs visible/materialized at that boundary; any
 \* later completion stays outside this proof, and a post-snapshot accepted-fd
 \* CQE is not reclaimed by this model's ring-close step.

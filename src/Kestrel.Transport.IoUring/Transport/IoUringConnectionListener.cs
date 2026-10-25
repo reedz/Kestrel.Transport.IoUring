@@ -22,7 +22,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private readonly Socket _listenSocket;
     private readonly Channel<ConnectionContext> _acceptChannel;
     private readonly IoUringConnection?[] _connectionSlots;
-    private readonly ushort[] _slotGenerations;
+    private readonly long[] _slotGenerations;
     // Round-7: free-list of available slot indices. Acquire a slot on accept, release
     // on RemoveConnection. Prevents the pre-R7 `connId % maxConn` collision that
     // orphaned prior connections at c=2048 under default MaxConnections=1024.
@@ -34,7 +34,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private readonly IoUringTransportOptions _options;
 
     // Connections that need RECV resubmitted (after async pipe flush completes).
-    private readonly ConcurrentQueue<(long ConnectionId, ushort Generation)> _recvResubmitQueue = new();
+    private readonly ConcurrentQueue<(long ConnectionId, long Generation)> _recvResubmitQueue = new();
     private readonly ConcurrentQueue<CloseRequest> _closeRequestQueue = new();
 
     // Pipe scheduler — routes output pipe reader continuations to the IO loop thread.
@@ -70,6 +70,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private int _activeConnectionCount;
     private int _consecutiveErrors;
     private readonly TaskCompletionSource _ioLoopStopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    // Completed by the IO loop once it owns the ring (after enabling a ring created disabled for SINGLE_ISSUER).
+    private readonly TaskCompletionSource _loopActivated = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _connectionsDrained = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _listenSocketFd;
     private bool _listenSocketFdRefAdded;
@@ -80,6 +82,12 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private bool _acceptRetryRequired;
     private readonly Timer _acceptRetryTimer;
     private readonly Timer _recvRetryTimer;
+    // NEW-14: a fixed-file unregister that failed leaves the socket referenced by the ring's table (the slot is not
+    // reused). It is retried from the loop; this timer wakes an otherwise idle loop to do so.
+    private readonly Timer _unregisterRetryTimer;
+    private int _unregisterRetryAttempts;
+    private long _unregisterRetryNotBeforeTimestamp;
+    private const int UnregisterRetryWarnAttempts = 32;
     private long _acceptRetryNotBeforeTimestamp;
     private long _recvRetryNotBeforeTimestamp;
     private int _acceptErrorBackoffMs;
@@ -90,6 +98,24 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private int _ringFailed;
     // Test seam: invoked at the top of every IO-loop iteration so tests can inject loop faults. Null in production.
     internal Action? IoLoopIterationHook { get; set; }
+
+    internal enum TeardownOutcome { NotRun, Quiesced, Quarantined }
+
+    // Written by the thread that drained the ring (the IO loop, or the disposing thread if the loop never ran).
+    private int _teardownOutcome;
+    private int _teardownCancelsInFlight; // owner thread only
+
+    /// <summary>Whether disposal proved the ring idle before releasing memory, or had to quarantine it.</summary>
+    internal TeardownOutcome Teardown => (TeardownOutcome)Volatile.Read(ref _teardownOutcome);
+
+    /// <summary>How long disposal waits for every request's final completion before quarantining the ring.</summary>
+    internal TimeSpan TeardownDrainTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    // Test seam: issue no cancel requests while draining, so a request the listener does not know about never ends.
+    internal bool SuppressTeardownCancels { get; set; }
+
+    // Upper bound for each step of disposal that waits on another party (accept shutdown, connection drain).
+    private static readonly TimeSpan ShutdownStepTimeout = TimeSpan.FromSeconds(5);
 
     internal Task IoLoopStopped => _ioLoopStopped.Task;
 
@@ -120,7 +146,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
     private readonly record struct CloseRequest(
         long ConnectionId,
-        ushort Generation,
+        long Generation,
         ConnectionAbortedException? Reason);
 
     // Process-wide counter of accept-channel drops (S0.1). Inspected by
@@ -146,7 +172,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         _options = options;
         _useMultishotAccept = options.EnableMultishotAccept;
         _connectionSlots = new IoUringConnection?[options.MaxConnections];
-        _slotGenerations = new ushort[options.MaxConnections];
+        _slotGenerations = new long[options.MaxConnections];
         _freeSlots = new Stack<int>(options.MaxConnections);
         // Pre-populate free-list with all slot indices. Push highest first so Pop()
         // returns 0 first — stable small connIds under light load for easier debugging.
@@ -183,6 +209,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             Timeout.Infinite,
             Timeout.Infinite);
         _recvRetryTimer = new Timer(
+            static state => ((IoUringConnectionListener)state!).WakeIoLoop(),
+            this,
+            Timeout.Infinite,
+            Timeout.Infinite);
+        _unregisterRetryTimer = new Timer(
             static state => ((IoUringConnectionListener)state!).WakeIoLoop(),
             this,
             Timeout.Infinite,
@@ -265,12 +296,14 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         SubmitAccept();
         SubmitEventFdRead();
 
-        // Submit pending SQEs to the kernel. NOTE: when EnableSingleIssuer is true, this
-        // would bind the issuer task to the constructor thread (wrong); the IO loop's
-        // first SubmitAndWait would also try to bind and fail. SINGLE_ISSUER is therefore
-        // disabled by default until submissions are routed exclusively through the IO
-        // loop. With SINGLE_ISSUER off, this Submit is fine on any thread.
-        if (!_options.EnableSingleIssuer)
+        // A disabled ring (SINGLE_ISSUER) is enabled by the IO loop thread, which thereby becomes its only issuer;
+        // the requests prepared above are submitted from there.
+        if (_options.EnableSingleIssuer &&
+            (_ring.SetupFlags & IoUringConstants.IORING_SETUP_SINGLE_ISSUER) == 0)
+        {
+            _logger.LogInformation("IORING_SETUP_SINGLE_ISSUER is not supported by this kernel; continuing without it.");
+        }
+        if (!_ring.IsDisabled)
         {
             _ring.Submit();
         }
@@ -292,6 +325,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             _ioLoopStarted = false;
             throw;
         }
+
+        // The loop owns the ring from here on; wait until it has taken it over (enabled a disabled ring).
+        if (!_loopActivated.Task.Wait(ShutdownStepTimeout))
+            throw new InvalidOperationException("The io_uring loop did not start.");
+        _loopActivated.Task.GetAwaiter().GetResult();
 
         // Opt-in periodic diagnostic logging (Round-3, Opt G validation).
         // Read interval from option OR env var (env var allows debug without source changes
@@ -330,6 +368,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         _activeConnectionCount++;
         Interlocked.Increment(ref s_activeConnections);
     }
+
+    // Test seam: positions a free slot's generation counter (the next occupant gets generation + 1), for example so
+    // that its 16-bit wire value repeats an earlier occupant's. Call only while the slot is free and the loop idle.
+    internal void SetSlotGenerationForTests(int slot, long generation) => _slotGenerations[slot] = generation;
 
     private void RemoveConnection(long slot)
     {
@@ -458,19 +500,19 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     }
 
     /// <summary>Enqueues a RECV resubmission request and wakes the IO loop.</summary>
-    private void RequestRecvResubmit(long connectionId, ushort generation)
+    private void RequestRecvResubmit(long connectionId, long generation)
     {
         _recvResubmitQueue.Enqueue((connectionId, generation));
         WakeIoLoop();
     }
 
-    private void RequestClose(long connectionId, ushort generation, ConnectionAbortedException? reason)
+    private void RequestClose(long connectionId, long generation, ConnectionAbortedException? reason)
     {
         _closeRequestQueue.Enqueue(new CloseRequest(connectionId, generation, reason));
         WakeIoLoop();
     }
 
-    private void RequestSendRetry(long connectionId, ushort generation)
+    private void RequestSendRetry(long connectionId, long generation)
     {
         _sendRetryState.RequestSendRetry(connectionId, generation);
     }
@@ -531,6 +573,18 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         var token = _cts.Token;
         try
         {
+            try
+            {
+                _ring.EnableRings();
+                _loopActivated.TrySetResult();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Enabling the io_uring ring on its IO loop failed.");
+                _loopActivated.TrySetException(ex);
+                return;
+            }
+
             while (!token.IsCancellationRequested)
             {
                 try
@@ -623,6 +677,22 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         }
         finally
         {
+            // A dead loop can no longer cancel its accept request, so stop the port accepting first (no-op once
+            // unbind has released the listening socket).
+            StopAcceptingAfterLoopExit();
+
+            TeardownOutcome outcome;
+            try
+            {
+                outcome = DrainKernelOperations() ? TeardownOutcome.Quiesced : TeardownOutcome.Quarantined;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Draining the io_uring ring during shutdown failed.");
+                outcome = TeardownOutcome.Quarantined;
+            }
+            Volatile.Write(ref _teardownOutcome, (int)outcome);
+
             // The loop can make no further progress. Release anything still awaiting finalization so a
             // Kestrel connection DisposeAsync cannot hang; the sockets are closed later by DisposeAsync.
             foreach (var conn in _connectionSlots)
@@ -632,11 +702,187 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             // Nothing will service lifecycle commands again: an unbind or dispose waiting for the IO loop to
             // stop accepting or to drain connections would otherwise wait forever. The listen socket is
             // released by DisposeAsync.
-            StopAcceptingAfterLoopExit();
             _acceptStopped.TrySetResult();
             _connectionsDrained.TrySetResult();
             _ioLoopStopped.TrySetResult();
         }
+    }
+
+    /// <summary>
+    /// Ends every request the kernel still holds, so that the memory they reference can be released. Closing the
+    /// ring fd is not enough: the kernel cancels requests asynchronously after close() returns, and a receive or
+    /// send it is still running can touch its buffer after that. Must run on the thread that owns the ring.
+    /// Aborts the remaining connections, shuts their sockets down, cancels every request and consumes completions
+    /// (closing accepted sockets and finalizing connections as usual) until every submitted request has posted
+    /// its final completion. Returns false if that did not happen before <see cref="TeardownDrainTimeout"/>.
+    /// </summary>
+    private bool DrainKernelOperations()
+    {
+        _stopping = true;
+        try
+        {
+            _cts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        long deadline = Stopwatch.GetTimestamp() + (long)(TeardownDrainTimeout.TotalSeconds * Stopwatch.Frequency);
+        long cancelInterval = Stopwatch.Frequency / 20;
+        long nextCancel = 0;
+        int consecutiveFailures = 0;
+
+        AbortRemainingConnections();
+
+        while (_ring.OutstandingOperations > 0)
+        {
+            long now = Stopwatch.GetTimestamp();
+            if (now >= deadline)
+                break;
+
+            bool progressed = false;
+            try
+            {
+                // Re-issued while requests remain: a cancel can race a request that is not cancellable yet.
+                if (_teardownCancelsInFlight == 0 && now >= nextCancel)
+                {
+                    SubmitTeardownCancels();
+                    nextCancel = now + cancelInterval;
+                }
+
+                _ring.Submit();
+                _ring.EnterForTeardown();
+                progressed = DrainTeardownCompletions();
+                _pipeScheduler?.DrainWorkItems();
+                DrainCloseRequestQueue();
+                consecutiveFailures = 0;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "An io_uring teardown drain step failed.");
+                if (++consecutiveFailures > 5)
+                    break;
+            }
+
+            if (!progressed && _ring.OutstandingOperations > 0)
+                Thread.Sleep(1);
+        }
+
+        long outstanding = _ring.OutstandingOperations;
+        if (outstanding == 0)
+        {
+            _ring.SealSubmissions();
+            // Unregistering fixed files is reserved to the issuer on newer SINGLE_ISSUER kernels, so the remaining
+            // sockets are closed here, on the thread that owns the ring.
+            CloseRemainingSockets();
+            return true;
+        }
+
+        _logger.LogError(
+            "{Outstanding} io_uring request(s) did not complete within {Timeout}; the ring and every buffer it may " +
+            "still use are kept alive for the rest of the process instead of being released.",
+            outstanding,
+            TeardownDrainTimeout);
+        return false;
+    }
+
+    private void CloseRemainingSockets()
+    {
+        var connections = new HashSet<IoUringConnection>(_closingConnections.Values);
+        foreach (var conn in _connectionSlots)
+        {
+            if (conn != null)
+                connections.Add(conn);
+        }
+
+        ListenerDisposeCleanup.RunIsolatedPerItem(
+            connections,
+            "connection close",
+            RunDisposeCleanupStep,
+            static conn => conn.CloseSocketFd());
+    }
+
+    private void AbortRemainingConnections()
+    {
+        foreach (var conn in _connectionSlots)
+        {
+            if (conn == null)
+                continue;
+
+            try
+            {
+                conn.BeginTransportAbort(new ConnectionAbortedException("Transport is shutting down."));
+                if (!_closingConnections.ContainsKey(conn.NumericConnectionId))
+                    BeginCloseConnection(conn.NumericConnectionId, conn);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Aborting connection {Id} during shutdown failed.", conn.NumericConnectionId);
+            }
+        }
+
+        // Completes the receive and send requests still parked on the sockets (graceful closes included).
+        foreach (var conn in _closingConnections.Values.ToArray())
+            conn.ShutdownSocket();
+    }
+
+    private void SubmitTeardownCancels()
+    {
+        if (SuppressTeardownCancels)
+            return;
+
+        // One request ends everything on Linux 5.19+. Older kernels fail it with EINVAL and rely on the targeted
+        // cancels below and on the socket shutdowns, which complete the connections' receives and sends.
+        TrySubmitTeardownCancel(
+            0,
+            IoUringConstants.IORING_ASYNC_CANCEL_ALL | IoUringConstants.IORING_ASYNC_CANCEL_ANY);
+        if (_acceptInFlight)
+            TrySubmitTeardownCancel(IoUringConstants.ACCEPT_USER_DATA, 0);
+        if (_eventFdReadState.ReadInFlight)
+            TrySubmitTeardownCancel(IoUringConstants.EVENTFD_USER_DATA, 0);
+    }
+
+    private unsafe void TrySubmitTeardownCancel(ulong targetUserData, uint cancelFlags)
+    {
+        if (!_ring.TryGetSqe(out IoUringSqe* sqe))
+            return;
+
+        sqe->Opcode = IoUringConstants.IORING_OP_ASYNC_CANCEL;
+        sqe->Fd = -1;
+        sqe->AddrOrSpliceOffIn = targetUserData;
+        sqe->OpFlags = cancelFlags;
+        sqe->UserData = IoUringConstants.TEARDOWN_CANCEL_USER_DATA;
+        _teardownCancelsInFlight++;
+    }
+
+    private bool DrainTeardownCompletions()
+    {
+        bool drained = false;
+        while (_ring.TryPeekCompletion(out var cqe))
+        {
+            drained = true;
+            try
+            {
+                DispatchCompletion(cqe);
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    HandleCompletionError(cqe, ex);
+                }
+                catch (Exception inner)
+                {
+                    _logger.LogWarning(inner, "Handling a failed completion during teardown failed.");
+                }
+            }
+            finally
+            {
+                _ring.AdvanceCompletion();
+            }
+        }
+
+        return drained;
     }
 
     /// <summary>
@@ -683,9 +929,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             _forceCloseBegun = true;
             foreach (var conn in _connectionSlots)
             {
-                // Connections already closing gracefully keep draining their final response; only
-                // connections the application still owns are aborted.
-                if (conn != null && !_closingConnections.ContainsKey(conn.NumericConnectionId))
+                // Connections the application has disposed keep draining their final response; everything else is
+                // aborted, including connections already closing because the peer ended its side, whose send loop
+                // would otherwise wait for an application that is not going to complete it.
+                if (conn != null && !conn.ApplicationDisposed)
                 {
                     _closeRequestQueue.Enqueue(new CloseRequest(
                         conn.NumericConnectionId,
@@ -866,6 +1113,39 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             var eventFdReadAdapter = new EventFdReadSubmitAdapter(this);
             _eventFdReadState.RetryPendingEventFdRead(ref eventFdReadAdapter);
         }
+        RetryFailedFixedFileUnregisters();
+    }
+
+    private void RetryFailedFixedFileUnregisters()
+    {
+        if (_ring.FailedUnregisterCount == 0)
+            return;
+
+        long now = Stopwatch.GetTimestamp();
+        if (now < Volatile.Read(ref _unregisterRetryNotBeforeTimestamp))
+            return;
+
+        if (_ring.RetryFailedUnregisters() == 0)
+        {
+            _unregisterRetryAttempts = 0;
+            return;
+        }
+
+        // The slots stay reserved (never reused) and their sockets were shut down when they closed, so the cost of
+        // failing for good is only the kernel's reference until the ring closes. Keep retrying, slowly.
+        if (++_unregisterRetryAttempts == UnregisterRetryWarnAttempts)
+        {
+            _logger.LogError(
+                "{Count} fixed-file slot(s) could not be unregistered after {Attempts} attempts; retrying every second.",
+                _ring.FailedUnregisterCount,
+                _unregisterRetryAttempts);
+        }
+
+        int delayMs = Math.Min(10 << Math.Min(_unregisterRetryAttempts, 7), 1000);
+        Volatile.Write(
+            ref _unregisterRetryNotBeforeTimestamp,
+            now + (long)(delayMs * (double)Stopwatch.Frequency / 1000));
+        _unregisterRetryTimer.Change(delayMs, Timeout.Infinite);
     }
 
     private void ResumeSendRetries()
@@ -964,6 +1244,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
     private void DispatchCompletion(IoUringCqe cqe)
     {
+        if (cqe.UserData == IoUringConstants.TEARDOWN_CANCEL_USER_DATA)
+        {
+            // Result is informational: the cancelled requests' own final completions are what end them.
+            _teardownCancelsInFlight--;
+            return;
+        }
+
         if (cqe.UserData == IoUringConstants.EVENTFD_USER_DATA)
         {
             _eventFdReadState.OnEventFdReadCompletion();
@@ -996,10 +1283,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             return;
         }
 
-        var (connectionId, generation, opType) =
+        var (connectionId, wireGeneration, opType) =
             IoUringConnection.DecodeUserData(cqe.UserData);
         var conn = GetConnection(connectionId);
-        if (conn == null || conn.Generation != generation)
+        // user_data carries only the low 16 bits of the generation; see IoUringConnection.Generation.
+        if (conn == null || (ushort)conn.Generation != wireGeneration)
         {
             if (opType == IoUringConnection.OpType.Recv &&
                 (cqe.Flags & IoUringConstants.IORING_CQE_F_BUFFER) != 0 &&
@@ -1058,10 +1346,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             return;
         }
 
-        var (connectionId, generation, _) =
+        var (connectionId, wireGeneration, _) =
             IoUringConnection.DecodeUserData(cqe.UserData);
         var conn = GetConnection(connectionId);
-        if (conn == null || conn.Generation != generation)
+        if (conn == null || (ushort)conn.Generation != wireGeneration)
             return;
 
         conn.BeginTransportAbort(new ConnectionAbortedException(
@@ -1511,8 +1799,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
             return;
 
-        await UnbindAsync().ConfigureAwait(false);
+        // Every wait below is bounded: an accept shutdown or a drain that cannot finish must not hang the host.
+        using (var unbindTimeout = new CancellationTokenSource(ShutdownStepTimeout))
+            await UnbindAsync(unbindTimeout.Token).ConfigureAwait(false);
 
+        bool loopStopped;
         if (_ioLoopStarted)
         {
             // Anything still open here was not closed by Kestrel (direct disposal or a fatal error).
@@ -1522,7 +1813,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             try
             {
                 await _connectionsDrained.Task
-                    .WaitAsync(TimeSpan.FromSeconds(5))
+                    .WaitAsync(ShutdownStepTimeout)
                     .ConfigureAwait(false);
             }
             catch (TimeoutException)
@@ -1531,18 +1822,43 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             }
             finally
             {
+                // The IO loop exits and drains the ring (DrainKernelOperations) before it reports stopping.
                 _cts.Cancel();
                 WakeIoLoop();
+            }
+
+            try
+            {
+                await _ioLoopStopped.Task
+                    .WaitAsync(TeardownDrainTimeout + ShutdownStepTimeout)
+                    .ConfigureAwait(false);
+                loopStopped = true;
+            }
+            catch (TimeoutException)
+            {
+                // The loop is wedged and still owns the ring: nothing it references may be touched.
+                _logger.LogError("The io_uring loop did not stop; its ring is quarantined.");
+                loopStopped = false;
             }
         }
         else
         {
+            // No loop ever owned the ring, so this thread does (requests may have been prepared by Bind).
             _connectionsDrained.TrySetResult();
-            _cts.Cancel();
+            TeardownOutcome outcome;
+            try
+            {
+                outcome = DrainKernelOperations() ? TeardownOutcome.Quiesced : TeardownOutcome.Quarantined;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Draining the io_uring ring during shutdown failed.");
+                outcome = TeardownOutcome.Quarantined;
+            }
+            Volatile.Write(ref _teardownOutcome, (int)outcome);
             _ioLoopStopped.TrySetResult();
+            loopStopped = true;
         }
-
-        await _ioLoopStopped.Task.ConfigureAwait(false);
 
         var connections = new HashSet<IoUringConnection>();
         foreach (var conn in _connectionSlots)
@@ -1553,32 +1869,20 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         foreach (var conn in _closingConnections.Values)
             connections.Add(conn);
 
+        if (!loopStopped || Teardown != TeardownOutcome.Quiesced)
+        {
+            Quarantine(connections, loopStopped);
+            return;
+        }
+
         ListenerDisposeCleanup.RunIsolatedPerItem(
             connections,
             "connection close",
             RunDisposeCleanupStep,
             static conn => conn.CloseSocketFd());
 
-        // Order guarantee: UnbindAsync has already observed _ioLoopStopped above, so
-        // this bounded teardown snapshot runs after the IO loop stops and before _ring.Dispose().
-        RunDisposeCleanupStep("final completion snapshot drain", () =>
-        {
-            ListenerStoppedCompletionDrain.DrainResult drainResult = ListenerStoppedCompletionDrain.Drain(_ring);
-            if (drainResult.MaterializationErrno != 0)
-            {
-                _logger.LogWarning(
-                    "Final CQ snapshot materialization during dispose stopped with errno {Errno}; continuing cleanup.",
-                    drainResult.MaterializationErrno);
-            }
-
-            if (drainResult.Failure is not null)
-            {
-                _logger.LogWarning(
-                    drainResult.Failure,
-                    "Final CQ snapshot drain during dispose failed; continuing cleanup.");
-            }
-        });
-
+        // Every request has posted its final completion (DrainKernelOperations), so the kernel references none of
+        // the memory released from here on and closing the ring cannot race a request.
         RunDisposeCleanupStep("ring dispose", _ring.Dispose);
 
         ListenerDisposeCleanup.RunIsolatedPerItem(
@@ -1595,6 +1899,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
         RunDisposeCleanupStep("send diagnostics timer dispose", () => _diagTimer?.Dispose());
         RunDisposeCleanupStep("recv diagnostics timer dispose", () => _recvDiagTimer?.Dispose());
+        // Like the retry timers below, its callback writes the eventfd, so it must be gone before that closes.
+        await RunDisposeCleanupStepAsync(
+            "unregister retry timer dispose",
+            () => _unregisterRetryTimer.DisposeAsync()).ConfigureAwait(false);
 
         await ListenerDisposeCleanup.DisposeRetryTimersThenRunEventFdTeardownAsync(
             _acceptRetryTimer,
@@ -1621,6 +1929,56 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             var adapter = new EventFdWakeAdapter(this);
             return _eventFdWakeState.CloseAsync(ref adapter);
         }
+    }
+
+    /// <summary>
+    /// Disposal could not show that the kernel is done with this ring (<see cref="DrainKernelOperations"/> timed out,
+    /// a completion was lost, or the loop is wedged). Releases only what the kernel cannot be using and parks the
+    /// listener, and with it the ring, its mappings, the provided buffers and every connection's receive buffer and
+    /// send pins, in <see cref="IoUringQuarantine"/> for the rest of the process.
+    /// </summary>
+    private void Quarantine(HashSet<IoUringConnection> connections, bool loopStopped)
+    {
+        long outstanding = loopStopped ? _ring.OutstandingOperations : 0;
+        IoUringQuarantine.Add(this, connections.Count, outstanding);
+        _logger.LogError(
+            "io_uring listener {EndPoint} could not prove its ring idle during shutdown ({Outstanding} request(s) " +
+            "outstanding, loop stopped: {LoopStopped}); the ring and the memory of {Connections} connection(s) are " +
+            "quarantined for the rest of the process.",
+            EndPoint,
+            outstanding,
+            loopStopped,
+            connections.Count);
+
+        if (loopStopped)
+        {
+            // Nothing else consumes the queue now: close sockets accepted by completions already posted.
+            RunDisposeCleanupStep("quarantine completion snapshot drain", () =>
+            {
+                var result = ListenerStoppedCompletionDrain.Drain(_ring);
+                if (result.Failure is not null)
+                    throw result.Failure;
+            });
+            // A kernel request holds its own reference to the socket, so closing our descriptor is memory-safe.
+            ListenerDisposeCleanup.RunIsolatedPerItem(
+                connections,
+                "connection close",
+                RunDisposeCleanupStep,
+                static conn => conn.CloseSocketFd());
+            ReleaseListenSocket(unregisterFixedFile: false);
+        }
+
+        ListenerDisposeCleanup.RunIsolatedPerItem(
+            connections,
+            "connection abandon",
+            RunDisposeCleanupStep,
+            static conn => conn.AbandonAfterFailedTeardown());
+
+        RunDisposeCleanupStep("send diagnostics timer dispose", () => _diagTimer?.Dispose());
+        RunDisposeCleanupStep("recv diagnostics timer dispose", () => _recvDiagTimer?.Dispose());
+        RunDisposeCleanupStep("accept retry timer dispose", _acceptRetryTimer.Dispose);
+        RunDisposeCleanupStep("recv retry timer dispose", _recvRetryTimer.Dispose);
+        RunDisposeCleanupStep("unregister retry timer dispose", _unregisterRetryTimer.Dispose);
     }
 
     private void RunDisposeCleanupStep(string stepName, Action action)

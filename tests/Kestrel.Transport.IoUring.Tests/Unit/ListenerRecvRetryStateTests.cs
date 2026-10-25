@@ -459,9 +459,9 @@ public class ListenerRecvRetryStateTests
 
     private readonly record struct CancelSelection(
         long Slot,
-        ushort OriginGeneration,
+        long OriginGeneration,
         ulong OriginRecvEpoch,
-        ushort LiveGeneration,
+        long LiveGeneration,
         ulong LiveRecvEpoch);
 
     private static IoUringConnection CreateConnection(

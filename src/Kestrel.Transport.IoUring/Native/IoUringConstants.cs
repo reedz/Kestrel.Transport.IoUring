@@ -57,6 +57,14 @@ internal static class IoUringConstants
     /// <summary>User-data sentinel for the ASYNC_CANCEL SQE that stops the accept request on unbind.</summary>
     public const ulong ACCEPT_CANCEL_USER_DATA = ulong.MaxValue - 3;
 
+    /// <summary>User-data sentinel for the ASYNC_CANCEL SQEs issued while disposal drains the ring.</summary>
+    public const ulong TEARDOWN_CANCEL_USER_DATA = ulong.MaxValue - 4;
+
+    // ASYNC_CANCEL flags (sqe->cancel_flags, Linux 5.19+). ALL cancels every match instead of the first;
+    // ANY matches every request regardless of user_data. Older kernels reject them with EINVAL.
+    public const uint IORING_ASYNC_CANCEL_ALL = 1u << 0;
+    public const uint IORING_ASYNC_CANCEL_ANY = 1u << 2;
+
     // Socket option constants for setsockopt.
     public const int SOL_SOCKET = 1;
     public const int SO_REUSEADDR = 2;
@@ -105,8 +113,12 @@ internal static class IoUringConstants
     public const uint IORING_REGISTER_FILES = 2;
     public const uint IORING_REGISTER_FILES_UPDATE = 6;
     public const uint IORING_REGISTER_PROBE = 8;
+    public const uint IORING_REGISTER_ENABLE_RINGS = 12;
 
     // io_uring_setup flags.
+    // R_DISABLED (5.10+): the ring starts disabled (io_uring_enter fails with EBADFD) until
+    // IORING_REGISTER_ENABLE_RINGS; with SINGLE_ISSUER, the enabling thread becomes the issuer.
+    public const uint IORING_SETUP_R_DISABLED = 1u << 6;
     public const uint IORING_SETUP_COOP_TASKRUN = 1u << 8;
     public const uint IORING_SETUP_SINGLE_ISSUER = 1u << 12;
     public const uint IORING_SETUP_DEFER_TASKRUN = 1u << 13;

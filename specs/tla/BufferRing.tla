@@ -53,15 +53,14 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 \*   - src/Kestrel.Transport.IoUring/Transport/IoUringConnectionListener.cs:1121-1138
 \*     (HandleCancel)
 \*
-\* RequestClose, FinalizeClose, CloseRingFd, KernelTeardownComplete, and
+\* RequestClose, FinalizeClose, ObserveQuiescence, Quarantine, CloseRingFd and
 \* UnmapBufferRing abstract close and shutdown cleanup:
-\*   - src/Kestrel.Transport.IoUring/Transport/IoUringConnectionListener.cs:1164-1198
-\*     (BeginCloseConnection, TryFinalizeClose, ShutdownSocket)
-\*   - src/Kestrel.Transport.IoUring/Transport/IoUringConnectionListener.cs:1268-1302
-\*     (DisposeAsync)
-\*   - src/Kestrel.Transport.IoUring/Ring.cs:396-406
-\*     (Ring.Dispose closes the ring fd)
-\*   - src/Kestrel.Transport.IoUring/ProvidedBufferRing.cs:121-141
+\*   - src/Kestrel.Transport.IoUring/Transport/IoUringConnectionListener.cs
+\*     (BeginCloseConnection, TryFinalizeClose, ShutdownSocket;
+\*      DrainKernelOperations, Quarantine, DisposeAsync)
+\*   - src/Kestrel.Transport.IoUring/Ring.cs
+\*     (OutstandingOperations ledger, SealSubmissions, Dispose closes the ring fd)
+\*   - src/Kestrel.Transport.IoUring/ProvidedBufferRing.cs
 \*     (Dispose, DisposeAfterRingClosed, unregister-vs-unmap split)
 \*
 \* Model assumptions and exclusions:
@@ -85,17 +84,17 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 \*      direct rearm already restored recvInFlight.
 \*   7. IoUringRing.tla already models CQ overflow observation and fail-fast.
 \*      This phase keeps only the single-connection ownership effect of a
-\*      dropped buffer-bearing CQE via cqOverflowLost until the ring itself is
-\*      closed.
-\*   8. CloseRingFd only models Ring.Dispose closing the main ring fd. It stops
-\*      new buffer-ring kernel actions, but it does not itself reclaim bids
-\*      still parked in selected/completionBacklog/cqOwned/cqOverflowLost and
-\*      may occur even if the connection still looks open or recv bookkeeping
-\*      is still live after the graceful-drain timeout.
-\*   9. KernelTeardownComplete is an explicit environment assumption, not a
-\*      proof about Linux semantics. It models eventual post-close teardown that
-\*      makes lingering kernel/completion-owned bids reclaimable and stops recv
-\*      before DisposeAfterRingClosed unmaps the ring memory.
+\*      dropped buffer-bearing CQE via cqOverflowLost; such a completion can
+\*      never be consumed, so the ring can only be quarantined.
+\*   8. Closing the ring fd is NOT a kernel quiescence barrier (Linux cancels
+\*      requests asynchronously after close() returns), so the model gives it no
+\*      reclaiming power. Memory may be released only after ObserveQuiescence:
+\*      the owner thread's operation ledger (SQEs handed out minus completions
+\*      without IORING_CQE_F_MORE) reached zero, which means no request is live
+\*      and every published completion was consumed. After that the ring is
+\*      sealed (no new request can start). Otherwise the ring is quarantined:
+\*      never closed or unmapped. How the drain gets there (cancels, socket
+\*      shutdown, the deadline) is modeled in Teardown.tla.
 \*
 \* Compositional note:
 \*   Cross-module use of BufferRing.tla with IoUringRing.tla or Listener.tla is
@@ -110,7 +109,7 @@ CONSTANTS
     MutateDoubleRecycle,
     MutateLoseRecycle,
     MutateUnmapBeforeRingClose,
-    MutateUnmapBeforeTeardown
+    MutateFreeWithoutQuiescence
 
 RingEntries == Cardinality(BufferUniverse)
 
@@ -122,12 +121,12 @@ ASSUME
     /\ MutateDoubleRecycle \in BOOLEAN
     /\ MutateLoseRecycle \in BOOLEAN
     /\ MutateUnmapBeforeRingClose \in BOOLEAN
-    /\ MutateUnmapBeforeTeardown \in BOOLEAN
+    /\ MutateFreeWithoutQuiescence \in BOOLEAN
 
 VARIABLES
     ringRegistered,
     ringFdClosed,
-    kernelTeardownDone,
+    teardown,
     ringUnmapped,
     headCursor,
     tailCursor,
@@ -149,6 +148,9 @@ VARIABLES
     connState
 
 CompletionKinds == {"data", "terminal"}
+\* "live": serving. "quiesced": the operation ledger was observed at zero and the ring sealed.
+\* "quarantined": the drain deadline passed first; nothing may be closed or released.
+TeardownStates == {"live", "quiesced", "quarantined"}
 ConnStates == {"open", "closing", "closed"}
 NoBuffer == "no-buffer"
 BufferSymmetry == Permutations(BufferUniverse)
@@ -196,6 +198,7 @@ CanArmRecv ==
     /\ ringRegistered
     /\ ~ringFdClosed
     /\ ~ringUnmapped
+    /\ teardown = "live"
     /\ connState = "open"
     /\ ~recvInFlight
     /\ ~recvRearmPending
@@ -206,13 +209,14 @@ CanRetryArmRecv ==
     /\ ringRegistered
     /\ ~ringFdClosed
     /\ ~ringUnmapped
+    /\ teardown = "live"
     /\ connState = "open"
     /\ ~recvInFlight
 
 Vars ==
     << ringRegistered,
        ringFdClosed,
-       kernelTeardownDone,
+       teardown,
        ringUnmapped,
        headCursor,
        tailCursor,
@@ -236,7 +240,7 @@ Vars ==
 Init ==
     /\ ringRegistered = TRUE
     /\ ringFdClosed = FALSE
-    /\ kernelTeardownDone = FALSE
+    /\ teardown = "live"
     /\ ringUnmapped = FALSE
     /\ headCursor = 0
     /\ tailCursor = 0
@@ -267,7 +271,7 @@ ArmRecv ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -296,7 +300,7 @@ RetryArmRecv ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -323,7 +327,7 @@ RetryDropStale ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -360,7 +364,7 @@ KernelSelectAvailableBuffer(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            tailCursor,
            completionBacklog,
@@ -394,7 +398,7 @@ KernelCompleteSelected(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -424,7 +428,7 @@ PublishCompletion(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -457,7 +461,7 @@ LoseCompletionToOverflow(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -490,7 +494,7 @@ ObserveEnobufs ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -523,7 +527,7 @@ StartTransportProcessing(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -552,7 +556,7 @@ FinishOpenDataContinue(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            selected,
@@ -585,7 +589,7 @@ FinishOpenDataDeferred(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            selected,
@@ -614,7 +618,7 @@ FinishOpenDataClose(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            selected,
@@ -644,7 +648,7 @@ FinishOpenTerminal(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            selected,
@@ -671,7 +675,7 @@ FinishClosingOrStale(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            selected,
@@ -703,7 +707,7 @@ DoubleRecycleBug(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            selected,
@@ -732,7 +736,7 @@ LoseRecycleBug(b) ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -761,7 +765,7 @@ ResolveDeferredContinue ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -792,7 +796,7 @@ ResolveDeferredClose ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -825,7 +829,7 @@ ObserveRecvCanceled ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -855,7 +859,7 @@ HandleCancelCompletion ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -884,7 +888,7 @@ RequestClose ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -920,7 +924,7 @@ ObserveTerminalNoBufferCompletion ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -949,7 +953,7 @@ FinalizeClose ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -968,18 +972,24 @@ FinalizeClose ==
            recvCancelPending,
            recvCancelIssued >>
 
-\* Listener DisposeAsync closes the main ring before it asks ProvidedBufferRing
-\* to munmap without unregistering. The close stops new kernel actions, but any
-\* still-kernel-owned or completion-owned bid remains live until the separate
-\* KernelTeardownComplete environment step models eventual teardown.
-CloseRingFd ==
+\* DrainKernelOperations observes the ring's operation ledger at zero: no request
+\* is live and every published completion was consumed (cqOverflowLost is a
+\* completion that can never be consumed, so it blocks this forever). The
+\* connection was aborted first, and Ring.SealSubmissions then stops any new
+\* request (CanArmRecv / CanRetryArmRecv require teardown = "live").
+ObserveQuiescence ==
+    /\ teardown = "live"
     /\ ~ringFdClosed
     /\ ~ringUnmapped
+    /\ connState # "open"
+    /\ ~recvInFlight
+    /\ ~recvCancelPending
+    /\ KernelOrCompletionOwned = {}
     /\ processing = NoBuffer
-    /\ ringRegistered' = FALSE
-    /\ ringFdClosed' = TRUE
+    /\ teardown' = "quiesced"
     /\ UNCHANGED
-        << kernelTeardownDone,
+        << ringRegistered,
+           ringFdClosed,
            ringUnmapped,
            headCursor,
            tailCursor,
@@ -1000,26 +1010,18 @@ CloseRingFd ==
            recvRetryPending,
            connState >>
 
-\* Environment assumption: after the ring fd is closed, the kernel eventually
-\* finishes tearing down any lingering recv state and releases every
-\* selected/backlogged/published/lost bid back to process-owned disposal.
-KernelTeardownComplete ==
-    /\ ringFdClosed
-    /\ ~kernelTeardownDone
+\* The drain deadline passed before the ledger reached zero (or the loop is
+\* wedged). IoUringQuarantine keeps the ring, its mappings and every buffer
+\* referenced for the rest of the process: nothing is closed or unmapped. The
+\* kernel may keep using the memory, which stays valid. Like quiescence, it is
+\* only reached after the drain aborted the connection.
+Quarantine ==
+    /\ teardown = "live"
+    /\ ~ringFdClosed
     /\ ~ringUnmapped
+    /\ connState # "open"
     /\ processing = NoBuffer
-    /\ kernelTeardownDone' = TRUE
-    /\ selected' = {}
-    /\ completionBacklog' = {}
-    /\ cqOwned' = {}
-    /\ cqOverflowLost' = {}
-    /\ disposed' = disposed \cup KernelOrCompletionOwned
-    /\ recvInFlight' = FALSE
-    /\ recvRearmPending' = FALSE
-    /\ recvCancelPending' = FALSE
-    /\ recvCancelIssued' = FALSE
-    /\ recvRetryPending' = FALSE
-    /\ connState' = "closed"
+    /\ teardown' = "quarantined"
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
@@ -1028,17 +1030,60 @@ KernelTeardownComplete ==
            tailCursor,
            ringOccupancy,
            ringAvailable,
+           selected,
+           completionBacklog,
+           cqOwned,
+           cqOverflowLost,
            processing,
+           disposed,
            compKind,
-           compMore >>
+           compMore,
+           recvInFlight,
+           recvRearmPending,
+           recvCancelPending,
+           recvCancelIssued,
+           recvRetryPending,
+           connState >>
+
+\* Listener DisposeAsync closes the main ring only after quiescence, then asks
+\* ProvidedBufferRing to munmap without unregistering. Closing is not a barrier
+\* (the kernel tears requests down asynchronously after close() returns); it is
+\* safe here only because nothing was live any more.
+CloseRingFd ==
+    /\ ~ringFdClosed
+    /\ ~ringUnmapped
+    /\ teardown = "quiesced"
+    /\ processing = NoBuffer
+    /\ ringRegistered' = FALSE
+    /\ ringFdClosed' = TRUE
+    /\ UNCHANGED
+        << teardown,
+           ringUnmapped,
+           headCursor,
+           tailCursor,
+           ringOccupancy,
+           ringAvailable,
+           selected,
+           completionBacklog,
+           cqOwned,
+           cqOverflowLost,
+           processing,
+           disposed,
+           compKind,
+           compMore,
+           recvInFlight,
+           recvRearmPending,
+           recvCancelPending,
+           recvCancelIssued,
+           recvRetryPending,
+           connState >>
 
 \* ProvidedBufferRing.DisposeAfterRingClosed only unmaps the buffer ring memory;
-\* by this point the model requires explicit kernel teardown completion, so
-\* every live bid must already be reclaimable by the process.
+\* quiescence guarantees no bid is kernel- or completion-owned.
 UnmapBufferRing ==
     /\ ~ringUnmapped
     /\ ringFdClosed
-    /\ kernelTeardownDone
+    /\ teardown = "quiesced"
     /\ processing = NoBuffer
     /\ ringUnmapped' = TRUE
     /\ headCursor' = tailCursor
@@ -1048,7 +1093,7 @@ UnmapBufferRing ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            tailCursor,
            selected,
            completionBacklog,
@@ -1064,25 +1109,26 @@ UnmapBufferRing ==
            recvRetryPending,
            connState >>
 
-\* Model-only mutation: ring fd is already closed, but userspace unmaps the
-\* buffer-ring memory before the kernel teardown step reclaimed every hidden or
-\* published bid. This should violate the post-unmap ownership safety checks.
-UnmapBeforeTeardownBug ==
-    /\ MutateUnmapBeforeTeardown
+\* Model-only mutation: release without quiescence. Covers the pre-fix order
+\* (close the ring fd and trust it to stop the kernel, then unmap) and the
+\* "free after the drain timed out" variant (from quarantine). Kernel- or
+\* completion-owned bids are still live, so this must violate the post-unmap
+\* ownership checks.
+FreeWithoutQuiescenceBug ==
+    /\ MutateFreeWithoutQuiescence
     /\ ~ringUnmapped
-    /\ ringFdClosed
-    /\ ~kernelTeardownDone
+    /\ teardown # "quiesced"
     /\ processing = NoBuffer
     /\ KernelOrCompletionOwned # {}
+    /\ ringRegistered' = FALSE
+    /\ ringFdClosed' = TRUE
     /\ ringUnmapped' = TRUE
     /\ headCursor' = tailCursor
     /\ ringOccupancy' = 0
     /\ ringAvailable' = ZeroCounts
     /\ disposed' = disposed \cup RingAvailableIds
     /\ UNCHANGED
-        << ringRegistered,
-           ringFdClosed,
-           kernelTeardownDone,
+        << teardown,
            tailCursor,
            selected,
            completionBacklog,
@@ -1113,7 +1159,7 @@ UnmapBeforeRingCloseBug ==
     /\ UNCHANGED
         << ringRegistered,
            ringFdClosed,
-           kernelTeardownDone,
+           teardown,
            tailCursor,
            selected,
            completionBacklog,
@@ -1184,10 +1230,11 @@ Next ==
     \/ RequestClose
     \/ ObserveTerminalNoBufferCompletion
     \/ FinalizeClose
+    \/ ObserveQuiescence
+    \/ Quarantine
     \/ CloseRingFd
-    \/ KernelTeardownComplete
     \/ UnmapBufferRing
-    \/ UnmapBeforeTeardownBug
+    \/ FreeWithoutQuiescenceBug
     \/ UnmapBeforeRingCloseBug
 
 Spec ==
@@ -1196,19 +1243,17 @@ Spec ==
 \* TLC deadlock checking is disabled in the configs because quiescent close /
 \* cleanup endpoints are intentional terminal states, and Spec already permits
 \* stuttering there. Liveness therefore speaks only about explicit properties.
-\* WF on KernelTeardownComplete is an environment assumption about eventual
-\* post-close teardown after ringFdClosed; it cannot rescue ordinary pre-close
-\* transport bugs because the action is disabled until shutdown already began.
+\* No fairness is assumed for ObserveQuiescence or Quarantine: whether the drain
+\* reaches zero before its deadline is the subject of Teardown.tla.
 LiveSpec ==
     /\ Spec
     /\ WF_Vars(ResolveDeferredAny)
     /\ WF_Vars(HandleCancelCompletion)
-    /\ WF_Vars(KernelTeardownComplete)
 
 TypeOK ==
     /\ ringRegistered \in BOOLEAN
     /\ ringFdClosed \in BOOLEAN
-    /\ kernelTeardownDone \in BOOLEAN
+    /\ teardown \in TeardownStates
     /\ ringUnmapped \in BOOLEAN
     /\ headCursor \in 0..(RingEntries - 1)
     /\ tailCursor \in 0..(RingEntries - 1)
@@ -1249,23 +1294,26 @@ RingCapacityAndTail ==
 CqCapacity ==
     Cardinality(cqOwned) <= CqEntries
 
-KernelTeardownReclaimsKernelOwners ==
-    kernelTeardownDone =>
-        /\ ringRegistered = FALSE
-        /\ ringFdClosed
+\* Once quiesced, the kernel owns no bid and no request can start again (sealed),
+\* so this holds for the rest of the behaviour, before and after the ring fd closes.
+QuiescenceMeansNoKernelOwners ==
+    teardown = "quiesced" =>
         /\ selected = {}
         /\ completionBacklog = {}
         /\ cqOwned = {}
         /\ cqOverflowLost = {}
 
-KernelTeardownStopsRecv ==
-    kernelTeardownDone =>
+QuiescenceStopsRecv ==
+    teardown = "quiesced" =>
         /\ recvInFlight = FALSE
-        /\ ~recvRearmPending
         /\ ~recvCancelPending
-        /\ ~recvCancelIssued
-        /\ ~recvRetryPending
-        /\ connState = "closed"
+        /\ connState # "open"
+
+\* A quarantined ring is never closed or released.
+QuarantineReleasesNothing ==
+    teardown = "quarantined" =>
+        /\ ~ringFdClosed
+        /\ ~ringUnmapped
 
 NoLiveBuffersAfterUnmap ==
     ringUnmapped =>
@@ -1280,8 +1328,12 @@ NoLiveBuffersAfterUnmap ==
 NoUnmapBeforeRingClosed ==
     ringUnmapped => ringFdClosed
 
-NoUnmapBeforeKernelTeardown ==
-    ringUnmapped => kernelTeardownDone
+NoUnmapBeforeQuiescence ==
+    ringUnmapped => teardown = "quiesced"
+
+\* Closing the ring fd is not a barrier, so it may only follow quiescence.
+NoRingCloseBeforeQuiescence ==
+    ringFdClosed => teardown = "quiesced"
 
 \* Environment liveness only ensures that, once an open connection has no live
 \* recv in flight, deferred-flush and cancel bookkeeping eventually resolve into

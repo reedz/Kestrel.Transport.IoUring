@@ -160,10 +160,12 @@ public class RingEnterBudgetTests
     }
 
     [Fact]
-    public Task Submit_RetryAfterEexist_PreservesPendingBudget()
-        => RunWithTimeout(Submit_RetryAfterEexist_PreservesPendingBudgetCore);
+    public Task Submit_Eexist_IsFatalInsteadOfRetriedForever()
+        => RunWithTimeout(Submit_Eexist_IsFatalInsteadOfRetriedForeverCore);
 
-    private unsafe void Submit_RetryAfterEexist_PreservesPendingBudgetCore()
+    // EEXIST from io_uring_enter means the calling thread is not the ring's SINGLE_ISSUER. It never clears by
+    // itself, so retrying (as before) spun forever.
+    private unsafe void Submit_Eexist_IsFatalInsteadOfRetriedForeverCore()
     {
         if (!Ring.IsSupported) return;
 
@@ -174,11 +176,9 @@ public class RingEnterBudgetTests
         using var ring = CreateRing(enter);
         StageNops(ring, 2);
 
-        int submitted = ring.Submit();
-
-        enter.Calls.Select(static call => call.ToSubmit)
-            .Should().Equal(new uint[] { 2u, 2u }, "retrying after EEXIST should keep the pending submit budget");
-        submitted.Should().Be(2);
+        FluentActions.Invoking(() => ring.Submit())
+            .Should().Throw<InvalidOperationException>().WithMessage("*EEXIST*");
+        enter.Calls.Should().ContainSingle("EEXIST must not be retried");
     }
 
     [Fact]

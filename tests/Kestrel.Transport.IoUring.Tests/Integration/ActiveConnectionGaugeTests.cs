@@ -8,14 +8,15 @@ using Xunit;
 namespace Kestrel.Transport.IoUring.Tests.Integration;
 
 /// <summary>
-/// The process-wide active-connection gauge must not drift when a listener is disposed with connections that
-/// were never released through the normal close path; later zero-assertions would otherwise fail forever.
+/// The process-wide active-connection gauge must not drift when the IO loop dies with live connections; later
+/// zero-assertions would otherwise fail forever. The dying loop drains its ring, which closes those connections
+/// through the normal release path.
 /// </summary>
 [Collection(ProcessWideResourcesCollection.Name)]
 public class ActiveConnectionGaugeTests
 {
     [Fact]
-    public async Task DisposingAfterTheLoopDiedWithLiveConnections_RestoresTheProcessWideGauge()
+    public async Task TheLoopDyingWithLiveConnections_RestoresTheProcessWideGauge()
     {
         if (!Ring.IsSupported) return;
 
@@ -35,13 +36,13 @@ public class ActiveConnectionGaugeTests
             connection.Should().NotBeNull();
             Volatile.Read(ref IoUringConnectionListener.s_activeConnections).Should().Be(before + 1);
 
-            // Kill the loop while the client is still connected: the connection can never be released normally.
             fail.Set();
             await client.GetStream().WriteAsync(new byte[] { 1 }); // wakes the parked loop
             await listener.IoLoopStopped.WaitAsync(TimeSpan.FromSeconds(20));
 
+            listener.Teardown.Should().Be(IoUringConnectionListener.TeardownOutcome.Quiesced);
             Volatile.Read(ref IoUringConnectionListener.s_activeConnections)
-                .Should().Be(before + 1, "a dead loop cannot release the connection, so dispose must");
+                .Should().Be(before, "the dying loop drains its ring, which releases the connection");
         }
         finally
         {

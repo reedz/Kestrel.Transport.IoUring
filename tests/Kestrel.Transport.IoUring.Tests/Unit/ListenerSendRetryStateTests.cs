@@ -157,7 +157,7 @@ public class ListenerSendRetryStateTests
         return true;
     }
 
-    private readonly record struct ResumeSelection(long Slot, ushort Generation);
+    private readonly record struct ResumeSelection(long Slot, long Generation);
 
     private struct FakeConnectionSlot
     {
