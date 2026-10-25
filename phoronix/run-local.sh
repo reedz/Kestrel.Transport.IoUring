@@ -81,6 +81,7 @@ check_csv rings       "$RINGS_LIST"       '[1-9][0-9]{0,2}|auto'
 [[ "$RUNS" =~ ^[1-9][0-9]?$ ]] || die "invalid --runs '$RUNS'"
 [[ "$NAME" =~ ^[a-z0-9]([a-z0-9-]{0,58}[a-z0-9])?$ ]] || die "invalid --name '$NAME' (lowercase letters, digits and single hyphens; PTS would rewrite anything else)"
 [[ "$NAME" != *--* ]] || die "invalid --name '$NAME' (no double hyphens; PTS would collapse them)"
+[ "$NAME" != "0" ] || die "invalid --name '0' (PTS treats it as empty and invents a timestamp)"
 
 [ -n "$PTS_BIN" ] && [ -x "$PTS_BIN" ] || die "phoronix-test-suite not found; pass --pts PATH or set PTS"
 
@@ -92,7 +93,7 @@ if [ "$NO_EGRESS" = "1" ]; then
     FORWARD_ENV=()
     for name in $(compgen -e); do
         case "$name" in
-            PTS_WARMUP|PTS_KESTREL_PORT|PTS_USER_PATH_OVERRIDE|IOURING_*|DOTNET_*) FORWARD_ENV+=("$name=${!name}") ;;
+            PTS_WARMUP|PTS_KESTREL_PORT|IOURING_*|DOTNET_*) FORWARD_ENV+=("$name=${!name}") ;;
         esac
     done
     [ "${#FORWARD_ENV[@]}" -eq 0 ] || echo "run-local: forwarding into the namespace: ${FORWARD_ENV[*]}"
@@ -100,7 +101,7 @@ if [ "$NO_EGRESS" = "1" ]; then
     exec sudo unshare -n bash -c '
         ip link set lo up || exit 1
         [ "$(ip -o link show | wc -l)" = 1 ] || { echo "run-local: the namespace has more than the loopback interface" >&2; exit 1; }
-        user="$0"; shift
+        user="$0"
         exec sudo -u "$user" -H env "$@"' \
         "$(id -un)" PATH="$PATH" PTS="$PTS_BIN" "${FORWARD_ENV[@]}" "$SELF" "${FORWARD_ARGS[@]}"
 fi
@@ -131,11 +132,21 @@ flock -n 9 || die "another run-local.sh is already using this installation"
 RESULT_DIR="${CFG_USER_PATH}test-results/$NAME"
 [ ! -e "$RESULT_DIR" ] || die "a result named '$NAME' already exists in ${CFG_USER_PATH}test-results/; PTS would silently skip configurations that are already stored. Pick a new --name."
 
-count_items() { local IFS=,; local -a items; read -ra items <<< "$1"; echo "${#items[@]}"; }
-EXPECTED_RESULTS=$(( $(count_items "$TRANSPORT_LIST") * $(count_items "$WORKLOAD_LIST") * $(count_items "$CONNECTIONS_LIST") * $(count_items "$RUNTIME_LIST") * $(count_items "$RINGS_LIST") ))
+# The exact configurations that must end up stored, in the argument format PTS records (option order of
+# test-definition.xml). Compared as a set, not only by count: a count can match while the wrong configurations ran.
+EXPECTED_ARGS=()
+split_csv() { local IFS=,; read -ra "$1" <<< "$2"; }
+split_csv T_LIST "$TRANSPORT_LIST"; split_csv W_LIST "$WORKLOAD_LIST"; split_csv C_LIST "$CONNECTIONS_LIST"
+split_csv R_LIST "$RUNTIME_LIST"; split_csv G_LIST "$RINGS_LIST"
+for t in "${T_LIST[@]}"; do for w in "${W_LIST[@]}"; do for c in "${C_LIST[@]}"; do for rt in "${R_LIST[@]}"; do for g in "${G_LIST[@]}"; do
+    EXPECTED_ARGS+=("-d $DURATION --transport $t --workload $w -c $c --runtime $rt --rings $g")
+done; done; done; done; done
+EXPECTED_RESULTS="${#EXPECTED_ARGS[@]}"
 
 # PTS modules can reach the network on their own (direct cURL, mail) no matter what NoNetworkCommunication says.
 export PTS_IGNORE_MODULES=1
+# The launcher's values already cover every option; a stray PRESET_OPTIONS must not take part in the selection.
+unset PRESET_OPTIONS
 export PRESET_OPTIONS_VALUES="$OPT.transport=$TRANSPORT_LIST;$OPT.workload=$WORKLOAD_LIST;$OPT.connections=$CONNECTIONS_LIST;$OPT.runtime=$RUNTIME_LIST;$OPT.rings=$RINGS_LIST;$OPT.duration=$DURATION"
 export FORCE_TIMES_TO_RUN="$RUNS"
 export TEST_RESULTS_NAME="$NAME" TEST_RESULTS_IDENTIFIER="$NAME"
@@ -175,23 +186,31 @@ fi
 
 # Process exit codes and the invalid-runs log are not enough on their own: PTS drops failed repetitions from the
 # average without saying so, records an empty stub for a failed configuration, and can skip configurations without
-# running any hook. So count what was actually stored: every configuration must hold exactly --runs valid numbers.
-COVERAGE="$(php -r '
+# running any hook. So compare what was actually stored with what was requested: every requested configuration must
+# be stored exactly once with exactly --runs valid numbers, and nothing else may be stored.
+COVERAGE="$(printf '%s\n' "${EXPECTED_ARGS[@]}" | php -r '
+    $expected = array_filter(explode("\n", stream_get_contents(STDIN)), "strlen");
     $d = new DOMDocument();
-    if (!file_exists($argv[1]) || !@$d->load($argv[1])) { echo "0\n"; exit; }
-    $runs = (int) $argv[2]; $good = 0; $bad = [];
+    if (!file_exists($argv[1]) || !@$d->load($argv[1])) { echo "0\nno readable stored result\n"; exit; }
+    $runs = (int) $argv[2]; $good = 0; $bad = []; $seen = [];
     foreach ($d->getElementsByTagName("Result") as $r) {
         $text = function ($tag) use ($r) { $n = $r->getElementsByTagName($tag); return $n->length ? trim($n->item(0)->nodeValue) : ""; };
+        $args = $text("Arguments");
+        if (!in_array($args, $expected, true)) { $bad[] = "unexpected configuration stored: $args"; continue; }
+        if (isset($seen[$args])) { $bad[] = "configuration stored twice: $args"; continue; }
+        $seen[$args] = true;
         $positive = fn($v) => is_numeric(trim($v)) && (float) $v > 0;
         $values = array_values(array_filter(explode(":", $text("RawString")), $positive));
         if (!$values && $positive($text("Value"))) { $values = [$text("Value")]; }
-        if (count($values) === $runs) { $good++; } else { $bad[] = $text("Description") . ": " . count($values) . " of $runs valid repetitions stored"; }
+        if (count($values) === $runs) { $good++; } else { $bad[] = "$args: " . count($values) . " of $runs valid repetitions stored"; }
     }
+    foreach ($expected as $args) { if (!isset($seen[$args])) { $bad[] = "requested configuration was not stored: $args"; } }
     echo $good, "\n", implode("\n", $bad), "\n";' "$RESULT_DIR/composite.xml" "$RUNS")"
 RESULTS_GOOD="$(head -n 1 <<< "$COVERAGE")"
-if [ "$RESULTS_GOOD" != "$EXPECTED_RESULTS" ]; then
-    echo "run-local: $RESULTS_GOOD of $EXPECTED_RESULTS configuration(s) hold $RUNS valid repetition(s):" >&2
-    tail -n +2 <<< "$COVERAGE" | sed '/^$/d; s/^/  /' >&2
+EXTRA_PROBLEMS="$(tail -n +2 <<< "$COVERAGE" | sed '/^$/d')"
+if [ "$RESULTS_GOOD" != "$EXPECTED_RESULTS" ] || [ -n "$EXTRA_PROBLEMS" ]; then
+    echo "run-local: $RESULTS_GOOD of $EXPECTED_RESULTS requested configuration(s) hold $RUNS valid repetition(s):" >&2
+    [ -z "$EXTRA_PROBLEMS" ] || sed 's/^/  /' <<< "$EXTRA_PROBLEMS" >&2
     STATUS=1
 fi
 exit "$STATUS"

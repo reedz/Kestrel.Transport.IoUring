@@ -12,9 +12,8 @@
  *
  * Faithfulness to PTS 10.8:
  *  - The file is chosen the way PTS chooses it (pts-core.php, pts_config::get_config_file_location):
- *    PTS_USER_PATH_OVERRIDE when it is an existing directory (appended to literally, without adding a slash),
- *    otherwise <POSIX home>/.phoronix-test-suite/, /var/lib/phoronix-test-suite/ for a privileged daemon-style
- *    install, and /etc/phoronix-test-suite.xml there.
+ *    <POSIX home>/.phoronix-test-suite/user-config.xml, or /var/lib/phoronix-test-suite/ and
+ *    /etc/phoronix-test-suite.xml for a privileged daemon-style install. PTS_USER_PATH_OVERRIDE is refused (see below).
  *  - Values are read with the same traversal as nye_XmlReader::getXMLValue: getElementsByTagName() of the first
  *    path step over the whole document, then the FIRST match narrowed step by step, and the value is used only
  *    when exactly one node remains; otherwise PTS uses its built-in default. A shadow <Options> element placed
@@ -72,20 +71,17 @@ function pts_xml_value(DOMDocument $doc, string $path): ?string
 $problems = [];
 
 $daemon = is_writable('/var/lib/') && is_writable('/etc');
+// PTS expands "~/" in its directory settings (installation, cache, results) from the ACCOUNT's home directory, never
+// from PTS_USER_PATH_OVERRIDE, so with an override PTS would read user-config.xml from one place and install and store
+// results in another. The profile's helpers rely on one coherent root, so any override is refused. This is checked
+// before is_dir(): PTS changes its working directory before it reads the variable, so even a relative path that does
+// not exist from here can be a real directory to PTS.
 $override = getenv('PTS_USER_PATH_OVERRIDE');
-if ($override !== false && $override !== '' && is_dir($override)) {
-    $userPath = $override;
-    if (substr($override, -1) !== '/') {
-        $problems[] = "PTS_USER_PATH_OVERRIDE must end with '/': PTS appends file names without a separator";
-    }
-    if ($override[0] !== '/') {
-        $problems[] = 'PTS_USER_PATH_OVERRIDE must be an absolute path: PTS changes its working directory before it reads it';
-    }
-} elseif ($daemon) {
-    $userPath = '/var/lib/phoronix-test-suite/';
-} else {
-    $userPath = pts_home() . '.phoronix-test-suite/';
+if ($override !== false && $override !== '') {
+    $problems[] = 'PTS_USER_PATH_OVERRIDE is set; it is not supported (PTS expands the installation, cache and results '
+        . 'directories from the account home, not from it, and resolves a relative value after changing directory)';
 }
+$userPath = $daemon ? '/var/lib/phoronix-test-suite/' : pts_home() . '.phoronix-test-suite/';
 
 if ($daemon || (is_file('/etc/phoronix-test-suite.xml') && is_writable('/etc/phoronix-test-suite.xml'))) {
     $effective = '/etc/phoronix-test-suite.xml';
@@ -104,6 +100,8 @@ $required = [
     'OpenBenchmarking/AllowResultUploadsToOpenBenchmarking' => 'FALSE',
     'Testing/AlwaysUploadResultsToOpenBenchmarking' => 'FALSE',
     'BatchMode/UploadResults' => 'FALSE',
+    // With TRUE, PTS ignores the launcher's preset values and runs every menu combination instead.
+    'BatchMode/RunAllTestCombinations' => 'FALSE',
     // PTS tests NoInternetCommunication first (an else-if): with it TRUE, NoNetworkCommunication is never applied.
     'Networking/NoInternetCommunication' => 'FALSE',
     'Networking/NoNetworkCommunication' => 'TRUE',
@@ -126,10 +124,13 @@ if (!is_file($target) || !is_readable($target)) {
     } else {
         foreach ($required as $path => $expected) {
             $value = pts_xml_value($doc, 'PhoronixTestSuite/Options/' . $path);
+            // Booleans are parsed by filter_var, which ignores surrounding whitespace; directory values are used as
+            // written (PTS expands "~/" in them literally), so those are compared untrimmed.
+            $isPath = substr($expected, 0, 2) === '~/';
             if ($value === null) {
                 $problems[] = "$target: PTS cannot read $path (missing, duplicated or shadowed) and would use its built-in default";
-            } elseif (trim($value) !== $expected) {
-                $problems[] = "$target: $path is '" . trim($value) . "', it must be '$expected'";
+            } elseif (($isPath ? $value : trim($value)) !== $expected) {
+                $problems[] = "$target: $path is '" . ($isPath ? $value : trim($value)) . "', it must be '$expected'";
             }
         }
     }

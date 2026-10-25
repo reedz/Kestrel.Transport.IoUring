@@ -62,8 +62,11 @@ Guards that make a run fail instead of producing a misleading number:
   0.5 GB of cached downloads.
 * PTS itself: tested with PTS master `be12163` (v10.8.6), <https://github.com/phoronix-test-suite/phoronix-test-suite>.
   The commands below assume `phoronix-test-suite` is on `PATH` or exported as `PTS=/path/to/phoronix-test-suite`.
-* Network access only for `fetch-artifacts.sh` (plain `curl` to the vendors' download hosts). PTS, the install and
-  every measurement run with **no network at all**: the build is offline (see below).
+* Network access is needed only by `fetch-artifacts.sh` (plain `curl` to the vendors' download hosts) and by the
+  package manager when PTS installs the build prerequisites (`build-essential`, `libssl-dev`; install them first to
+  keep the rest offline). The profile's own install and run steps need no network: the build is offline (see
+  below) and PTS runs with `NoNetworkCommunication=TRUE`. That is about this profile's scripts and PTS's
+  own gated helpers, not a proof of silence; see [Not uploading](#not-uploading-what-is-and-is-not-guaranteed).
 
 ## Quick start
 
@@ -124,36 +127,45 @@ Done by the profile and its scripts:
   are linked from SDK 10 (which ships the same version), and `dotnet publish` restores from an empty local source
   with `NuGetAudit` off, so any attempt to reach nuget.org fails loudly instead of succeeding.
 * **The configuration is checked as PTS will read it**, not by grepping: `runtime/check-pts-config.php` chooses the
-  file the way PTS does (`PTS_USER_PATH_OVERRIDE` is appended literally without a slash and must be absolute,
-  otherwise the POSIX account's home, not `$HOME`) and reads each value with the same traversal as PTS's own
-  `getXMLValue` (first matching descendant, exactly one leaf), so a shadowing `<Options>` or a duplicated leaf that
-  makes PTS ignore the real values is caught. It requires the four upload/usage keys `FALSE`,
+  file the way PTS does (the POSIX account's home, not `$HOME`) and reads each value with the same traversal as
+  PTS's own `getXMLValue` (first matching descendant, exactly one leaf), so a shadowing `<Options>` or a duplicated
+  leaf that makes PTS ignore the real values is caught. It requires the four upload/usage keys `FALSE`,
   `NoNetworkCommunication=TRUE`, `NoInternetCommunication=FALSE` (PTS tests the latter first, with an `else if`, so
-  `TRUE` there would leave network helpers enabled), empty `AutoLoadModules` and the standard directories. This
-  matters because PTS silently falls back to defaults that **enable** uploads whenever it cannot read a value; a
-  double hyphen inside an XML comment (`<!-- ... --offline ... -->`) is malformed XML and triggered exactly that
-  during development. Plain, well-formed comments are fine.
+  `TRUE` there would leave network helpers enabled), `RunAllTestCombinations=FALSE` (otherwise PTS ignores the
+  launcher's option values and runs every menu combination), empty `AutoLoadModules` and the standard directories
+  (compared exactly, without trimming). `PTS_USER_PATH_OVERRIDE` is refused outright: PTS expands `~/` in the
+  directory settings from the account home, never from the override, so it would split the configuration from the
+  installation and results, and a relative value is resolved only after PTS changes directory. This matters
+  because PTS silently falls back to defaults that **enable** uploads whenever it cannot read a value; a double
+  hyphen inside an XML comment (`<!-- ... --offline ... -->`) is malformed XML and triggered exactly that during
+  development. Plain, well-formed comments are fine.
 * `run-local.sh` and every `pre.sh` refuse to proceed unless that check passes (the setup hook runs under the
   environment PTS gives it, so a variable set only for the hook is checked too). `run-local.sh` additionally sets
   `PTS_IGNORE_MODULES=1` (modules such as Pushover or e-mail export use direct cURL/SMTP regardless of
   `NoNetworkCommunication`), refuses to run a profile that is not installed, and only ever calls `batch-run`.
   Nothing in this directory calls `upload-result` or `upload-test-profile`.
-* The profile's own scripts make no requests except to `127.0.0.1`, and those `curl` calls ignore `~/.curlrc` and
-  proxy variables.
+* The profile's hook scripts (`pre.sh`, `run-test.sh`, `post.sh`) make no requests except to `127.0.0.1`, and those
+  `curl` calls ignore `~/.curlrc` and proxy variables. `fetch-artifacts.sh` is the one script that deliberately
+  contacts remote hosts.
 
 Not guaranteed (these are PTS settings and ordinary processes, not an OS sandbox):
 
 * **PTS has network paths that `NoNetworkCommunication` does not gate.** Examples verified in its source: on
-  Google Compute Engine, hardware detection requests the metadata server directly; PTS modules (also when selected
-  through the environment by a bare `phoronix-test-suite` command rather than by `run-local.sh`) can use raw cURL or
-  mail; its dependency installer runs `apt`/`apt-file`, which have their own network access; a remote
-  `PTS_DOWNLOAD_CACHE` is fetched without that check (refused here). Only the first of these concerns a standard
-  setup, and `run-local.sh` only issues `batch-run`, so a standard run does not reach them. The .NET SDK's own
-  network behaviour is switched off (telemetry, workload update notices, offline restore) but that is not a proof of
-  silence either.
-* PTS's raw option strings are interpreted by a shell before this profile can validate them; `run-local.sh`
-  validates its inputs, but a hand-written `PRESET_OPTIONS`/`TEST_EXEC_PREPEND` is trusted input, which is why
-  `run-local.sh` refuses to run with such variables set.
+  Google Compute Engine, hardware detection requests the metadata server directly, and that happens on every PTS
+  start including `batch-run`; PTS modules (also when selected through the environment by a bare
+  `phoronix-test-suite` command rather than by `run-local.sh`) can use raw cURL or mail; its dependency installer
+  runs `apt`/`apt-file`, which have their own network access; a remote `PTS_DOWNLOAD_CACHE` is fetched without that
+  check (refused here). Only a Google Cloud host is affected by the first, and `run-local.sh` never installs
+  dependencies or enables modules. The .NET SDK's own network behaviour is switched off (telemetry, workload update
+  notices, offline restore) but that is not a proof of silence either. For a zero-IP-egress assurance use the
+  namespace mode below.
+* PTS's raw option strings are interpreted by a shell before this profile can validate them. `run-local.sh`
+  validates its own inputs and refuses to run while variables such as `TEST_EXEC_PREPEND` or `PTS_DOWNLOAD_CACHE`
+  are set; it does not refuse `PRESET_OPTIONS`, it unsets it (the launcher's `PRESET_OPTIONS_VALUES` covers every
+  option), so a hand-written `PRESET_OPTIONS` given to a bare `phoronix-test-suite` command remains trusted input.
+* **A hook killed with SIGKILL runs no `EXIT` trap** (PTS's own process-killing helper uses SIGKILL), so the invalid
+  repetition may not reach the log. It is still never counted: the repetition status starts as failed and the setup
+  latch starts as incomplete, and the stored-result comparison at the end catches anything that is missing.
 * **A guarantee about IP traffic that does not depend on any setting** is to run with only loopback available:
 
   ```bash
@@ -162,7 +174,7 @@ Not guaranteed (these are PTS settings and ordinary processes, not an OS sandbox
 
   `--no-egress` creates a fresh network namespace every time (it does not trust an inherited marker), verifies it has
   only the loopback interface, drops back to your user inside it and forwards only an allowlist of `PTS_WARMUP`,
-  `PTS_KESTREL_PORT`, `PTS_USER_PATH_OVERRIDE`, `IOURING_*` and `DOTNET_*` variables (echoed, because `sudo` would
+  `PTS_KESTREL_PORT`, `IOURING_*` and `DOTNET_*` variables (echoed, because `sudo` would
   otherwise silently drop them). This was tested: the host reached the internet, the namespace did not, and both the
   install (run with `unshare -n`) and measured matrices completed. A network namespace isolates IP networking only;
   it does not confine the filesystem or host IPC such as Unix sockets.
