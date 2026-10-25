@@ -17,27 +17,52 @@ public sealed class IoUringTransportFactory :
     private readonly IoUringTransportOptions _options;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<IoUringTransportFactory> _logger;
+    private readonly Func<bool> _isSupported;
+    private readonly Func<uint, uint, Ring> _createRing;
     // Lazily-created socket fallback — only used when io_uring is unavailable.
     private readonly Lazy<SocketTransportFactory> _socketFallback;
+    private readonly object _bindingsLock = new();
+    private IoUringBindingInfo[] _bindings = [];
 
     /// <summary>Initializes a new instance of the <see cref="IoUringTransportFactory"/> class.</summary>
     public IoUringTransportFactory(
         IOptions<IoUringTransportOptions> options,
         IOptions<SocketTransportOptions> socketOptions,
         ILoggerFactory loggerFactory)
+        : this(options, socketOptions, loggerFactory, isSupported: null, createRing: null)
+    {
+    }
+
+    // Test seam: lets unit tests simulate an unsupported host or a failing ring setup.
+    internal IoUringTransportFactory(
+        IOptions<IoUringTransportOptions> options,
+        IOptions<SocketTransportOptions> socketOptions,
+        ILoggerFactory loggerFactory,
+        Func<bool>? isSupported,
+        Func<uint, uint, Ring>? createRing)
     {
         _options = options.Value;
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<IoUringTransportFactory>();
+        _isSupported = isSupported ?? (() => Ring.IsSupported);
+        _createRing = createRing ?? ((entries, flags) => new Ring(entries, flags));
         _socketFallback = new Lazy<SocketTransportFactory>(
             () => new SocketTransportFactory(socketOptions, loggerFactory));
     }
 
     /// <summary>
-    /// <see langword="true"/> when the io_uring transport is active;
-    /// <see langword="false"/> when the socket transport fallback is in use.
+    /// <see langword="true"/> when this host supports io_uring (a kernel capability probe).
+    /// This does <b>not</b> mean any listener is using io_uring: an endpoint type io_uring does not serve,
+    /// a failed ring setup, or an explicit socket-transport configuration still uses SocketTransport.
+    /// Use <see cref="Bindings"/> to see what actually served each bind.
     /// </summary>
     public static bool IsUsingIoUring => Ring.IsSupported;
+
+    /// <summary>
+    /// What actually served each successful <see cref="BindAsync"/> call on this factory, in bind order.
+    /// A refused bind (see <see cref="IoUringTransportOptions.RequireIoUring"/>) is not listed.
+    /// </summary>
+    public IReadOnlyList<IoUringBindingInfo> Bindings => Volatile.Read(ref _bindings);
 
     /// <inheritdoc />
     public async ValueTask<IConnectionListener> BindAsync(
@@ -47,14 +72,21 @@ public sealed class IoUringTransportFactory :
         _options.Validate();
 
         if (!CanBind(endpoint))
-            return await _socketFallback.Value.BindAsync(endpoint, cancellationToken).ConfigureAwait(false);
-
-        if (!Ring.IsSupported)
         {
-            _logger.LogWarning(
-                "io_uring is not supported on this system (Linux 5.1+ required). " +
-                "Falling back to the default socket transport.");
-            return await _socketFallback.Value.BindAsync(endpoint, cancellationToken).ConfigureAwait(false);
+            return await BindSocketTransportAsync(
+                endpoint,
+                $"endpoint type {endpoint.GetType().Name} is not served by io_uring",
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        if (!_isSupported())
+        {
+            return await FallbackOrThrowAsync(
+                endpoint,
+                "io_uring is not supported on this host (kernel too old, disabled via " +
+                "kernel.io_uring_disabled/seccomp, or IOURING_FORCE_FALLBACK=1)",
+                inner: null,
+                cancellationToken).ConfigureAwait(false);
         }
 
         if (_options.ThreadCount > 1)
@@ -65,26 +97,31 @@ public sealed class IoUringTransportFactory :
             try
             {
                 var multiListener = new IoUringMultiListener(endpoint, _options, _loggerFactory);
+                RecordIoUringBinding(multiListener);
                 return multiListener;
             }
             catch (InvalidOperationException ex)
             {
-                _logger.LogWarning(ex,
-                    "Failed to initialize io_uring; falling back to the default socket transport.");
-                return await _socketFallback.Value.BindAsync(endpoint, cancellationToken).ConfigureAwait(false);
+                return await FallbackOrThrowAsync(
+                    endpoint,
+                    $"io_uring ring setup failed: {ex.Message}",
+                    ex,
+                    cancellationToken).ConfigureAwait(false);
             }
         }
 
         Ring ring;
         try
         {
-            ring = new Ring((uint)_options.EffectiveRingSize, GetSetupFlags());
+            ring = _createRing((uint)_options.EffectiveRingSize, GetSetupFlags());
         }
         catch (InvalidOperationException ex)
         {
-            _logger.LogWarning(ex,
-                "Failed to initialize io_uring; falling back to the default socket transport.");
-            return await _socketFallback.Value.BindAsync(endpoint, cancellationToken).ConfigureAwait(false);
+            return await FallbackOrThrowAsync(
+                endpoint,
+                $"io_uring ring setup failed: {ex.Message}",
+                ex,
+                cancellationToken).ConfigureAwait(false);
         }
         var logger = _loggerFactory.CreateLogger<IoUringConnectionListener>();
         IoUringConnectionListener? listener = null;
@@ -102,7 +139,77 @@ public sealed class IoUringTransportFactory :
             throw;
         }
 
+        RecordIoUringBinding(listener);
         return listener;
+    }
+
+    private bool IsIoUringRequired =>
+        _options.RequireIoUring ||
+        Environment.GetEnvironmentVariable("IOURING_REQUIRE") == "1";
+
+    private async ValueTask<IConnectionListener> FallbackOrThrowAsync(
+        EndPoint endpoint,
+        string reason,
+        Exception? inner,
+        CancellationToken cancellationToken)
+    {
+        if (IsIoUringRequired)
+        {
+            throw new NotSupportedException(
+                $"The io_uring transport is required (IoUringTransportOptions.RequireIoUring or IOURING_REQUIRE=1) " +
+                $"but cannot serve {endpoint}: {reason}.",
+                inner);
+        }
+
+        if (inner is null)
+        {
+            _logger.LogWarning(
+                "{Reason}. Falling back to the default socket transport.",
+                reason);
+        }
+        else
+        {
+            _logger.LogWarning(
+                inner,
+                "Failed to initialize io_uring; falling back to the default socket transport.");
+        }
+
+        return await BindSocketTransportAsync(endpoint, reason, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<IConnectionListener> BindSocketTransportAsync(
+        EndPoint endpoint,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        IConnectionListener listener =
+            await _socketFallback.Value.BindAsync(endpoint, cancellationToken).ConfigureAwait(false);
+        AddBinding(new IoUringBindingInfo(
+            listener.EndPoint,
+            IoUringBindingMode.SocketFallback,
+            RingCount: 0,
+            SetupFlags: 0,
+            UsesProvidedBufferRing: false,
+            FallbackReason: reason));
+        return listener;
+    }
+
+    private void RecordIoUringBinding(IConnectionListener listener)
+    {
+        var info = (IIoUringListenerInfo)listener;
+        AddBinding(new IoUringBindingInfo(
+            listener.EndPoint,
+            IoUringBindingMode.IoUring,
+            info.RingCount,
+            info.SetupFlags,
+            info.UsesProvidedBufferRing,
+            FallbackReason: null));
+    }
+
+    private void AddBinding(IoUringBindingInfo binding)
+    {
+        lock (_bindingsLock)
+            _bindings = [.. _bindings, binding];
     }
 
     /// <inheritdoc />

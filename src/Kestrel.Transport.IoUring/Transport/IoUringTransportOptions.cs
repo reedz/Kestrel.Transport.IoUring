@@ -87,6 +87,17 @@ public sealed class IoUringTransportOptions
     public bool EnableMultishotAccept { get; set; } = true;
 
     /// <summary>
+    /// When <see langword="true"/>, binding an IP endpoint throws <see cref="NotSupportedException"/> instead of
+    /// silently falling back to the socket transport when io_uring is unavailable (unsupported kernel, seccomp,
+    /// <c>kernel.io_uring_disabled</c>, <c>IOURING_FORCE_FALLBACK=1</c>) or ring setup fails. Intended for
+    /// benchmarks and tests that must not report socket-transport results as io_uring results.
+    /// The <c>IOURING_REQUIRE=1</c> environment variable has the same effect. Endpoint types io_uring never serves
+    /// (for example Unix domain sockets) still use the socket transport; see
+    /// <see cref="Transport.IoUringTransportFactory.Bindings"/> to inspect what actually served each bind.
+    /// </summary>
+    public bool RequireIoUring { get; set; }
+
+    /// <summary>
     /// Enables registered file descriptors. This requires a synchronous kernel table update
     /// for every accepted and closed connection, so it is disabled by default for balanced
     /// persistent-connection and connection-churn performance.

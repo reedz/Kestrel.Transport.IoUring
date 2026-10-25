@@ -15,7 +15,7 @@ using Microsoft.Extensions.Logging;
 
 namespace Kestrel.Transport.IoUring.Transport;
 
-internal sealed class IoUringConnectionListener : IConnectionListener, IMultiListenerWorker
+internal sealed class IoUringConnectionListener : IConnectionListener, IMultiListenerWorker, IIoUringListenerInfo
 {
     private readonly Ring _ring;
     private readonly ILogger _logger;
@@ -109,6 +109,12 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     internal static long s_activeConnections;
 
     public EndPoint EndPoint { get; private set; }
+
+    int IIoUringListenerInfo.RingCount => 1;
+
+    uint IIoUringListenerInfo.SetupFlags => _ring.SetupFlags;
+
+    bool IIoUringListenerInfo.UsesProvidedBufferRing => _bufferRing != null;
 
     public IoUringConnectionListener(EndPoint endPoint, Ring ring, IoUringTransportOptions options, ILogger logger)
     {

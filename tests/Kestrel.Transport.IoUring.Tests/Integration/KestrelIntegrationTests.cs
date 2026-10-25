@@ -5,8 +5,10 @@ using System.Text;
 using FluentAssertions;
 using Kestrel.Transport.IoUring.Transport;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Xunit;
 
@@ -26,7 +28,9 @@ public class KestrelIntegrationTests : IAsyncLifetime
         int port = GetRandomPort();
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
-        builder.WebHost.UseIoUring();
+        // Refuse a silent socket fallback: on a host that supports io_uring these tests must exercise it.
+        // (IOURING_FORCE_FALLBACK=1 makes Ring.IsSupported false, so the socket-fallback CI lane still works.)
+        builder.WebHost.UseIoUring(o => o.RequireIoUring = Ring.IsSupported);
         builder.WebHost.ConfigureKestrel(o => o.Listen(IPAddress.Loopback, port));
 
         _app = builder.Build();
@@ -74,6 +78,22 @@ public class KestrelIntegrationTests : IAsyncLifetime
         _client.Dispose();
         await _app.StopAsync();
         await _app.DisposeAsync();
+    }
+
+    [Fact]
+    public void Transport_IsActuallyIoUring_WhenHostSupportsIt()
+    {
+        var factory = _app.Services
+            .GetServices<IConnectionListenerFactory>()
+            .OfType<IoUringTransportFactory>()
+            .Single();
+
+        var binding = factory.Bindings.Should().ContainSingle().Subject;
+        binding.Mode.Should().Be(
+            Ring.IsSupported ? IoUringBindingMode.IoUring : IoUringBindingMode.SocketFallback,
+            "a green integration run must not be produced by the socket transport on an io_uring host");
+        if (Ring.IsSupported)
+            binding.RingCount.Should().Be(1);
     }
 
     [Fact]
@@ -293,6 +313,7 @@ public class KestrelIntegrationTests : IAsyncLifetime
         {
             options.ThreadCount = threadCount;
             options.MaxConnections = 32;
+            options.RequireIoUring = Ring.IsSupported;
         });
         builder.WebHost.ConfigureKestrel(options =>
             options.Listen(IPAddress.Loopback, 0));
@@ -321,6 +342,7 @@ public class KestrelIntegrationTests : IAsyncLifetime
             options.BufferRingSize = 2;
             options.MaxConnections = 1;
             options.AcceptQueueCapacity = 1;
+            options.RequireIoUring = Ring.IsSupported;
         });
         builder.WebHost.ConfigureKestrel(options =>
             options.Listen(IPAddress.Loopback, 0));

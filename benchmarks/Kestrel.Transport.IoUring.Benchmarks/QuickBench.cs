@@ -4,8 +4,11 @@ using System.Net;
 using System.Numerics;
 using System.Text.RegularExpressions;
 using Kestrel.Transport.IoUring;
+using Kestrel.Transport.IoUring.Transport;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace Kestrel.Transport.IoUring.Benchmarks;
@@ -227,6 +230,8 @@ public static partial class QuickBench
             {
                 options.RingSize = ringSize;
                 options.BufferRingSize = bufferRingSize;
+                // A benchmark labelled io_uring must never be served by the socket transport.
+                options.RequireIoUring = true;
             });
         }
         else if (transport != "socket")
@@ -237,6 +242,14 @@ public static partial class QuickBench
         var app = builder.Build();
         app.MapGet("/", () => "OK");
         await app.StartAsync();
+
+        string actual = app.Services
+            .GetServices<IConnectionListenerFactory>()
+            .OfType<IoUringTransportFactory>()
+            .SingleOrDefault()?.Bindings
+            .Select(b => $"{b.Mode}(rings={b.RingCount})")
+            .FirstOrDefault() ?? "SocketTransport";
+        Console.WriteLine($"TRANSPORT {actual}");
         Console.WriteLine("READY");
         Console.Out.Flush();
         await app.WaitForShutdownAsync();
@@ -452,11 +465,27 @@ public static partial class QuickBench
         process.BeginErrorReadLine();
 
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        string? reportedTransport = null;
         while (true)
         {
             string? line = await process.StandardOutput.ReadLineAsync(timeout.Token);
+            if (line != null && line.StartsWith("TRANSPORT ", StringComparison.Ordinal))
+                reportedTransport = line["TRANSPORT ".Length..];
             if (line == "READY")
+            {
+                string expected = transport == "iouring" ? "IoUring" : "SocketTransport";
+                if (reportedTransport == null ||
+                    !reportedTransport.StartsWith(expected, StringComparison.Ordinal))
+                {
+                    process.Kill(entireProcessTree: true);
+                    throw new InvalidOperationException(
+                        $"{transport} server reported transport '{reportedTransport ?? "<none>"}', " +
+                        $"expected '{expected}'. Refusing to benchmark the wrong transport.");
+                }
+
+                Console.WriteLine($"[{transport}] actual transport: {reportedTransport}");
                 return process;
+            }
             if (line == null)
                 throw new InvalidOperationException($"{transport} server exited before readiness.");
         }

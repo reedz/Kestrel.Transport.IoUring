@@ -68,9 +68,26 @@ use `services.AddIoUringTransport(...)`.
 | `EnableBufferRing` | `true` | Provided-buffer multishot receive. |
 | `EnableRegisteredFiles` | `false` | Fixed-file table; adds synchronous updates on connection churn. |
 | `UnsafeInlineScheduling` | `true` | Runs Kestrel processing on the IO thread; disable for blocking middleware. |
+| `RequireIoUring` | `false` | Throw instead of silently falling back to SocketTransport when io_uring is unavailable or ring setup fails (also `IOURING_REQUIRE=1`). |
 
 `EnableCoopTaskRun`, `EnableSingleIssuer`, `EnableDeferTaskRun`, and
 `EnableSqPoll` are advanced kernel options and default to `false`.
+
+### Verifying which transport is active
+
+`IoUringTransportFactory.IsUsingIoUring` only reports whether the host *supports* io_uring. To see what actually
+served each listener (for example before trusting a benchmark), resolve the factory and read `Bindings`:
+
+```csharp
+var factory = app.Services.GetServices<IConnectionListenerFactory>()
+    .OfType<IoUringTransportFactory>().Single();
+foreach (var b in factory.Bindings)
+    Console.WriteLine($"{b.EndPoint}: {b.Mode}, rings={b.RingCount}, fallback={b.FallbackReason}");
+```
+
+Set `RequireIoUring = true` in benchmarks and tests so a host that blocks io_uring fails loudly. Endpoint types that
+io_uring never serves (for example Unix domain sockets) still use SocketTransport and are reported as
+`SocketFallback`.
 
 Diagnostics can be enabled with `LogPoolStatsInterval` or the
 `IOURING_LOG_POOL_STATS_INTERVAL` environment variable. `IOURING_SPIN_COUNT`

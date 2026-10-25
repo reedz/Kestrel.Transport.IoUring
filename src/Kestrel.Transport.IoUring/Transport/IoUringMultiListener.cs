@@ -15,7 +15,7 @@ namespace Kestrel.Transport.IoUring.Transport;
 /// and IO loop thread. Uses SO_REUSEPORT so the kernel distributes incoming
 /// connections across listen sockets.
 /// </summary>
-internal sealed class IoUringMultiListener : IConnectionListener
+internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListenerInfo
 {
     private readonly IMultiListenerWorker[] _workers;
     private readonly Channel<ConnectionContext> _mergedChannel;
@@ -33,6 +33,16 @@ internal sealed class IoUringMultiListener : IConnectionListener
     private readonly record struct WorkerSet(EndPoint EndPoint, IMultiListenerWorker[] Workers);
 
     public EndPoint EndPoint { get; private set; }
+
+    int IIoUringListenerInfo.RingCount => _workers.Sum(
+        static worker => worker is IIoUringListenerInfo info ? info.RingCount : 1);
+
+    uint IIoUringListenerInfo.SetupFlags =>
+        _workers.Length > 0 && _workers[0] is IIoUringListenerInfo info ? info.SetupFlags : 0;
+
+    bool IIoUringListenerInfo.UsesProvidedBufferRing =>
+        _workers.Length > 0 &&
+        _workers.All(static worker => worker is IIoUringListenerInfo { UsesProvidedBufferRing: true });
 
     public IoUringMultiListener(
         EndPoint endPoint,
