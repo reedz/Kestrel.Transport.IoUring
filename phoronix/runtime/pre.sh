@@ -10,17 +10,25 @@
 
 . "$(dirname "$0")/common.sh"
 
+PRE_COMPLETED=0
+
 fail() {
     echo "ERROR: $*" >&2
     [ -f "$PTS_SERVER_LOG" ] && tail -n 20 "$PTS_SERVER_LOG" >&2
     stop_server
     printf '%s\n' "$*" > "$PTS_FAILURE_LATCH"
     record_invalid "pre-test: $*"
+    PRE_COMPLETED=1
     echo 0 > "${PTS_HOME}/pre-test-exit-status"
     exit 0
 }
 
-rm -f "$PTS_FAILURE_LATCH" "${PTS_HOME}/pre-test-exit-status"
+rm -f "${PTS_HOME}/pre-test-exit-status"
+# Pessimistic: PTS treats a missing status as success, so until this hook reaches its last line the configuration
+# counts as not set up. A hook killed anywhere in between leaves this latch, which run-test.sh turns into invalid
+# repetitions.
+printf 'pre-test hook did not complete\n' > "$PTS_FAILURE_LATCH" || exit 0
+trap '[ "$PRE_COMPLETED" = 1 ] || { stop_server; record_invalid "pre-test: hook ended before completing"; }' EXIT
 parse_args "$@" || fail "invalid arguments: $*"
 cd "$PTS_HOME" || fail "cannot cd to $PTS_HOME"
 
@@ -87,7 +95,7 @@ case "$WORKLOAD" in
     test.html) EXPECTED_SIZE="$(stat -c %s "${PTS_HOME}/wwwroot/test.html" 2>/dev/null)" ;;
     plaintext) EXPECTED_SIZE=13 ;;
 esac
-RESPONSE="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code} %{size_download} %{content_type}' "$URL" 2>&1)" \
+RESPONSE="$(curl_local -sS --max-time 10 -o /dev/null -w '%{http_code} %{size_download} %{content_type}' "$URL" 2>&1)" \
     || fail "workload request failed: $RESPONSE"
 read -r HTTP_CODE HTTP_SIZE HTTP_TYPE <<< "$RESPONSE"
 [ "$HTTP_CODE" = "200" ] || fail "workload $WORKLOAD answered HTTP $HTTP_CODE"
@@ -114,5 +122,7 @@ OVERRIDES="$(env | grep -E '^(DOTNET_|IOURING_)' | grep -vE '^DOTNET_(ROOT|CLI_T
 echo "Transport: $ACTUAL (rings=$RINGS_ACTUAL), $RUNTIME_DESC, kernel $(uname -r), open-file limit $FD_LIMIT, wrk threads $(wrk_threads), warm-up ${WARMUP}s, source $(cat "${PTS_HOME}/source-commit" 2>/dev/null || echo unknown)${OVERRIDES:+, env: ${OVERRIDES% }}" \
     > "${PTS_HOME}/pts-footnote"
 
+rm -f "$PTS_FAILURE_LATCH"
+PRE_COMPLETED=1
 echo 0 > "${PTS_HOME}/pre-test-exit-status"
 exit 0

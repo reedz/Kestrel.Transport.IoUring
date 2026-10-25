@@ -7,8 +7,9 @@
 # loopback requests to the benchmark server.
 
 PTS_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PTS_HOME="${PTS_HOME:-$HOME}"
-PTS_HOME="${PTS_HOME%/}"   # PTS exports $HOME with a trailing slash; normalised so paths compare equal everywhere
+# State lives in the directory PTS gives the hooks as $HOME. Deliberately not overridable from the environment:
+# an inherited override would send status files somewhere PTS never reads them.
+PTS_HOME="${HOME%/}"   # PTS exports $HOME with a trailing slash; normalised so paths compare equal everywhere
 PTS_PORT="${PTS_KESTREL_PORT:-18099}"
 PTS_SERVER_PID_FILE="${PTS_HOME}/server.pid"
 PTS_SERVER_LOG="${PTS_HOME}/server.log"
@@ -154,12 +155,18 @@ verify_transport() {
     return 0
 }
 
+# curl for the loopback checks: ignore ~/.curlrc and proxy environment variables, which would otherwise route even
+# 127.0.0.1 requests through a remote proxy.
+curl_local() {
+    curl -q --noproxy '*' "$@"
+}
+
 # Verifies that the HTTP endpoint wrk will hit is answered by OUR server process, with the requested runtime and
 # transport. READY plus /proc evidence alone would not notice another server sharing the port (SO_REUSEPORT).
 verify_endpoint_identity() {
     local pid body served
     pid="$(server_pid)" || { echo "no server pid"; return 1; }
-    body="$(curl -fsS --max-time 5 "http://127.0.0.1:${PTS_PORT}/__transport" 2>&1)" \
+    body="$(curl_local -fsS --max-time 5 "http://127.0.0.1:${PTS_PORT}/__transport" 2>&1)" \
         || { echo "cannot query /__transport on port ${PTS_PORT}: $body"; return 1; }
     served="$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' <<< "$body")"
     [ "$served" = "$pid" ] || { echo "port ${PTS_PORT} is answered by pid '${served:-?}', not by the server this run started ($pid)"; return 1; }

@@ -10,13 +10,21 @@
 . "$(dirname "$0")/common.sh"
 
 LOG="${LOG_FILE:-${PTS_HOME}/wrk-last.log}"
+RUN_COMPLETED=0
 
 invalid() {
     echo "INVALID RUN: $1" >> "$LOG"
     record_invalid "run: $1"
+    RUN_COMPLETED=1
     echo 1 > "${PTS_HOME}/test-exit-status"
     exit 1
 }
+
+# Pessimistic: PTS counts a repetition as passed when the status file is missing, and it parses the number wrk
+# printed whatever this script returns. The status starts as failed and is only set to passed on the last line,
+# so a wrapper killed after wrk wrote its number but before validation finished cannot leave a passing number.
+echo 1 > "${PTS_HOME}/test-exit-status"
+trap '[ "$RUN_COMPLETED" = 1 ] || { echo "INVALID RUN: wrapper ended before validation finished" >> "$LOG"; record_invalid "run: wrapper ended before validation finished"; }' EXIT
 
 parse_args "$@" || invalid "invalid arguments: $*"
 cd "$PTS_HOME" || exit 1
@@ -46,5 +54,6 @@ fi
 [ -z "$REASON" ] || invalid "$REASON"
 
 echo "wrk threads=$THREADS connections=$CONNECTIONS duration=${DURATION}s url=$URL" >> "$LOG"
+RUN_COMPLETED=1
 echo 0 > "${PTS_HOME}/test-exit-status"
 exit 0

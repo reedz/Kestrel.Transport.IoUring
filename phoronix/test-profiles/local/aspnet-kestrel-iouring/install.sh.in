@@ -10,8 +10,8 @@
 # the build restores nothing from NuGet (the SDKs ship the reference packs; an empty local source makes any
 # attempt to reach nuget.org fail instead of silently succeeding). PTS therefore never needs network access.
 #
-# make-bundle.sh fills the @...@ placeholders so that this script identifies, and verifies, the exact source bundle.
-# Set PTS_SKIP_NET11=1 to skip the .NET 11 SDK/publish (the ".NET 11 RC2" option then fails fast in pre.sh).
+# make-bundle.sh fills the @...@ placeholders so that this script identifies, and verifies, the exact source bundle
+# and every third-party archive.
 
 fail() {
     echo "ERROR: $*"
@@ -40,13 +40,24 @@ for old in aspnet-kestrel-iouring-src*.tar.gz; do
 done
 echo "$SRC_SHA256  $SRC_BUNDLE" | sha256sum --check --status || fail "$SRC_BUNDLE does not match the expected SHA-256 $SRC_SHA256"
 
+# PTS also skips hashing every other download that already sits in the install directory, so each archive is
+# verified here against the digests baked in from downloads.xml.in, before anything is extracted.
+ARCHIVE_SHA256="$(cat <<'EOF_ARCHIVES'
+@ARCHIVE_SHA256_LIST@
+EOF_ARCHIVES
+)"
+while read -r expected_sha archive_name; do
+    [ -n "$archive_name" ] || continue
+    echo "$expected_sha  $archive_name" | sha256sum --check --status || fail "$archive_name does not match the expected SHA-256 $expected_sha"
+done <<< "$ARCHIVE_SHA256"
+
 # 1. Source bundle (also carries the runtime scripts used by pre.sh, post.sh and the run wrapper).
 rm -rf pts-source && mkdir pts-source || fail "cannot create pts-source"
 tar -xzf "$SRC_BUNDLE" -C pts-source || fail "cannot unpack $SRC_BUNDLE"
 
 # 2. SDKs.
 rm -rf dotnet10 && mkdir dotnet10 && tar -xzf "$SDK10" -C dotnet10 || fail "cannot unpack $SDK10"
-if [ "${PTS_SKIP_NET11:-0}" != "1" ]; then
+{
     [ -f "$SDK11" ] || fail "missing download $SDK11"
     rm -rf dotnet11 && mkdir dotnet11 && tar -xzf "$SDK11" -C dotnet11 || fail "cannot unpack $SDK11"
 
@@ -62,7 +73,7 @@ if [ "${PTS_SKIP_NET11:-0}" != "1" ]; then
                 || fail "cannot link the $pack $version reference pack"
         done
     done
-fi
+}
 
 # 3. wrk.
 rm -rf wrk-4.2.0 && tar -xzf wrk-4.2.0.tar.gz || fail "cannot unpack wrk"
@@ -76,6 +87,7 @@ rm -rf http-test-files
 
 # 5. Build the server once per runtime, offline.
 export DOTNET_CLI_HOME="$HOME" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+export DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=1 DOTNET_GENERATE_ASPNET_CERTIFICATE=false
 export NUGET_PACKAGES="$HOME/.nuget/packages" MSBUILDDISABLENODEREUSE=1 DOTNET_gcServer=
 PROJECT="pts-source/benchmarks/Kestrel.Transport.IoUring.PtsServer/Kestrel.Transport.IoUring.PtsServer.csproj"
 mkdir -p "$HOME/nuget-offline" || fail "cannot create the empty NuGet source"
@@ -92,7 +104,7 @@ publish() {
 
 rm -rf publish
 publish 10
-[ "${PTS_SKIP_NET11:-0}" = "1" ] || publish 11
+publish 11
 
 # Build servers (MSBuild, Razor, Roslyn) outlive the build and would compete with the benchmark for CPU.
 for rt in 10 11; do

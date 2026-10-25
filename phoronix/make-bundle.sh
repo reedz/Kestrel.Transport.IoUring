@@ -50,6 +50,19 @@ for f in test-definition.xml results-definition.xml pre.sh post.sh; do
 done
 sed -e "s|@SRC_FILE@|$SRC_FILE|g" -e "s|@SRC_SHA256@|$SHA256|g" -e "s|@SOURCE_COMMIT@|$COMMIT|g" \
     "$STAGE/$PROFILE_SRC/install.sh.in" > "$DEST/install.sh"
+
+# "<sha256> <file name>" for every third-party package, taken from downloads.xml.in so the digests have one source.
+php -r '
+    $d = new DOMDocument(); $d->load($argv[1]);
+    foreach ($d->getElementsByTagName("Package") as $p) {
+        $g = function ($t) use ($p) { $n = $p->getElementsByTagName($t); return $n->length ? trim($n->item(0)->textContent) : ""; };
+        if ($g("URL") !== "") { echo $g("SHA256"), " ", $g("FileName"), "\n"; }
+    }' "$STAGE/$PROFILE_SRC/downloads.xml.in" > "$STAGE/archives.sha256"
+[ -s "$STAGE/archives.sha256" ] || { echo "No third-party packages found in downloads.xml.in" >&2; exit 1; }
+awk -v listfile="$STAGE/archives.sha256" \
+    '$0 == "@ARCHIVE_SHA256_LIST@" { while ((getline line < listfile) > 0) print line; next } { print }' \
+    "$DEST/install.sh" > "$DEST/install.sh.filled"
+mv "$DEST/install.sh.filled" "$DEST/install.sh"
 sed -e "s|@SRC_FILE@|$SRC_FILE|g" -e "s|@SRC_SHA256@|$SHA256|g" -e "s|@SRC_SIZE@|$SIZE|g" \
     "$STAGE/$PROFILE_SRC/downloads.xml.in" > "$DEST/downloads.xml"
 chmod +x "$DEST/install.sh" "$DEST/pre.sh" "$DEST/post.sh"

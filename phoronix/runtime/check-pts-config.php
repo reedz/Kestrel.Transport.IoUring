@@ -1,18 +1,26 @@
 <?php
 /*
- * Checks that the Phoronix Test Suite configuration PTS will actually read keeps this profile local-only.
+ * Checks that the Phoronix Test Suite configuration and environment PTS will actually use keep this profile
+ * local-only.
  *
  *   php check-pts-config.php [--file PATH]
  *
  * Prints USER_PATH=, CONFIG= and zero or more PROBLEM= lines. Exit status: 0 = no problems, 1 = problems found,
  * 2 = bad usage. Anything other than 0 must be treated as "not safe": PTS silently falls back to defaults that
- * ENABLE result uploads and usage reporting when it cannot parse user-config.xml (a double hyphen inside an XML
- * comment is enough), so grepping the file for FALSE is not a check.
+ * ENABLE result uploads and usage reporting when it cannot read a value from user-config.xml (malformed XML, a
+ * shadowing or duplicated element, ...), so grepping the file for FALSE is not a check.
  *
- * The file is chosen the way PTS chooses it (pts-core.php and pts_config::get_config_file_location in PTS 10.8):
- *   PTS_USER_PATH_OVERRIDE when it is an existing directory (appended to literally, without adding a slash),
- *   otherwise <home of the POSIX account>/.phoronix-test-suite/, and /etc/phoronix-test-suite.xml for a privileged
- *   daemon-style install. --file checks an explicit file instead (used to vet the shipped config).
+ * Faithfulness to PTS 10.8:
+ *  - The file is chosen the way PTS chooses it (pts-core.php, pts_config::get_config_file_location):
+ *    PTS_USER_PATH_OVERRIDE when it is an existing directory (appended to literally, without adding a slash),
+ *    otherwise <POSIX home>/.phoronix-test-suite/, /var/lib/phoronix-test-suite/ for a privileged daemon-style
+ *    install, and /etc/phoronix-test-suite.xml there.
+ *  - Values are read with the same traversal as nye_XmlReader::getXMLValue: getElementsByTagName() of the first
+ *    path step over the whole document, then the FIRST match narrowed step by step, and the value is used only
+ *    when exactly one node remains; otherwise PTS uses its built-in default. A shadow <Options> element placed
+ *    before the real one, or a nested duplicate leaf, therefore makes PTS ignore the real values, and so does this
+ *    checker.
+ *  --file checks an explicit file instead (used to vet the shipped config).
  */
 
 function usage_error(string $message): void
@@ -38,6 +46,7 @@ function pts_home(): string
         $home = $info['dir'] ?? null;
     }
     if (!$home) {
+        // DEBUG_REAL_HOME is exported by PTS to profile scripts, whose $HOME is the install directory.
         $home = getenv('DEBUG_REAL_HOME') ?: getenv('HOME');
     }
     if (!$home) {
@@ -46,19 +55,38 @@ function pts_home(): string
     return substr($home, -1) === '/' ? $home : $home . '/';
 }
 
+/** Mirror of nye_XmlReader::getXMLValue(): null where PTS would use its fallback default. */
+function pts_xml_value(DOMDocument $doc, string $path): ?string
+{
+    $steps = explode('/', $path);
+    $narrow = $doc->getElementsByTagName(array_shift($steps));
+    foreach ($steps as $step) {
+        if ($narrow->length == 0) {
+            break;
+        }
+        $narrow = $narrow->item(0)->getElementsByTagName($step);
+    }
+    return $narrow->length == 1 ? $narrow->item(0)->nodeValue : null;
+}
+
 $problems = [];
 
+$daemon = is_writable('/var/lib/') && is_writable('/etc');
 $override = getenv('PTS_USER_PATH_OVERRIDE');
 if ($override !== false && $override !== '' && is_dir($override)) {
     $userPath = $override;
     if (substr($override, -1) !== '/') {
         $problems[] = "PTS_USER_PATH_OVERRIDE must end with '/': PTS appends file names without a separator";
     }
+    if ($override[0] !== '/') {
+        $problems[] = 'PTS_USER_PATH_OVERRIDE must be an absolute path: PTS changes its working directory before it reads it';
+    }
+} elseif ($daemon) {
+    $userPath = '/var/lib/phoronix-test-suite/';
 } else {
     $userPath = pts_home() . '.phoronix-test-suite/';
 }
 
-$daemon = is_writable('/var/lib/') && is_writable('/etc');
 if ($daemon || (is_file('/etc/phoronix-test-suite.xml') && is_writable('/etc/phoronix-test-suite.xml'))) {
     $effective = '/etc/phoronix-test-suite.xml';
 } else {
@@ -69,15 +97,21 @@ $target = $explicit ?? $effective;
 echo "USER_PATH=$userPath\n";
 echo "CONFIG=$target\n";
 
-// Path below PhoronixTestSuite/Options => the only acceptable value.
+// Path below PhoronixTestSuite/Options => the only acceptable effective value.
 $required = [
     'OpenBenchmarking/AnonymousUsageReporting' => 'FALSE',
     'OpenBenchmarking/AlwaysUploadSystemLogs' => 'FALSE',
     'OpenBenchmarking/AllowResultUploadsToOpenBenchmarking' => 'FALSE',
     'Testing/AlwaysUploadResultsToOpenBenchmarking' => 'FALSE',
     'BatchMode/UploadResults' => 'FALSE',
+    // PTS tests NoInternetCommunication first (an else-if): with it TRUE, NoNetworkCommunication is never applied.
+    'Networking/NoInternetCommunication' => 'FALSE',
     'Networking/NoNetworkCommunication' => 'TRUE',
     'Modules/AutoLoadModules' => '',
+    // Where PTS installs, caches and stores results; the launcher and setup scripts rely on these locations.
+    'Installation/EnvironmentDirectory' => '~/.phoronix-test-suite/installed-tests/',
+    'Installation/CacheDirectory' => '~/.phoronix-test-suite/download-cache/',
+    'Testing/ResultsDirectory' => '~/.phoronix-test-suite/test-results/',
 ];
 
 if (!is_file($target) || !is_readable($target)) {
@@ -90,18 +124,32 @@ if (!is_file($target) || !is_readable($target)) {
         $problems[] = "$target: not well-formed XML" . ($first ? ' (line ' . $first->line . ': ' . trim($first->message) . ')' : '')
             . '; PTS would discard it and fall back to defaults that enable uploads';
     } else {
-        $xpath = new DOMXPath($doc);
         foreach ($required as $path => $expected) {
-            $nodes = $xpath->query('/PhoronixTestSuite/Options/' . $path);
-            if ($nodes === false || $nodes->length !== 1) {
-                $problems[] = "$target: $path must appear exactly once (found " . ($nodes ? $nodes->length : 0) . ')';
-                continue;
-            }
-            $value = trim($nodes->item(0)->textContent);
-            if ($value !== $expected) {
-                $problems[] = "$target: $path is '$value', it must be '$expected'";
+            $value = pts_xml_value($doc, 'PhoronixTestSuite/Options/' . $path);
+            if ($value === null) {
+                $problems[] = "$target: PTS cannot read $path (missing, duplicated or shadowed) and would use its built-in default";
+            } elseif (trim($value) !== $expected) {
+                $problems[] = "$target: $path is '" . trim($value) . "', it must be '$expected'";
             }
         }
+    }
+}
+
+// Ambient PTS controls that redirect where files live, load code, add shell prefixes, or change which
+// repetitions count. The launcher sets its own FORCE_TIMES_TO_RUN / PRESET_OPTIONS_VALUES / TEST_RESULTS_*.
+$forbiddenEnv = [
+    'PTS_TEST_INSTALL_ROOT_PATH', 'PTS_DOWNLOAD_CACHE', 'PTS_EXTRA_SYSTEM_LOGS_DIR',
+    'TEST_EXEC_PREPEND', 'EXECUTE_BINARY_PREPEND', 'PTS_MODULES', 'PTS_MODULE_SETUP',
+    'SKIP_TESTS', 'SKIP_TESTS_HAVING_ARGS', 'SKIP_TESTING_SUBSYSTEMS',
+    'TOTAL_LOOP_TIME', 'TOTAL_LOOP_COUNT', 'LIMIT_ELAPSED_TEST_TIME',
+    'FORCE_MIN_TIMES_TO_RUN', 'FORCE_MIN_TIMES_TO_RUN_CUTOFF', 'FORCE_ABSOLUTE_MIN_TIMES_TO_RUN',
+    'FORCE_TIMES_TO_RUN_MULTIPLE', 'IGNORE_RUNS', 'TEST_TIMEOUT_AFTER', 'PTS_CONCURRENT_TEST_RUNS',
+    'NO_FILE_HASH_CHECKS', 'NO_DOWNLOAD_CACHE', 'MONITOR', 'REMOVE_TESTS_ON_COMPLETION', 'REMOVE_TESTS_OLDER_THAN',
+];
+foreach ($forbiddenEnv as $name) {
+    $value = getenv($name);
+    if ($value !== false && $value !== '') {
+        $problems[] = "environment variable $name is set; it changes where PTS stores files, what it runs or how results are counted, so it is refused";
     }
 }
 
