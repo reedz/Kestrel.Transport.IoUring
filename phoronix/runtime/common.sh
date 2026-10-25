@@ -55,6 +55,29 @@ wrk_threads() {
     echo "$threads"
 }
 
+# Prints one line per reason the PTS configuration that PTS itself will read could let results or usage data
+# leave this machine (empty output = fine). Mirrors how PTS picks its config file (pts-core.php,
+# pts_config::get_config_file_location). PTS silently regenerates DEFAULTS (uploads on) when it cannot parse
+# user-config.xml, so this checks the file as it is now, not the file we shipped.
+config_upload_problems() {
+    local home="${DEBUG_REAL_HOME:-$HOME}" file key dir
+    home="${home%/}"
+    if { [ -w /var/lib/ ] && [ -w /etc ]; } || { [ -f /etc/phoronix-test-suite.xml ] && [ -w /etc/phoronix-test-suite.xml ]; }; then
+        file=/etc/phoronix-test-suite.xml
+    else
+        dir="$home/.phoronix-test-suite"
+        [ -n "${PTS_USER_PATH_OVERRIDE:-}" ] && [ -d "$PTS_USER_PATH_OVERRIDE" ] && dir="${PTS_USER_PATH_OVERRIDE%/}"
+        file="$dir/user-config.xml"
+    fi
+    if [ ! -r "$file" ]; then
+        echo "$file: not found (PTS would generate defaults that enable uploads)"
+        return 0
+    fi
+    for key in AllowResultUploadsToOpenBenchmarking AnonymousUsageReporting AlwaysUploadResultsToOpenBenchmarking AlwaysUploadSystemLogs; do
+        grep -q "<$key>FALSE</$key>" "$file" || echo "$file: $key is not FALSE"
+    done
+}
+
 server_pid() {
     [ -f "$PTS_SERVER_PID_FILE" ] && cat "$PTS_SERVER_PID_FILE"
 }

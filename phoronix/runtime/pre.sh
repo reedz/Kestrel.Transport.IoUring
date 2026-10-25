@@ -18,6 +18,13 @@ fail() {
 parse_args "$@" || fail "invalid arguments: $*"
 cd "$PTS_HOME" || fail "cannot cd to $PTS_HOME"
 
+# This profile is for local, unpublished runs: refuse to measure under a PTS configuration that would upload.
+if [ "${PTS_KESTREL_ALLOW_UPLOAD_CONFIG:-0}" != "1" ]; then
+    PROBLEMS="$(config_upload_problems)"
+    [ -z "$PROBLEMS" ] || fail "PTS is configured so that results or usage data may be uploaded; run phoronix/setup-local-pts.sh (or set PTS_KESTREL_ALLOW_UPLOAD_CONFIG=1 to override):
+$PROBLEMS"
+fi
+
 # A leftover server from an interrupted run would hold the port.
 stop_server
 rm -f "$PTS_SERVER_LOG" "${PTS_HOME}/pre-test-exit-status"

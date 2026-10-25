@@ -1,15 +1,4 @@
 <?xml version="1.0"?>
-<!--
-  Phoronix Test Suite configuration for LOCAL, UNPUBLISHED runs of the aspnet-kestrel-iouring profile.
-  phoronix/setup-local-pts.sh installs it as ~/.phoronix-test-suite/user-config.xml (keeping a backup).
-
-  What it guarantees: PTS is configured never to upload results, usage statistics or system logs, never to open a
-  browser, never to prompt in batch mode, and to run exactly the option combinations you preset (dynamic run
-  counts are off so every configuration runs exactly TimesToRun repetitions).
-
-  These are PTS settings, not an OS sandbox: profile scripts are ordinary shell scripts. For a literal no-egress
-  guarantee also block outbound network (allow loopback) while running; see phoronix/README.md.
--->
 <PhoronixTestSuite>
   <Options>
     <OpenBenchmarking>
@@ -79,9 +68,6 @@
     </BatchMode>
     <Networking>
       <NoInternetCommunication>FALSE</NoInternetCommunication>
-      <!-- FALSE only so that `install` can restore NuGet packages (the profile declares InstallRequiresInternet).
-           Uploads stay off via the settings above. Run `setup-local-pts.sh --offline` before measuring to set
-           this to TRUE, and see README.md for a literal no-egress run. -->
       <NoNetworkCommunication>FALSE</NoNetworkCommunication>
       <Timeout>20</Timeout>
       <ProxyAddress></ProxyAddress>

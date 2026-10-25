@@ -9,12 +9,27 @@
 #                     does not re-download them. Optional: PTS downloads anything missing.
 #   --no-config       leave ~/.phoronix-test-suite/user-config.xml alone (then YOU must make sure uploads are off)
 #   --offline         set NoNetworkCommunication=TRUE in the installed config (use after `install`, before measuring)
+#   --verify          only check that the PTS configuration PTS will read cannot upload results or usage data
+#                     (run it again after the first PTS command: PTS rewrites the file and falls back to
+#                     upload-enabled defaults if it cannot parse it)
 #
 # Run phoronix/make-bundle.sh first.
 
 set -euo pipefail
 
 REPO="$(git rev-parse --show-toplevel)"
+. "$REPO/phoronix/runtime/common.sh"
+
+verify_config() {
+    local problems
+    problems="$(config_upload_problems)"
+    if [ -n "$problems" ]; then
+        echo "PTS configuration is NOT local-only:" >&2
+        echo "$problems" >&2
+        return 1
+    fi
+    echo "PTS configuration verified: result uploads, usage reporting and log uploads are disabled."
+}
 DIST="${DIST:-$REPO/phoronix/dist}"
 PTS_USER="$HOME/.phoronix-test-suite"
 ARTIFACTS=""
@@ -26,6 +41,7 @@ while [ $# -gt 0 ]; do
         --artifacts) ARTIFACTS="$2"; shift 2 ;;
         --no-config) WRITE_CONFIG=0; shift ;;
         --offline) OFFLINE=1; shift ;;
+        --verify) verify_config; exit $? ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -34,7 +50,8 @@ if [ "$OFFLINE" = "1" ]; then
     [ -f "$PTS_USER/user-config.xml" ] || { echo "No $PTS_USER/user-config.xml; run without --offline first." >&2; exit 1; }
     sed -i 's#<NoNetworkCommunication>FALSE</NoNetworkCommunication>#<NoNetworkCommunication>TRUE</NoNetworkCommunication>#' "$PTS_USER/user-config.xml"
     echo "NoNetworkCommunication=TRUE in $PTS_USER/user-config.xml"
-    exit 0
+    verify_config
+    exit $?
 fi
 
 [ -f "$DIST/aspnet-kestrel-iouring-src.tar.gz" ] || { echo "Run phoronix/make-bundle.sh first." >&2; exit 1; }
@@ -57,6 +74,7 @@ if [ "$WRITE_CONFIG" = "1" ]; then
     fi
     cp "$REPO/phoronix/config/user-config.xml" "$PTS_USER/user-config.xml"
     echo "Wrote $PTS_USER/user-config.xml (uploads, usage reporting and prompts disabled)."
+    verify_config
 fi
 
 cat <<EOF
