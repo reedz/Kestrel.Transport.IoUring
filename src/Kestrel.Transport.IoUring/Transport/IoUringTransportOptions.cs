@@ -1,4 +1,5 @@
 using Kestrel.Transport.IoUring.Native;
+using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets;
 
 namespace Kestrel.Transport.IoUring.Transport;
 
@@ -13,8 +14,43 @@ public sealed class IoUringTransportOptions
     /// <summary>Maximum number of simultaneous connections. Excess connections are rejected.</summary>
     public int MaxConnections { get; set; } = 16384;
 
-    /// <summary>TCP listen backlog passed to <c>listen(2)</c>.</summary>
-    public int ListenBacklog { get; set; } = 512;
+    private const int DefaultListenBacklog = 512;
+    private int? _listenBacklog;
+
+    /// <summary>
+    /// TCP listen backlog passed to <c>listen(2)</c>. When not set, <c>SocketTransportOptions.Backlog</c> applies
+    /// (512 by default), as it would for Kestrel's socket transport.
+    /// </summary>
+    public int ListenBacklog
+    {
+        get => _listenBacklog ?? DefaultListenBacklog;
+        set => _listenBacklog = value;
+    }
+
+    internal bool IsListenBacklogSet => _listenBacklog.HasValue;
+
+    // Taken from SocketTransportOptions by ResolveWith; the defaults are SocketTransportOptions' defaults.
+    internal bool NoDelay { get; set; } = true;
+    internal long? MaxReadBufferSize { get; set; } = 1024 * 1024;
+    internal long? MaxWriteBufferSize { get; set; } = 64 * 1024;
+
+    internal IoUringTransportOptions Clone() => (IoUringTransportOptions)MemberwiseClone();
+
+    /// <summary>
+    /// The options listeners actually use: these options plus the <see cref="SocketTransportOptions"/> settings
+    /// that mean the same thing for this transport (<c>NoDelay</c>, <c>Backlog</c>, <c>MaxReadBufferSize</c>,
+    /// <c>MaxWriteBufferSize</c>). An explicitly set <see cref="ListenBacklog"/> wins over <c>Backlog</c>.
+    /// </summary>
+    internal IoUringTransportOptions ResolveWith(SocketTransportOptions socketOptions)
+    {
+        var resolved = Clone();
+        if (!IsListenBacklogSet)
+            resolved._listenBacklog = socketOptions.Backlog;
+        resolved.NoDelay = socketOptions.NoDelay;
+        resolved.MaxReadBufferSize = socketOptions.MaxReadBufferSize;
+        resolved.MaxWriteBufferSize = socketOptions.MaxWriteBufferSize;
+        return resolved;
+    }
 
     /// <summary>Capacity of the internal accept channel (buffered accepted-connection queue).</summary>
     public int AcceptQueueCapacity { get; set; } = 1024;

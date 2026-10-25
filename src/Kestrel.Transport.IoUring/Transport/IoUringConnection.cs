@@ -189,7 +189,9 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         IoUringPipeScheduler transportScheduler,
         bool unsafeInlineScheduling,
         ILogger logger,
-        bool useBufferRing = false)
+        bool useBufferRing = false,
+        long? maxReadBufferSize = 1024 * 1024,
+        long? maxWriteBufferSize = 64 * 1024)
     {
         _connectionId = connectionId;
         _socketFd = socketFd;
@@ -226,17 +228,21 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             ? PipeScheduler.Inline
             : PipeScheduler.ThreadPool;
 
+        // Like SocketTransport: MaxReadBufferSize / MaxWriteBufferSize pause the writer, resume at half,
+        // and null (or 0) means no limit.
+        InputPauseThreshold = maxReadBufferSize ?? 0;
+        OutputPauseThreshold = maxWriteBufferSize ?? 0;
         var inputOptions = new PipeOptions(
             writerScheduler: transportScheduler,
             readerScheduler: appReadScheduler,
-            pauseWriterThreshold: 1024 * 1024,
-            resumeWriterThreshold: 512 * 1024,
+            pauseWriterThreshold: InputPauseThreshold,
+            resumeWriterThreshold: InputPauseThreshold / 2,
             useSynchronizationContext: false);
         var outputOptions = new PipeOptions(
             writerScheduler: PipeScheduler.ThreadPool,
             readerScheduler: transportScheduler,
-            pauseWriterThreshold: 64 * 1024,
-            resumeWriterThreshold: 32 * 1024,
+            pauseWriterThreshold: OutputPauseThreshold,
+            resumeWriterThreshold: OutputPauseThreshold / 2,
             useSynchronizationContext: false);
         _inputPipe = new Pipe(inputOptions);
         _outputPipe = new Pipe(outputOptions);
@@ -251,6 +257,12 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     }
 
     public IDuplexPipe Application { get; }
+
+    /// <summary>Input pipe pause threshold (SocketTransportOptions.MaxReadBufferSize; 0 = unlimited).</summary>
+    internal long InputPauseThreshold { get; }
+
+    /// <summary>Output pipe pause threshold (SocketTransportOptions.MaxWriteBufferSize; 0 = unlimited).</summary>
+    internal long OutputPauseThreshold { get; }
 
     public override CancellationToken ConnectionClosed => _connectionClosedCts.Token;
 

@@ -713,6 +713,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 outcome = TeardownOutcome.Quarantined;
             }
             Volatile.Write(ref _teardownOutcome, (int)outcome);
+            // Nothing will retry receives for this listener any more.
+            ReportRecvRetryDepth(loopEnded: true);
 
             // The loop can make no further progress. Release anything still awaiting finalization so a
             // Kestrel connection DisposeAsync cannot hang; the sockets are closed later by DisposeAsync.
@@ -1287,6 +1289,22 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         RetryFailedRecvs();
         RetryControlOperations();
         ResumeSendRetries();
+        // Retry passes and closes remove entries; keep the process-wide gauge live.
+        ReportRecvRetryDepth();
+    }
+
+    private int _reportedRecvRetryDepth; // IO loop only
+
+    /// <summary>Publishes this listener's change in receive-retry entries to the process-wide gauge (NEW-13).</summary>
+    private void ReportRecvRetryDepth(bool loopEnded = false)
+    {
+        int depth = loopEnded ? 0 : _recvRetryState.RecvRetryCount;
+        int delta = depth - _reportedRecvRetryDepth;
+        if (delta == 0)
+            return;
+
+        _reportedRecvRetryDepth = depth;
+        Diagnostics.RecvDiagnostics.OnRecvRetryDepthChanged(delta);
     }
 
     private void DispatchCompletion(IoUringCqe cqe)
@@ -1468,7 +1486,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             }
             else
             {
-                if (!SetTcpNoDelay(socketFd))
+                // SocketTransportOptions.NoDelay (default true). Accepted sockets otherwise inherit the listening
+                // socket's setting, which is Nagle on.
+                if (_options.NoDelay && !SetTcpNoDelay(socketFd))
                 {
                     _logger.LogWarning(
                         "TCP_NODELAY failed for accepted fd {Fd} with errno {Errno}.",
@@ -1502,7 +1522,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                         _pipeScheduler!,
                         _options.UnsafeInlineScheduling,
                         _logger,
-                        useBufferRing: _bufferRing != null);
+                        useBufferRing: _bufferRing != null,
+                        maxReadBufferSize: _options.MaxReadBufferSize,
+                        maxWriteBufferSize: _options.MaxWriteBufferSize);
                 }
                 catch
                 {
@@ -1541,14 +1563,14 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                         {
                             Diagnostics.RecvDiagnostics.OnMultishotRearmSqFull();
                             _recvRetryState.AddRecvRetry(connId);
-                            Diagnostics.RecvDiagnostics.OnRecvRetryDepth(_recvRetryState.RecvRetryCount);
+                            ReportRecvRetryDepth();
                         }
                     }
                     else if (!conn.SubmitRecv())
                     {
                         Diagnostics.RecvDiagnostics.OnSingleshotRearmSqFull();
                         _recvRetryState.AddRecvRetry(connId);
-                        Diagnostics.RecvDiagnostics.OnRecvRetryDepth(_recvRetryState.RecvRetryCount);
+                        ReportRecvRetryDepth();
                     }
                 }
             }
@@ -1604,7 +1626,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                     Diagnostics.RecvDiagnostics.OnRecvEnobufs();
                     _recvRetryState.AddRecvRetry(connectionId);
                     OnBufferExhausted();
-                    Diagnostics.RecvDiagnostics.OnRecvRetryDepth(_recvRetryState.RecvRetryCount);
+                    ReportRecvRetryDepth();
                     return false;
                 }
 
@@ -1679,7 +1701,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                     {
                         Diagnostics.RecvDiagnostics.OnMultishotRearmSqFull();
                         _recvRetryState.AddRecvRetry(connectionId);
-                        Diagnostics.RecvDiagnostics.OnRecvRetryDepth(_recvRetryState.RecvRetryCount);
+                        ReportRecvRetryDepth();
                     }
                     return true;
                 }
@@ -1712,7 +1734,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             {
                 Diagnostics.RecvDiagnostics.OnSingleshotRearmSqFull();
                 _recvRetryState.AddRecvRetry(connectionId);
-                Diagnostics.RecvDiagnostics.OnRecvRetryDepth(_recvRetryState.RecvRetryCount);
+                ReportRecvRetryDepth();
             }
             return true;
         }

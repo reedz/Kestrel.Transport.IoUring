@@ -15,6 +15,8 @@ public sealed class IoUringTransportFactory :
     IConnectionListenerFactorySelector
 {
     private readonly IoUringTransportOptions _options;
+    // NoDelay, Backlog and the read/write buffer limits apply to this transport too (IoUringTransportOptions.ResolveWith).
+    private readonly SocketTransportOptions _socketOptions;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<IoUringTransportFactory> _logger;
     private readonly Func<bool> _isSupported;
@@ -42,6 +44,7 @@ public sealed class IoUringTransportFactory :
         Func<uint, uint, Ring>? createRing)
     {
         _options = options.Value;
+        _socketOptions = socketOptions.Value;
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<IoUringTransportFactory>();
         _isSupported = isSupported ?? (() => Ring.IsSupported);
@@ -70,6 +73,7 @@ public sealed class IoUringTransportFactory :
         CancellationToken cancellationToken = default)
     {
         _options.Validate();
+        var listenerOptions = _options.ResolveWith(_socketOptions);
 
         if (!CanBind(endpoint))
         {
@@ -96,7 +100,7 @@ public sealed class IoUringTransportFactory :
                 _options.ThreadCount);
             try
             {
-                var multiListener = new IoUringMultiListener(endpoint, _options, _loggerFactory);
+                var multiListener = new IoUringMultiListener(endpoint, listenerOptions, _loggerFactory);
                 RecordIoUringBinding(multiListener);
                 return multiListener;
             }
@@ -129,8 +133,8 @@ public sealed class IoUringTransportFactory :
         IoUringConnectionListener? listener = null;
         try
         {
-            listener = new IoUringConnectionListener(endpoint, ring, _options, logger);
-            listener.Bind(_options.ListenBacklog);
+            listener = new IoUringConnectionListener(endpoint, ring, listenerOptions, logger);
+            listener.Bind(listenerOptions.ListenBacklog);
         }
         catch
         {

@@ -36,7 +36,9 @@ internal static class RecvDiagnostics
     private static long _asyncFlushPending;       // OnRecvCompleteFromBuffer flush returned async
 
     // ── Gauges (current value) ──
-    private static long _recvRetryDepth;          // size of _recvRetrySet
+    // Live receive-retry entries summed over every listener in the process (each reports its own changes), and the
+    // highest such sum seen. Maintained even when logging is off: changes are rare (SQ-full / ENOBUFS paths only).
+    private static long _recvRetryDepth;
     private static long _recvRetryDepthHighWater;
 
     public static void OnRecvEnobufs()       { if (Enabled) Interlocked.Increment(ref _recvEnobufs); }
@@ -49,14 +51,22 @@ internal static class RecvDiagnostics
     public static void OnAcceptChannelDrop()  { if (Enabled) Interlocked.Increment(ref _acceptChannelDrops); }
     public static void OnAsyncFlushPending() { if (Enabled) Interlocked.Increment(ref _asyncFlushPending); }
 
-    public static void OnRecvRetryDepth(int depth)
+    /// <summary>A listener's receive-retry set grew or shrank by <paramref name="delta"/> entries.</summary>
+    public static void OnRecvRetryDepthChanged(int delta)
     {
-        if (!Enabled) return;
-        Volatile.Write(ref _recvRetryDepth, depth);
+        long depth = Interlocked.Add(ref _recvRetryDepth, delta);
         long prev;
         do { prev = Volatile.Read(ref _recvRetryDepthHighWater); if (depth <= prev) break; }
         while (Interlocked.CompareExchange(ref _recvRetryDepthHighWater, depth, prev) != prev);
     }
+
+    internal static long RecvRetryDepth => Volatile.Read(ref _recvRetryDepth);
+
+    // Test seam: restart the high-water mark from the current depth.
+    internal static void ResetRecvRetryHighWaterForTests() =>
+        Volatile.Write(ref _recvRetryDepthHighWater, Volatile.Read(ref _recvRetryDepth));
+
+    internal static long RecvRetryDepthHighWater => Volatile.Read(ref _recvRetryDepthHighWater);
 
     public sealed class Snapshot
     {

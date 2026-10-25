@@ -461,6 +461,21 @@ public sealed class Ring : IDisposable
 
     private bool UsesSqPollThread => (SetupFlags & IoUringConstants.IORING_SETUP_SQPOLL) != 0;
 
+    /// <summary>
+    /// SQPOLL: the tail store published by Flush must be visible before IORING_SQ_NEED_WAKEUP is read, or the poll
+    /// thread can go to sleep without seeing the new entries and no wakeup is sent (liburing issues
+    /// io_uring_smp_mb() here). A release store followed by an acquire load does not order that, so fence fully
+    /// instead of relying on the SubmitLock release.
+    /// </summary>
+    private bool NeedsSqPollWakeup()
+    {
+        if (!UsesSqPollThread)
+            return false;
+
+        Interlocked.MemoryBarrier();
+        return _sq.NeedsWakeup;
+    }
+
     // Non-SQPOLL callers re-account kernel-visible pending SQEs on each enter/retry.
     // SQPOLL intentionally stays flush-gated so retries preserve the poll-thread behavior.
     private uint GetSubmitBudget(uint flushed) => UsesSqPollThread ? flushed : _sq.PendingSubmit;
@@ -479,7 +494,7 @@ public sealed class Ring : IDisposable
         // With DEFER_TASKRUN, completions only run when we enter with GETEVENTS — pass it
         // even on a "submit-only" call so the kernel processes any queued task work.
         uint flags = RequiresGetEventsToDrain ? IoUringConstants.IORING_ENTER_GETEVENTS : 0u;
-        if (_sq.NeedsWakeup)
+        if (NeedsSqPollWakeup())
             flags |= IoUringConstants.IORING_ENTER_SQ_WAKEUP;
         uint toSubmit = GetSubmitBudget(flushed);
         if (toSubmit == 0 && flags == 0)
@@ -501,7 +516,7 @@ public sealed class Ring : IDisposable
         uint flags = (minComplete > 0 || RequiresGetEventsToDrain)
             ? IoUringConstants.IORING_ENTER_GETEVENTS
             : 0u;
-        if (_sq.NeedsWakeup)
+        if (NeedsSqPollWakeup())
             flags |= IoUringConstants.IORING_ENTER_SQ_WAKEUP;
         uint toSubmit = GetSubmitBudget(flushed);
         return Enter(toSubmit, minComplete, flags);

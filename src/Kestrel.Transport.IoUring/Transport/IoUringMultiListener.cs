@@ -84,26 +84,15 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
 
     internal static IoUringTransportOptions CreateWorkerOptions(
         IoUringTransportOptions options,
-        int maxConnections) =>
-        new()
-        {
-            RingSize = options.RingSize,
-            MaxConnections = maxConnections,
-            ListenBacklog = options.ListenBacklog,
-            AcceptQueueCapacity = options.AcceptQueueCapacity,
-            LogPoolStatsInterval = options.LogPoolStatsInterval,
-            ReceiveBufferSize = options.ReceiveBufferSize,
-            ThreadCount = 1,
-            EnableSqPoll = options.EnableSqPoll,
-            EnableBufferRing = options.EnableBufferRing,
-            EnableMultishotAccept = options.EnableMultishotAccept,
-            EnableRegisteredFiles = options.EnableRegisteredFiles,
-            BufferRingSize = options.BufferRingSize,
-            EnableCoopTaskRun = options.EnableCoopTaskRun,
-            EnableSingleIssuer = options.EnableSingleIssuer,
-            EnableDeferTaskRun = options.EnableDeferTaskRun,
-            UnsafeInlineScheduling = options.UnsafeInlineScheduling,
-        };
+        int maxConnections)
+    {
+        // A full copy, so every behavioural setting (including those resolved from SocketTransportOptions) reaches
+        // the workers.
+        var worker = options.Clone();
+        worker.MaxConnections = maxConnections;
+        worker.ThreadCount = 1;
+        return worker;
+    }
 
     internal static int GetWorkerMaxConnections(int total, int workers, int workerIndex) =>
         total / workers + (workerIndex < total % workers ? 1 : 0);
