@@ -41,7 +41,7 @@
     </Package>
     <Package>
       <SHA256>@SRC_SHA256@</SHA256>
-      <FileName>aspnet-kestrel-iouring-src.tar.gz</FileName>
+      <FileName>@SRC_FILE@</FileName>
       <FileSize>@SRC_SIZE@</FileSize>
     </Package>
   </Downloads>

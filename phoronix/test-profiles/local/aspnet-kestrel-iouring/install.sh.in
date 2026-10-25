@@ -6,8 +6,12 @@
 #   wwwroot/         test.html from the PTS http-test-files package
 #   publish/net10, publish/net11   the ASP.NET Core server built for each runtime
 #
+# The install is OFFLINE: every download is supplied by PTS from its download cache (see fetch-artifacts.sh), and
+# the build restores nothing from NuGet (the SDKs ship the reference packs; an empty local source makes any
+# attempt to reach nuget.org fail instead of silently succeeding). PTS therefore never needs network access.
+#
+# make-bundle.sh fills the @...@ placeholders so that this script identifies, and verifies, the exact source bundle.
 # Set PTS_SKIP_NET11=1 to skip the .NET 11 SDK/publish (the ".NET 11 RC2" option then fails fast in pre.sh).
-# dotnet publish restores a few NuGet packages (for example SourceLink), so the install needs nuget.org access.
 
 fail() {
     echo "ERROR: $*"
@@ -17,13 +21,24 @@ fail() {
 
 cd ~ || fail "cannot cd to the install directory"
 
-SRC_BUNDLE="aspnet-kestrel-iouring-src.tar.gz"
+SRC_BUNDLE="@SRC_FILE@"
+SRC_SHA256="@SRC_SHA256@"
+SOURCE_COMMIT="@SOURCE_COMMIT@"
 SDK10="dotnet-sdk-10.0.402-linux-x64.tar.gz"
 SDK11="dotnet-sdk-11.0.100-rc.2.26504.105-linux-x64.tar.gz"
+
+command -v curl > /dev/null || fail "curl is required (the profile verifies the server with it)"
 
 for f in "$SRC_BUNDLE" "$SDK10" wrk-4.2.0.tar.gz http-test-files-1.tar.xz; do
     [ -f "$f" ] || fail "missing download $f"
 done
+
+# PTS keeps a download that already exists in the install directory without re-hashing it, so a stale bundle from
+# an earlier install must never be used: the bundle name carries the commit and the hash is checked here.
+for old in aspnet-kestrel-iouring-src*.tar.gz; do
+    [ "$old" = "$SRC_BUNDLE" ] || rm -f "$old"
+done
+echo "$SRC_SHA256  $SRC_BUNDLE" | sha256sum --check --status || fail "$SRC_BUNDLE does not match the expected SHA-256 $SRC_SHA256"
 
 # 1. Source bundle (also carries the runtime scripts used by pre.sh, post.sh and the run wrapper).
 rm -rf pts-source && mkdir pts-source || fail "cannot create pts-source"
@@ -34,6 +49,19 @@ rm -rf dotnet10 && mkdir dotnet10 && tar -xzf "$SDK10" -C dotnet10 || fail "cann
 if [ "${PTS_SKIP_NET11:-0}" != "1" ]; then
     [ -f "$SDK11" ] || fail "missing download $SDK11"
     rm -rf dotnet11 && mkdir dotnet11 && tar -xzf "$SDK11" -C dotnet11 || fail "cannot unpack $SDK11"
+
+    # The server for .NET 11 consumes the library's net10.0 asset, which SDK 11 can only compile against the
+    # net10.0 reference packs. SDK 10 ships exactly those; link them in instead of downloading them.
+    for pack in Microsoft.NETCore.App.Ref Microsoft.AspNetCore.App.Ref; do
+        for version_dir in dotnet10/packs/"$pack"/*; do
+            version="$(basename "$version_dir")"
+            [ -d "$version_dir" ] || continue
+            [ -e "dotnet11/packs/$pack/$version" ] && continue
+            mkdir -p "dotnet11/packs/$pack"
+            ln -s "../../../dotnet10/packs/$pack/$version" "dotnet11/packs/$pack/$version" \
+                || fail "cannot link the $pack $version reference pack"
+        done
+    done
 fi
 
 # 3. wrk.
@@ -46,15 +74,17 @@ rm -rf http-test-files wwwroot && tar -xJf http-test-files-1.tar.xz || fail "can
 mkdir wwwroot && cp http-test-files/test.html wwwroot/ || fail "test.html missing"
 rm -rf http-test-files
 
-# 5. Build the server once per runtime.
+# 5. Build the server once per runtime, offline.
 export DOTNET_CLI_HOME="$HOME" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 export NUGET_PACKAGES="$HOME/.nuget/packages" MSBUILDDISABLENODEREUSE=1 DOTNET_gcServer=
 PROJECT="pts-source/benchmarks/Kestrel.Transport.IoUring.PtsServer/Kestrel.Transport.IoUring.PtsServer.csproj"
+mkdir -p "$HOME/nuget-offline" || fail "cannot create the empty NuGet source"
 
 publish() {
     local rt="$1"
-    echo "Publishing PtsServer for .NET $rt"
+    echo "Publishing PtsServer for .NET $rt (offline)"
     DOTNET_ROOT="$HOME/dotnet$rt" "$HOME/dotnet$rt/dotnet" publish "$PROJECT" -c Release \
+        --source "$HOME/nuget-offline" -p:NuGetAudit=false \
         -p:PtsTargetFramework="net$rt.0" -p:PtsLibraryTfm=net10.0 -o "publish/net$rt" \
         > "publish-net$rt.log" 2>&1 || { tail -n 30 "publish-net$rt.log"; fail "dotnet publish for net$rt failed"; }
     [ -f "publish/net$rt/PtsServer.dll" ] || fail "publish/net$rt/PtsServer.dll missing"
@@ -65,10 +95,11 @@ publish 10
 [ "${PTS_SKIP_NET11:-0}" = "1" ] || publish 11
 
 # 6. Run wrapper (PTS runs ./aspnet-kestrel-iouring <options> for every repetition).
-cat > aspnet-kestrel-iouring <<'EOF'
+cat > aspnet-kestrel-iouring <<'EOF' || fail "cannot write the run wrapper"
 #!/bin/sh
 exec bash "$HOME/pts-source/phoronix/runtime/run-test.sh" "$@"
 EOF
-chmod +x aspnet-kestrel-iouring
+chmod +x aspnet-kestrel-iouring || fail "cannot make the run wrapper executable"
 
+echo "$SOURCE_COMMIT" > source-commit || fail "cannot record the source commit"
 echo 0 > ~/install-exit-status

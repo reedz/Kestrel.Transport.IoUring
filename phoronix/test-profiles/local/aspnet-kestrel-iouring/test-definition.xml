@@ -4,7 +4,7 @@
   <TestInformation>
     <Title>ASP.NET Core Kestrel (transport comparison)</Title>
     <AppVersion>2.3.0</AppVersion>
-    <Description>HTTP/1.1 throughput of ASP.NET Core's Kestrel server with either its default epoll socket transport or the Kestrel.Transport.IoUring transport (Linux io_uring), measured with wrk. Workloads: the nginx/apache profiles' 118 KB static test.html, a 13-byte plaintext response and a per-request serialized JSON response. The profile starts the server with the chosen transport and .NET runtime, verifies from /proc that the requested transport really serves traffic (a silent fall back to sockets fails the run), warms it up, and fails any measured run that has socket errors or non-2xx responses.</Description>
+    <Description>HTTP/1.1 throughput of ASP.NET Core's Kestrel server with either its default epoll socket transport or the Kestrel.Transport.IoUring transport (Linux io_uring), measured with wrk. Workloads: the nginx/apache profiles' 118 KB static test.html, a 13-byte plaintext response and a per-request serialized JSON response. The profile starts the server with the chosen transport and .NET runtime, verifies from /proc and over HTTP that this process serves the port with the requested transport and runtime (a silent fall back to sockets fails the run), checks the workload's response, warms it up, and fails any measured run that has socket errors or HTTP error responses.</Description>
     <ResultScale>Requests Per Second</ResultScale>
     <Proportion>HIB</Proportion>
     <TimesToRun>3</TimesToRun>
@@ -18,16 +18,31 @@
     <Status>Private</Status>
     <SupportedArchitectures>x86_64</SupportedArchitectures>
     <ExternalDependencies>build-utilities, openssl-development</ExternalDependencies>
-    <InstallRequiresInternet>TRUE</InstallRequiresInternet>
     <EnvironmentSize>2600</EnvironmentSize>
     <ProjectURL>https://github.com/reedz/Kestrel.Transport.IoUring</ProjectURL>
     <RepositoryURL>https://github.com/reedz/Kestrel.Transport.IoUring</RepositoryURL>
     <Maintainer>reedz</Maintainer>
   </TestProfile>
   <TestSettings>
-    <Default>
-      <Arguments>-d 90 </Arguments>
-    </Default>
+    <Option>
+      <DisplayName>Duration</DisplayName>
+      <Identifier>duration</Identifier>
+      <ArgumentPrefix>-d </ArgumentPrefix>
+      <Menu>
+        <Entry>
+          <Name>90 seconds</Name>
+          <Value>90</Value>
+        </Entry>
+        <Entry>
+          <Name>30 seconds</Name>
+          <Value>30</Value>
+        </Entry>
+        <Entry>
+          <Name>10 seconds (smoke test)</Name>
+          <Value>10</Value>
+        </Entry>
+      </Menu>
+    </Option>
     <Option>
       <DisplayName>Transport</DisplayName>
       <Identifier>transport</Identifier>

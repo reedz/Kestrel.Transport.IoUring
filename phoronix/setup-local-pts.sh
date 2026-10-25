@@ -1,93 +1,94 @@
 #!/bin/bash
-# Installs the private profile and a no-upload PTS configuration into the CURRENT USER's
-# ~/.phoronix-test-suite. It does not run PTS, does not upload anything and does not publish the profile.
+# Installs the private profile and the no-upload PTS configuration into the CURRENT USER's PTS directory.
+# It does not run PTS, does not upload anything and does not publish the profile.
 #
-#   phoronix/setup-local-pts.sh [--artifacts DIR] [--no-config]
+#   phoronix/setup-local-pts.sh [--artifacts DIR]     install profile + configuration (run make-bundle.sh first)
+#   phoronix/setup-local-pts.sh --verify              only check the PTS configuration PTS will actually read
 #
-#   --artifacts DIR   directory holding the pre-downloaded third-party files named in downloads.xml
-#                     (SDK tarballs, wrk, http-test-files). Copied into PTS's download cache so the install
-#                     does not re-download them. Optional: PTS downloads anything missing.
-#   --no-config       leave ~/.phoronix-test-suite/user-config.xml alone (then YOU must make sure uploads are off)
-#   --offline         set NoNetworkCommunication=TRUE in the installed config (use after `install`, before measuring)
-#   --verify          only check that the PTS configuration PTS will read cannot upload results or usage data
-#                     (run it again after the first PTS command: PTS rewrites the file and falls back to
-#                     upload-enabled defaults if it cannot parse it)
+#   --artifacts DIR   directory holding the third-party files named in downloads.xml (SDK tarballs, wrk,
+#                     http-test-files), copied into PTS's download cache. fetch-artifacts.sh puts them there too.
 #
-# Run phoronix/make-bundle.sh first.
+# PTS is configured with NoNetworkCommunication=TRUE and the profile installs offline, so PTS never needs the network:
+# every download must already be in the cache (fetch-artifacts.sh).
 
 set -euo pipefail
 
 REPO="$(git rev-parse --show-toplevel)"
+DIST="${DIST:-$REPO/phoronix/dist}"
 . "$REPO/phoronix/runtime/common.sh"
 
 verify_config() {
-    local problems
-    problems="$(config_upload_problems)"
-    if [ -n "$problems" ]; then
-        echo "PTS configuration is NOT local-only:" >&2
-        echo "$problems" >&2
-        return 1
+    if config_check; then
+        echo "PTS configuration verified ($CFG_FILE): result uploads, usage reporting, log uploads and PTS network access are disabled."
+        return 0
     fi
-    echo "PTS configuration verified: result uploads, usage reporting and log uploads are disabled."
+    echo "PTS configuration is NOT local-only:" >&2
+    echo "$CFG_PROBLEMS" | sed 's/^/  - /' >&2
+    return 1
 }
-DIST="${DIST:-$REPO/phoronix/dist}"
-PTS_USER="$HOME/.phoronix-test-suite"
-ARTIFACTS=""
-WRITE_CONFIG=1
-OFFLINE=0
 
+ARTIFACTS=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --artifacts) ARTIFACTS="$2"; shift 2 ;;
-        --no-config) WRITE_CONFIG=0; shift ;;
-        --offline) OFFLINE=1; shift ;;
+        --artifacts) [ $# -ge 2 ] || { echo "--artifacts needs a directory" >&2; exit 2; }; ARTIFACTS="$2"; shift 2 ;;
         --verify) verify_config; exit $? ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
-if [ "$OFFLINE" = "1" ]; then
-    [ -f "$PTS_USER/user-config.xml" ] || { echo "No $PTS_USER/user-config.xml; run without --offline first." >&2; exit 1; }
-    sed -i 's#<NoNetworkCommunication>FALSE</NoNetworkCommunication>#<NoNetworkCommunication>TRUE</NoNetworkCommunication>#' "$PTS_USER/user-config.xml"
-    echo "NoNetworkCommunication=TRUE in $PTS_USER/user-config.xml"
-    verify_config
-    exit $?
-fi
+SRC_BUNDLE="$(ls "$DIST"/aspnet-kestrel-iouring-src-*.tar.gz 2> /dev/null | head -1 || true)"
+[ -n "$SRC_BUNDLE" ] && [ -f "$DIST/user-config.xml" ] || { echo "Run phoronix/make-bundle.sh first." >&2; exit 1; }
+SRC_NAME="$(basename "$SRC_BUNDLE")"
 
-[ -f "$DIST/aspnet-kestrel-iouring-src.tar.gz" ] || { echo "Run phoronix/make-bundle.sh first." >&2; exit 1; }
+# Where PTS will look, decided the way PTS decides it (this is also where the configuration must go).
+config_check > /dev/null || true
+[ -n "$CFG_USER_PATH" ] && [ -n "$CFG_FILE" ] || { echo "Cannot determine the PTS user directory." >&2; exit 1; }
+case "$CFG_FILE" in
+    /etc/*) echo "PTS would read $CFG_FILE (privileged install); run this as a normal user." >&2; exit 1 ;;
+esac
 
-mkdir -p "$PTS_USER/test-profiles/local" "$PTS_USER/download-cache"
+mkdir -p "$CFG_USER_PATH/test-profiles/local" "$CFG_USER_PATH/download-cache"
 
-rm -rf "$PTS_USER/test-profiles/local/aspnet-kestrel-iouring"
-cp -r "$DIST/test-profiles/local/aspnet-kestrel-iouring" "$PTS_USER/test-profiles/local/"
-cp "$DIST/aspnet-kestrel-iouring-src.tar.gz" "$PTS_USER/download-cache/"
+rm -rf "$CFG_USER_PATH/test-profiles/local/aspnet-kestrel-iouring"
+cp -r "$DIST/test-profiles/local/aspnet-kestrel-iouring" "$CFG_USER_PATH/test-profiles/local/"
+
+# Only the bundle of this commit stays in the cache: PTS keeps an already-present download without re-hashing it.
+for old in "$CFG_USER_PATH"/download-cache/aspnet-kestrel-iouring-src*.tar.gz; do
+    [ -e "$old" ] && [ "$(basename "$old")" != "$SRC_NAME" ] && rm -f "$old"
+done
+cp "$SRC_BUNDLE" "$CFG_USER_PATH/download-cache/"
+
 if [ -n "$ARTIFACTS" ]; then
     for f in dotnet-sdk-10.0.402-linux-x64.tar.gz dotnet-sdk-11.0.100-rc.2.26504.105-linux-x64.tar.gz \
              wrk-4.2.0.tar.gz http-test-files-1.tar.xz; do
-        [ -f "$ARTIFACTS/$f" ] && cp "$ARTIFACTS/$f" "$PTS_USER/download-cache/"
+        [ -f "$ARTIFACTS/$f" ] && cp "$ARTIFACTS/$f" "$CFG_USER_PATH/download-cache/"
     done
 fi
 
-if [ "$WRITE_CONFIG" = "1" ]; then
-    if [ -f "$PTS_USER/user-config.xml" ]; then
-        cp "$PTS_USER/user-config.xml" "$PTS_USER/user-config.xml.bak.$(date +%Y%m%d%H%M%S)"
-    fi
-    cp "$REPO/phoronix/config/user-config.xml" "$PTS_USER/user-config.xml"
-    echo "Wrote $PTS_USER/user-config.xml (uploads, usage reporting and prompts disabled)."
-    verify_config
+if [ -f "$CFG_FILE" ]; then
+    cp "$CFG_FILE" "$CFG_FILE.bak.$(date +%Y%m%d%H%M%S)"
+fi
+cp "$DIST/user-config.xml" "$CFG_FILE"
+verify_config
+
+MISSING=""
+for f in dotnet-sdk-10.0.402-linux-x64.tar.gz dotnet-sdk-11.0.100-rc.2.26504.105-linux-x64.tar.gz \
+         wrk-4.2.0.tar.gz http-test-files-1.tar.xz; do
+    [ -f "$CFG_USER_PATH/download-cache/$f" ] || MISSING="$MISSING $f"
+done
+if [ -n "$MISSING" ]; then
+    echo
+    echo "Missing from the PTS download cache:$MISSING"
+    echo "Run phoronix/fetch-artifacts.sh (needs network, uses curl only) and then this script again."
 fi
 
 cat <<EOF
 
 Profile installed as local/aspnet-kestrel-iouring (source commit $(cat "$DIST/SOURCE_COMMIT")).
 
-Next (PTS must already be on your PATH or use its full path):
-  phoronix-test-suite install local/aspnet-kestrel-iouring
-  # short smoke run: one repetition, 10 s per measurement, one configuration
-  PTS_DURATION=10 FORCE_TIMES_TO_RUN=1 \\
-  PRESET_OPTIONS='aspnet-kestrel-iouring.transport=io_uring;aspnet-kestrel-iouring.workload=Plaintext;aspnet-kestrel-iouring.connections=100;aspnet-kestrel-iouring.runtime=.NET 10;aspnet-kestrel-iouring.rings=1' \\
-  TEST_RESULTS_NAME=kestrel-smoke TEST_RESULTS_IDENTIFIER=smoke \\
-  phoronix-test-suite batch-benchmark local/aspnet-kestrel-iouring
+Next (needs PTS and php; no network):
+  phoronix-test-suite force-install local/aspnet-kestrel-iouring
+  phoronix/run-local.sh --duration 10 --runs 1 --connections 100 --rings 1       # smoke test
 
-See phoronix/README.md for the full matrix and for keeping the run strictly local.
+See phoronix/README.md for the full matrix and for the no-egress mode.
 EOF
