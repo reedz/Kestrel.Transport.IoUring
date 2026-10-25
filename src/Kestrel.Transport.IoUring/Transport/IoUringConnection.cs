@@ -42,9 +42,15 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     private readonly ILogger _logger;
     private readonly int _receiveBufferSize;
     private readonly CancellationTokenSource _connectionCts = new();
+    // Public ConnectionClosed. Separate from _connectionCts (which the send loop watches) so that the receive
+    // side ending (EOF/RST) can notify the application, as SocketTransport does, without cutting off a
+    // response that is still being sent to a client that half-closed.
+    private readonly CancellationTokenSource _connectionClosedCts = new();
+    private int _receiveClosedSignaled;
     private readonly Pipe _inputPipe;
     private readonly Pipe _outputPipe;
     private int _disposed;
+    private readonly TaskCompletionSource _finalized = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>Generation counter — incremented on each connection using this slot.
     /// Encoded into UserData to detect stale CQEs from previous connections.</summary>
@@ -121,7 +127,14 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     internal bool RecvCancelPending { get; set; }
     private Queue<byte[]>? _pendingRecvData;
     private int _pendingRecvBytes;
-    private const int MaxPendingRecvBytes = 1024 * 1024;
+
+    // Upper bound for receive data queued while the application's input pipe is paused. The multishot receive is
+    // cancelled when the pipe pauses, but completions already posted keep arriving until the cancel takes
+    // effect: up to a full completion queue of buffers, plus whatever the peer's socket buffer holds (a few MiB
+    // on loopback). That data was already received and cannot be dropped, so this is a runaway guard, not the
+    // backpressure mechanism: once the cancel lands, TCP flow control throttles the peer.
+    private const int MinPendingRecvLimitBytes = 8 * 1024 * 1024;
+    private readonly int _maxPendingRecvBytes;
 
     /// <summary>True after the output-pipe send loop has stopped and cannot submit more sends.</summary>
     internal bool SendLoopCompleted { get; private set; } = true;
@@ -153,6 +166,9 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         _ring = ring;
         _logger = logger;
         _receiveBufferSize = receiveBufferSize;
+        _maxPendingRecvBytes = (int)Math.Min(
+            int.MaxValue,
+            Math.Max(MinPendingRecvLimitBytes, (long)ring.CqEntries * receiveBufferSize));
         UsingBufferRing = useBufferRing;
         ConnectionId = $"iouring:{connectionId}";
         RemoteEndPoint = remoteEndPoint;
@@ -194,11 +210,47 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
 
         Transport = new DuplexPipe(_inputPipe.Reader, _outputPipe.Writer);
         Application = new DuplexPipe(_outputPipe.Reader, _inputPipe.Writer);
+
+        // Abort and final close cancel _connectionCts; the application-visible token follows it.
+        _connectionCts.Token.UnsafeRegister(
+            static state => ((IoUringConnection)state!)._connectionClosedCts.Cancel(),
+            this);
     }
 
     public IDuplexPipe Application { get; }
 
-    public override CancellationToken ConnectionClosed => _connectionCts.Token;
+    public override CancellationToken ConnectionClosed => _connectionClosedCts.Token;
+
+    /// <summary>
+    /// Notifies the application that the connection is closed because the receive side ended (EOF or a
+    /// terminal error such as a peer reset). Kestrel uses this to abort an in-flight request. Callbacks are
+    /// application code, so they run on the thread pool rather than on the IO loop.
+    /// </summary>
+    internal void SignalReceiveClosed()
+    {
+        if (Interlocked.Exchange(ref _receiveClosedSignaled, 1) != 0)
+            return;
+
+        ThreadPool.UnsafeQueueUserWorkItem(
+            static connection => connection.CancelConnectionClosed(),
+            this,
+            preferLocal: false);
+    }
+
+    private void CancelConnectionClosed()
+    {
+        try
+        {
+            _connectionClosedCts.Cancel();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "ConnectionClosed callbacks failed after the receive side of connection {Id} ended.",
+                _connectionId);
+        }
+    }
 
     /// <summary>Sets the fd on an SQE, using fixed-file index if registered.</summary>
     private unsafe void SetSqeFd(IoUringSqe* sqe)
@@ -283,6 +335,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     internal void CompleteInputWriter()
     {
         try { _inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
+        SignalReceiveClosed();
     }
 
     /// <summary>
@@ -294,7 +347,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     {
         if (RecvRearmPending)
         {
-            if (_pendingRecvBytes + data.Length > MaxPendingRecvBytes)
+            if (_pendingRecvBytes + data.Length > _maxPendingRecvBytes)
             {
                 _requestClose?.Invoke(
                     _connectionId,
@@ -404,6 +457,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         if (bytesRead <= 0)
         {
             _inputPipe.Writer.Complete();
+            SignalReceiveClosed();
             return RecvOutcome.Closed;
         }
 
@@ -680,12 +734,19 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
 
     public override ValueTask DisposeAsync()
     {
-        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
-            return ValueTask.CompletedTask;
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) == 0)
+            RequestClose(null);
 
-        RequestClose(null);
-        return ValueTask.CompletedTask;
+        // Kestrel removes the connection from its manager only after this completes, so it must not complete
+        // before the IO loop has drained the final response and reclaimed the socket.
+        return new ValueTask(_finalized.Task);
     }
+
+    /// <summary>
+    /// Signals that the transport has finished with this connection: its socket is reclaimed (or the transport
+    /// stopped and can make no further progress). Completes <see cref="DisposeAsync"/>.
+    /// </summary>
+    internal void MarkFinalized() => _finalized.TrySetResult();
 
     private void RequestClose(ConnectionAbortedException? reason)
     {
@@ -758,6 +819,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         try { _outputPipe.Reader.Complete(); } catch (InvalidOperationException) { }
         _pendingRecvData?.Clear();
         _pendingRecvBytes = 0;
+        MarkFinalized();
     }
 
     private sealed class DuplexPipe(PipeReader reader, PipeWriter writer) : IDuplexPipe

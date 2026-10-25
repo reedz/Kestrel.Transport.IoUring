@@ -26,7 +26,8 @@ internal sealed class ListenerRecvRetryState
         bool isClosing,
         bool hasRecvInFlight,
         bool recvCancelPending,
-        bool usingBufferRing)
+        bool usingBufferRing,
+        bool recvRearmPending = false)
     {
         internal ushort Generation { get; } = generation;
         internal ulong RecvEpoch { get; } = recvEpoch;
@@ -34,6 +35,7 @@ internal sealed class ListenerRecvRetryState
         internal bool HasRecvInFlight { get; } = hasRecvInFlight;
         internal bool RecvCancelPending { get; } = recvCancelPending;
         internal bool UsingBufferRing { get; } = usingBufferRing;
+        internal bool RecvRearmPending { get; } = recvRearmPending;
     }
 
     internal readonly struct RecvCancelRetryOrigin(ushort generation, ulong recvEpoch)
@@ -68,19 +70,29 @@ internal sealed class ListenerRecvRetryState
     }
 
     private readonly HashSet<long> _recvRetrySet = [];
+    // FIFO order of retry arms so a connection that keeps losing a race for buffers cannot starve the
+    // others. Entries may be stale (removed from the set); they are skipped when dequeued.
+    private readonly Queue<long> _recvRetryOrder = new();
     private readonly HashSet<long> _recvCancelRetrySet = [];
     private readonly Dictionary<long, RecvCancelRetryOrigin> _recvCancelRetryOrigins = [];
     private readonly List<long> _recvRetryScratch = [];
     // True only when the most recent due retry pass actually tried to queue
     // recv/cancel work and lost to SQ-full.
     private bool _blockedOnSq;
+    // True when the most recent pass stopped at its arm budget with receive retries still queued.
+    private bool _budgetLimited;
 
     internal int RecvRetryCount => _recvRetrySet.Count;
     internal int RecvCancelRetryCount => _recvCancelRetrySet.Count;
     internal bool HasPendingRetryPassWork => _recvRetrySet.Count != 0 || _recvCancelRetrySet.Count != 0;
     internal bool BlockedOnSq => _blockedOnSq;
+    internal bool BudgetLimited => _budgetLimited;
 
-    internal void AddRecvRetry(long connectionId) => _recvRetrySet.Add(connectionId);
+    internal void AddRecvRetry(long connectionId)
+    {
+        if (_recvRetrySet.Add(connectionId))
+            _recvRetryOrder.Enqueue(connectionId);
+    }
 
     internal void AddRecvCancelRetry(long connectionId, in RecvCancelRetryOrigin origin)
     {
@@ -113,13 +125,19 @@ internal sealed class ListenerRecvRetryState
     internal void RetryFailedRecvs(
         IoUringConnection?[] connectionSlots,
         ProvidedBufferRing? bufferRing,
-        ushort recvBufferGroupId)
+        ushort recvBufferGroupId,
+        int maxArms = int.MaxValue)
     {
         var adapter = new ProductionPassAdapter(connectionSlots, bufferRing, recvBufferGroupId);
-        RunRetryPass(ref adapter);
+        RunRetryPass(ref adapter, maxArms);
     }
 
-    internal void RunRetryPass<TAdapter>(ref TAdapter adapter)
+    /// <summary>
+    /// Runs one retry pass. <paramref name="maxArms"/> bounds how many receives are re-armed per pass: with a
+    /// provided buffer ring, re-arming more sockets than there are free buffers just produces another round of
+    /// ENOBUFS, so the pass leaves the rest queued (in FIFO order) for the next one.
+    /// </summary>
+    internal void RunRetryPass<TAdapter>(ref TAdapter adapter, int maxArms = int.MaxValue)
         where TAdapter : struct, IRecvRetryPassAdapter<TAdapter>
     {
         // A retry pass must still run for cancel-only work; the per-slot stale
@@ -127,26 +145,44 @@ internal sealed class ListenerRecvRetryState
         if (!HasPendingRetryPassWork)
         {
             _blockedOnSq = false;
+            _budgetLimited = false;
+            _recvRetryOrder.Clear();
             return;
         }
 
         bool blockedOnSq = false;
-        _recvRetryScratch.Clear();
-        foreach (long connectionId in _recvRetrySet)
+        bool budgetLimited = false;
+        int armed = 0;
+        int queued = _recvRetryOrder.Count;
+        for (int i = 0; i < queued; i++)
         {
+            if (armed >= maxArms)
+            {
+                budgetLimited = true;
+                break;
+            }
+
+            if (!_recvRetryOrder.TryDequeue(out long connectionId))
+                break;
+            if (!_recvRetrySet.Contains(connectionId))
+                continue;
+
             switch (ProcessRecvRetry(ref adapter, connectionId, out bool retryBlockedOnSq))
             {
                 case RecvRetryProcessResult.Armed:
+                    _recvRetrySet.Remove(connectionId);
+                    armed++;
+                    break;
                 case RecvRetryProcessResult.Drop:
-                    _recvRetryScratch.Add(connectionId);
+                    _recvRetrySet.Remove(connectionId);
+                    break;
+                default:
+                    _recvRetryOrder.Enqueue(connectionId);
                     break;
             }
 
             blockedOnSq |= retryBlockedOnSq;
         }
-
-        foreach (long connectionId in _recvRetryScratch)
-            _recvRetrySet.Remove(connectionId);
 
         _recvRetryScratch.Clear();
         foreach (long connectionId in _recvCancelRetrySet)
@@ -170,6 +206,7 @@ internal sealed class ListenerRecvRetryState
             RemoveRecvCancelRetry(connectionId);
 
         _blockedOnSq = blockedOnSq;
+        _budgetLimited = budgetLimited && _recvRetrySet.Count != 0;
     }
 
     private void RemoveRecvCancelRetry(long connectionId)
@@ -195,6 +232,12 @@ internal sealed class ListenerRecvRetryState
             return RecvRetryProcessResult.Drop;
 
         if (connectionState.IsClosing || connectionState.HasRecvInFlight)
+            return RecvRetryProcessResult.Drop;
+
+        // A pending cancel or a pipe flush that has not drained already has its own re-arm path
+        // (HandleCancel / DrainRecvResubmitQueue). Re-arming here would bypass receive backpressure
+        // and, for a cancel, leave two receives armed for one connection.
+        if (connectionState.RecvCancelPending || connectionState.RecvRearmPending)
             return RecvRetryProcessResult.Drop;
 
         bool armed = connectionState.UsingBufferRing
@@ -267,7 +310,8 @@ internal sealed class ListenerRecvRetryState
                 conn.IsClosing,
                 conn.HasRecvInFlight,
                 conn.RecvCancelPending,
-                conn.UsingBufferRing && self._bufferRing != null);
+                conn.UsingBufferRing && self._bufferRing != null,
+                conn.RecvRearmPending);
             return true;
         }
 

@@ -29,8 +29,9 @@ EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC
 \*   1. Each worker is reduced to a bounded accept channel, a fixed max-live
 \*      capacity, and the phase-4 listener lifecycle boundary: it can publish
 \*      accepted connections, its AcceptAsync returns the FIFO head or null after
-\*      cancellation/completion, UnbindAsync eventually terminates live transport
-\*      ownership, and DisposeAsync only runs after UnbindAsync.
+\*      cancellation/completion, UnbindAsync only stops accepting (application-owned
+\*      connections stay live until Kestrel closes them or DisposeAsync aborts the
+\*      remainder), and DisposeAsync only runs after UnbindAsync.
 \*   2. Internal ring SQ/CQ scheduling, slot generations, recv/send state, and
 \*      worker-local close queues stay in Listener.tla. This module only keeps
 \*      the ownership effects visible to IoUringMultiListener.

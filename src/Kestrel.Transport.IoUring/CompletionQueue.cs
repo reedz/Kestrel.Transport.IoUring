@@ -52,6 +52,9 @@ internal sealed unsafe class CompletionQueue
 
     public uint Available => Volatile.Read(ref *_tail) - Volatile.Read(ref *_head);
 
+    /// <summary>Number of CQ entries the kernel allocated.</summary>
+    public uint RingEntries => *_ringEntries;
+
     /// <summary>Returns the kernel's CQ overflow counter.</summary>
     public uint OverflowCount => Volatile.Read(ref *_overflow);
 }

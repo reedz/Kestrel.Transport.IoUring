@@ -573,7 +573,7 @@ TopWorkDrained ==
             /\ sendLoopCompleted[s]
             /\ sendInFlight[s] = "none"
             /\ cancelInFlight[s] = "none"
-    /\ ~(unbindStarted /\ \E s \in Slots : slotState[s] # "free" /\ ~abortIssued[s])
+    /\ ~(disposeStarted /\ \E s \in Slots : slotState[s] = "open" /\ ~abortIssued[s])
 
 AcceptRearmEnabled ==
     \/ ScenarioAcceptFocused
@@ -1740,7 +1740,7 @@ TriggerRingFailure ==
 
 UnbindTimeoutExpires ==
     /\ ScenarioLifecycleFocused
-    /\ unbindStarted
+    /\ disposeStarted
     /\ ~unbindTimeoutElapsed
     /\ ~AllSlotsFree
     /\ unbindTimeoutElapsed' = TRUE
@@ -1811,12 +1811,15 @@ LoopMaybeFinishSend ==
                     unbindStarted, disposeStarted, unbindTimeoutElapsed,
                     ringDisposed, PoolVars, FileVars, BugVars >>
 
+\* Queues a forced abort for connections the application still owns. Runs only after DisposeAsync has
+\* started: UnbindAsync alone must not abort live connections. Connections already closing gracefully
+\* ("closing") are left to drain their final response.
 LoopQueueUnbindClose ==
     /\ loopPhase = "top"
-    /\ unbindStarted
-    /\ \E s \in Slots : slotState[s] # "free" /\ ~abortIssued[s]
+    /\ disposeStarted
+    /\ \E s \in Slots : slotState[s] = "open" /\ ~abortIssued[s]
     /\ \E s \in Slots :
-        /\ slotState[s] # "free"
+        /\ slotState[s] = "open"
         /\ ~abortIssued[s]
         /\ abortIssued' = [abortIssued EXCEPT ![s] = TRUE]
         /\ closeRequestQueue' = Append(closeRequestQueue, CloseReq(s, slotGen[s], "abort"))
@@ -2193,7 +2196,7 @@ LoopStop ==
     /\ loopPhase \in {"top", "wait", "after", "parked"}
     /\ stopping
     /\ ~HasStagedOps
-    /\ (ringFailed \/ (unbindStarted /\ (AllSlotsFree \/ unbindTimeoutElapsed \/ disposeStarted)))
+    /\ (ringFailed \/ (disposeStarted /\ (AllSlotsFree \/ unbindTimeoutElapsed \/ disposeStarted)))
     /\ loopPhase' = "stopped"
     /\ UNCHANGED << ConnVars, RetryVars, QueueVars, acceptArmed,
                     acceptArmedMultishot, eventfdReadArmed, cqQueue, sqAvail,
@@ -2782,7 +2785,7 @@ AfterResumeSend ==
        /\ sendReady' = sendReady \cup resumed
        /\ sendWaitingRetry' = [s \in Slots |-> IF s \in resumed THEN FALSE ELSE sendWaitingRetry[s]]
        /\ sendRetrySet' = {}
-       /\ loopPhase' = IF unbindStarted /\ (ringFailed \/ AllSlotsFree \/ unbindTimeoutElapsed) THEN "stopped" ELSE "top"
+       /\ loopPhase' = IF disposeStarted /\ (ringFailed \/ AllSlotsFree \/ unbindTimeoutElapsed) THEN "stopped" ELSE "top"
     /\ UNCHANGED << freeSlots, slotState, slotGen, slotAccepted, slotFd, slotFile,
                     outputCompleted, sendLoopCompleted, recvEpoch, recvArmed,
                     recvFdRef, recvRearmPending, pendingRecv, recvSeen,
@@ -4833,6 +4836,12 @@ EventFdWakeEventuallyDrains ==
 CloseEventuallyReleasesSlot ==
     \A s \in Slots :
         []((slotState[s] = "closing") => <>(slotState[s] = "free" \/ ringDisposed))
+
+\* Unbind only stops accepting. The IO loop keeps serving established connections until the transport
+\* is disposed (or the ring fails): Kestrel gracefully closes connections between UnbindAsync and
+\* DisposeAsync, and only DisposeAsync force-aborts what the application still owns.
+UnbindAloneKeepsLoopRunning ==
+    (unbindStarted /\ ~disposeStarted /\ ~ringFailed) => loopPhase # "stopped"
 
 UnbindEventuallyStops ==
     []((unbindStarted) => <>(loopPhase = "stopped" \/ ringDisposed))

@@ -28,7 +28,7 @@ public sealed class IoUringTransportOptions
     /// <summary>Per-connection receive buffer size in bytes.
     /// Also controls per-buffer size in the provided buffer ring when EnableBufferRing=true.
     /// 2 KB is plenty for keep-alive HTTP/1.1 small-payload workloads (Plaintext/JSON);
-    /// raise for upload-heavy workloads. Pinned heap cost = BufferRingSize × ReceiveBufferSize × ThreadCount.</summary>
+    /// raise for upload-heavy workloads. Pinned heap cost = <see cref="BufferRingSize"/> × ReceiveBufferSize × ThreadCount.</summary>
     public int ReceiveBufferSize { get; set; } = 2048;
 
     /// <summary>
@@ -104,8 +104,15 @@ public sealed class IoUringTransportOptions
     /// </summary>
     public bool EnableRegisteredFiles { get; set; }
 
-    /// <summary>Number of buffers in the provided buffer ring (must be power of two).</summary>
-    public int BufferRingSize { get; set; } = 1024;
+    /// <summary>
+    /// Number of buffers in the provided buffer ring (a power of two), or <c>0</c> (the default) to size it from
+    /// <see cref="MaxConnections"/>: the next power of two, between 1024 and 4096. Every ready socket's receive
+    /// takes a buffer, so a ring smaller than the number of active connections makes receives fail with
+    /// <c>ENOBUFS</c> and stalls connections under load; keep this at least as large as the number of
+    /// concurrent connections you expect per ring. Pinned heap cost = buffers × <see cref="ReceiveBufferSize"/>
+    /// × <see cref="ThreadCount"/>.
+    /// </summary>
+    public int BufferRingSize { get; set; }
 
     /// <summary>
     /// When true, Kestrel HTTP processing runs inline on the IO loop thread,
@@ -121,6 +128,31 @@ public sealed class IoUringTransportOptions
     /// accepted them, so queue depth must not scale with <see cref="MaxConnections"/>.
     /// </summary>
     internal int EffectiveRingSize => RingSize;
+
+    internal const int AutoBufferRingMin = 1024;
+    internal const int AutoBufferRingMax = 4096;
+
+    /// <summary>
+    /// The provided buffer ring size actually used: <see cref="BufferRingSize"/>, or when that is 0 a power of
+    /// two derived from <see cref="MaxConnections"/> (per ring: multi-ring listeners split the limit).
+    /// </summary>
+    internal int EffectiveBufferRingSize
+    {
+        get
+        {
+            if (BufferRingSize != 0)
+                return BufferRingSize;
+
+            long wanted = Math.Clamp((long)MaxConnections, AutoBufferRingMin, AutoBufferRingMax);
+            int size = AutoBufferRingMin;
+            while (size < wanted)
+                size <<= 1;
+
+            while (size > 1 && (long)size * ReceiveBufferSize > int.MaxValue)
+                size >>= 1;
+            return size;
+        }
+    }
 
     internal void Validate()
     {
@@ -141,10 +173,11 @@ public sealed class IoUringTransportOptions
         if (LogPoolStatsInterval < 0)
             throw new ArgumentOutOfRangeException(nameof(LogPoolStatsInterval),
                 "LogPoolStatsInterval cannot be negative.");
-        if (BufferRingSize < 1 || BufferRingSize > MaxRingEntries || !IsPowerOfTwo(BufferRingSize))
+        if (BufferRingSize < 0 ||
+            (BufferRingSize != 0 && (BufferRingSize > MaxRingEntries || !IsPowerOfTwo(BufferRingSize))))
             throw new ArgumentOutOfRangeException(nameof(BufferRingSize),
-                $"BufferRingSize must be a power of two between 1 and {MaxRingEntries}.");
-        if ((long)BufferRingSize * ReceiveBufferSize > int.MaxValue)
+                $"BufferRingSize must be 0 (auto) or a power of two between 1 and {MaxRingEntries}.");
+        if ((long)EffectiveBufferRingSize * ReceiveBufferSize > int.MaxValue)
             throw new ArgumentOutOfRangeException(nameof(BufferRingSize),
                 "BufferRingSize multiplied by ReceiveBufferSize must fit in a managed array.");
         if ((long)AcceptQueueCapacity * ThreadCount > int.MaxValue)

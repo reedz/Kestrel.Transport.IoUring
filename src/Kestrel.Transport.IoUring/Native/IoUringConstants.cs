@@ -54,6 +54,9 @@ internal static class IoUringConstants
     public const ulong EVENTFD_USER_DATA = ulong.MaxValue - 1;
     public const ulong ACCEPT_USER_DATA = ulong.MaxValue - 2;
 
+    /// <summary>User-data sentinel for the ASYNC_CANCEL SQE that stops the accept request on unbind.</summary>
+    public const ulong ACCEPT_CANCEL_USER_DATA = ulong.MaxValue - 3;
+
     // Socket option constants for setsockopt.
     public const int SOL_SOCKET = 1;
     public const int SO_REUSEADDR = 2;

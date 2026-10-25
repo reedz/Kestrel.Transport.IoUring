@@ -84,11 +84,23 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private long _recvRetryNotBeforeTimestamp;
     private int _acceptErrorBackoffMs;
     private int _recvErrorBackoffMs;
+    // Consecutive ENOBUFS completions with no successful buffer receive in between.
+    private int _enobufsStreak;
     private volatile bool _stopping;
     private int _unbindStarted;
     private int _disposeStarted;
     private bool _ioLoopStarted;
 
+    // Unbind only stops accepting: the IO loop keeps serving established connections until DisposeAsync
+    // (Kestrel gracefully closes them between UnbindAsync and DisposeAsync). Accept shutdown is driven by the
+    // IO loop so the cancel SQE, any racing accept CQEs and the listen-socket close have a single owner.
+    private readonly TaskCompletionSource _acceptStopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _acceptStopRequested;   // set by UnbindAsync (any thread), consumed by the IO loop
+    private bool _acceptStopBegun;      // IO loop only
+    private bool _acceptCancelInFlight; // IO loop only
+    private int _forceCloseRequested;   // set by DisposeAsync (any thread), consumed by the IO loop
+    private bool _forceCloseBegun;      // IO loop only
+    private int _listenSocketReleased;
     // Registered file indices for fixed-fd SQEs (-1 = not registered).
     private int _listenSocketFileIndex = -1;
     private int _eventFdFileIndex = -1;
@@ -206,7 +218,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             {
                 _bufferRing = new ProvidedBufferRing(
                     _ring.Fd, RECV_BUF_GROUP_ID,
-                    _options.BufferRingSize, _receiveBufferSize);
+                    _options.EffectiveBufferRingSize, _receiveBufferSize);
             }
             catch (Exception ex)
             {
@@ -493,6 +505,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             {
                 try
                 {
+                    ProcessLifecycleCommands();
                     // Drain pipe scheduler work items (send loop continuations).
                     _pipeScheduler?.DrainWorkItems();
                     DrainCloseRequestQueue();
@@ -548,7 +561,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                                 schedulerHasWork,
                                 _eventFdReadState.RetryPendingWithoutReadInFlight,
                                 acceptRetryDueNow,
-                                recvRetryPassDueNow && _recvRetryState.BlockedOnSq));
+                                recvRetryPassDueNow &&
+                                    (_recvRetryState.BlockedOnSq || _recvRetryState.BudgetLimited)));
                         ProcessCompletions();
                     }
                     _consecutiveErrors = 0;
@@ -578,8 +592,105 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         }
         finally
         {
+            // The loop can make no further progress. Release anything still awaiting finalization so a
+            // Kestrel connection DisposeAsync cannot hang; the sockets are closed later by DisposeAsync.
+            foreach (var conn in _connectionSlots)
+                conn?.MarkFinalized();
+            foreach (var conn in _closingConnections.Values)
+                conn.MarkFinalized();
             _ioLoopStopped.TrySetResult();
         }
+    }
+
+    /// <summary>
+    /// Runs IO-loop-owned lifecycle commands requested from other threads by <see cref="UnbindAsync"/>
+    /// and <see cref="DisposeAsync"/>.
+    /// </summary>
+    private void ProcessLifecycleCommands()
+    {
+        if (Volatile.Read(ref _acceptStopRequested) != 0)
+        {
+            if (!_acceptStopBegun)
+            {
+                _acceptStopBegun = true;
+                TryCompleteAcceptStop();
+            }
+            // Re-attempts the cancel while the accept request is still live (SQ was full, or the
+            // cancel raced the accept's start and reported ENOENT).
+            TrySubmitAcceptCancel();
+        }
+
+        if (Volatile.Read(ref _forceCloseRequested) != 0 && !_forceCloseBegun)
+        {
+            _forceCloseBegun = true;
+            foreach (var conn in _connectionSlots)
+            {
+                // Connections already closing gracefully keep draining their final response; only
+                // connections the application still owns are aborted.
+                if (conn != null && !_closingConnections.ContainsKey(conn.NumericConnectionId))
+                {
+                    _closeRequestQueue.Enqueue(new CloseRequest(
+                        conn.NumericConnectionId,
+                        conn.Generation,
+                        new ConnectionAbortedException("Transport is shutting down.")));
+                }
+            }
+
+            if (_activeConnectionCount == 0)
+                _connectionsDrained.TrySetResult();
+        }
+    }
+
+    private unsafe void TrySubmitAcceptCancel()
+    {
+        if (!_acceptInFlight || _acceptCancelInFlight)
+            return;
+
+        if (!_ring.TryGetSqe(out IoUringSqe* sqe))
+        {
+            // SQ full: the next loop iteration flushes it and retries.
+            WakeIoLoop();
+            return;
+        }
+
+        sqe->Opcode = IoUringConstants.IORING_OP_ASYNC_CANCEL;
+        sqe->Fd = -1;
+        sqe->AddrOrSpliceOffIn = IoUringConstants.ACCEPT_USER_DATA;
+        sqe->UserData = IoUringConstants.ACCEPT_CANCEL_USER_DATA;
+        _acceptCancelInFlight = true;
+    }
+
+    /// <summary>
+    /// Completes accept shutdown once no accept or cancel request is outstanding: closes the listen socket
+    /// (new clients are refused from here on) and releases <see cref="UnbindAsync"/>.
+    /// </summary>
+    private void TryCompleteAcceptStop()
+    {
+        if (!_stopping || !_acceptStopBegun || _acceptInFlight || _acceptCancelInFlight)
+            return;
+
+        ReleaseListenSocket(unregisterFixedFile: true);
+        _acceptStopped.TrySetResult();
+    }
+
+    private void ReleaseListenSocket(bool unregisterFixedFile)
+    {
+        if (Interlocked.Exchange(ref _listenSocketReleased, 1) != 0)
+            return;
+
+        // Only valid while the ring is open (fd numbers can be reused after it closes).
+        if (unregisterFixedFile && _listenSocketFileIndex >= 0)
+        {
+            try { _ring.UnregisterFd(_listenSocketFileIndex); } catch { }
+            _listenSocketFileIndex = -1;
+        }
+
+        RunDisposeCleanupStep("listen socket handle release", () =>
+        {
+            if (_listenSocketFdRefAdded)
+                _listenSocket.SafeHandle.DangerousRelease();
+        });
+        RunDisposeCleanupStep("listen socket dispose", _listenSocket.Dispose);
     }
 
     /// <summary>Resubmits RECV SQEs for connections that had async flush (back-pressure resolved).</summary>
@@ -632,12 +743,32 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         }
     }
 
-    /// <summary>Retries RECV submissions that previously failed due to SQ-full.</summary>
+    /// <summary>Retries RECV submissions that previously failed (SQ full, or the buffer pool ran dry).</summary>
     private void RetryFailedRecvs()
     {
         if (Stopwatch.GetTimestamp() < Volatile.Read(ref _recvRetryNotBeforeTimestamp))
             return;
-        _recvRetryState.RetryFailedRecvs(_connectionSlots, _bufferRing, RECV_BUF_GROUP_ID);
+
+        // Re-arming more sockets than there are free provided buffers only produces another round of
+        // ENOBUFS. All buffers are free right after the CQ drains, so half the ring bounds the number of
+        // sockets that can complete before their buffers are recycled even if every one of them has data.
+        int maxArms = _bufferRing != null
+            ? Math.Max(1, _options.EffectiveBufferRingSize / 2)
+            : int.MaxValue;
+        _recvRetryState.RetryFailedRecvs(_connectionSlots, _bufferRing, RECV_BUF_GROUP_ID, maxArms);
+    }
+
+    /// <summary>
+    /// Provided-buffer exhaustion is resolved by progress, not time: the completions that hold buffers are
+    /// processed and recycled, then the retry pass at the end of the same CQ drain re-arms the victims.
+    /// Only a long streak with no successful receive in between means buffers are not coming back
+    /// (or the peer is flooding faster than we can drain), and then we back off instead of spinning.
+    /// </summary>
+    private void OnBufferExhausted()
+    {
+        int streakLimit = Math.Max(1024, _options.EffectiveBufferRingSize * 8);
+        if (++_enobufsStreak > streakLimit)
+            ScheduleRecvRetry();
     }
 
     private void ScheduleRecvRetry()
@@ -786,6 +917,16 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             return;
         }
 
+        if (cqe.UserData == IoUringConstants.ACCEPT_CANCEL_USER_DATA)
+        {
+            // Result is informational (0 cancelled, -ENOENT/-EALREADY raced the accept's own completion).
+            // The accept request's terminal CQE is what ends it; ProcessLifecycleCommands re-issues the
+            // cancel if the accept is somehow still live.
+            _acceptCancelInFlight = false;
+            TryCompleteAcceptStop();
+            return;
+        }
+
         var (connectionId, generation, opType) =
             IoUringConnection.DecodeUserData(cqe.UserData);
         var conn = GetConnection(connectionId);
@@ -829,11 +970,16 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             cqe.UserData);
 
         if (cqe.UserData is IoUringConstants.EVENTFD_USER_DATA or
-            IoUringConstants.ACCEPT_USER_DATA)
+            IoUringConstants.ACCEPT_USER_DATA or
+            IoUringConstants.ACCEPT_CANCEL_USER_DATA)
         {
             if (cqe.UserData == IoUringConstants.EVENTFD_USER_DATA)
             {
                 _eventFdReadState.OnEventFdReadCompletionDispatchError();
+            }
+            else if (cqe.UserData == IoUringConstants.ACCEPT_CANCEL_USER_DATA)
+            {
+                _acceptCancelInFlight = false;
             }
             else
             {
@@ -860,6 +1006,16 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         bool more = (cqeFlags & IoUringConstants.IORING_CQE_F_MORE) != 0;
         _acceptInFlight = more;
         bool delayedRetry = false;
+
+        if (_stopping)
+        {
+            // Accept is shutting down (unbind or fatal error): reclaim any connection that raced the
+            // cancel instead of surfacing it, and finish accept shutdown if nothing else is outstanding.
+            if (result >= 0)
+                Libc.close(result);
+            TryCompleteAcceptStop();
+            return;
+        }
 
         if (result < 0)
         {
@@ -1037,12 +1193,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 if (hasBuffer && _bufferRing != null)
                     _bufferRing.RecycleBuffer(bufferId);
 
-                // ENOBUFS: buffer ring empty — transient, rearm later.
+                // ENOBUFS: the buffer pool was empty when this socket became readable, which terminated
+                // its multishot receive. Retried by progress once the CQ drains and buffers are recycled.
                 if (result == -ENOBUFS)
                 {
                     Diagnostics.RecvDiagnostics.OnRecvEnobufs();
                     _recvRetryState.AddRecvRetry(connectionId);
-                    ScheduleRecvRetry();
+                    OnBufferExhausted();
                     Diagnostics.RecvDiagnostics.OnRecvRetryDepth(_recvRetryState.RecvRetryCount);
                     return false;
                 }
@@ -1079,6 +1236,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             if (hasBuffer && _bufferRing != null)
             {
                 _recvErrorBackoffMs = 0;
+                _enobufsStreak = 0;
                 Volatile.Write(ref _recvRetryNotBeforeTimestamp, 0);
                 IoUringConnection.RecvOutcome bufferOutcome;
                 try
@@ -1238,6 +1396,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         }
     }
 
+    /// <summary>
+    /// Stops accepting new connections. Established connections are untouched: Kestrel closes them gracefully
+    /// (and aborts stragglers) before disposing the listener, so the IO loop keeps running until
+    /// <see cref="DisposeAsync"/>. Never throws for a cancelled token; accept shutdown continues on the IO loop.
+    /// </summary>
     public async ValueTask UnbindAsync(CancellationToken cancellationToken = default)
     {
         if (Interlocked.Exchange(ref _unbindStarted, 1) == 0)
@@ -1245,48 +1408,26 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             _stopping = true;
             _acceptChannel.Writer.TryComplete();
 
-            if (!_ioLoopStarted)
-            {
-                _connectionsDrained.TrySetResult();
-                _cts.Cancel();
-                _ioLoopStopped.TrySetResult();
-            }
-
-            foreach (var conn in _connectionSlots)
-            {
-                if (conn == null)
-                    continue;
-                _closeRequestQueue.Enqueue(new CloseRequest(
-                    conn.NumericConnectionId,
-                    conn.Generation,
-                    new ConnectionAbortedException("Transport is shutting down.")));
-            }
-
-            if (_activeConnectionCount == 0)
-                _connectionsDrained.TrySetResult();
-
             if (_ioLoopStarted)
+            {
+                Volatile.Write(ref _acceptStopRequested, 1);
                 WakeIoLoop();
-
-            try
-            {
-                await _connectionsDrained.Task
-                    .WaitAsync(TimeSpan.FromSeconds(5), cancellationToken)
-                    .ConfigureAwait(false);
             }
-            catch (TimeoutException)
+            else
             {
-                _logger.LogWarning("Connections did not drain gracefully within the timeout period.");
-            }
-            finally
-            {
-                _cts.Cancel();
-                if (_ioLoopStarted)
-                    WakeIoLoop();
+                ReleaseListenSocket(unregisterFixedFile: false);
+                _acceptStopped.TrySetResult();
             }
         }
 
-        await _ioLoopStopped.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await _acceptStopped.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Best effort: the caller stopped waiting, accept shutdown still completes on the IO loop.
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -1295,6 +1436,37 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             return;
 
         await UnbindAsync().ConfigureAwait(false);
+
+        if (_ioLoopStarted)
+        {
+            // Anything still open here was not closed by Kestrel (direct disposal or a fatal error).
+            // Abort it so disposal cannot leak sockets or hang.
+            Volatile.Write(ref _forceCloseRequested, 1);
+            WakeIoLoop();
+            try
+            {
+                await _connectionsDrained.Task
+                    .WaitAsync(TimeSpan.FromSeconds(5))
+                    .ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning("Connections did not drain within the timeout period.");
+            }
+            finally
+            {
+                _cts.Cancel();
+                WakeIoLoop();
+            }
+        }
+        else
+        {
+            _connectionsDrained.TrySetResult();
+            _cts.Cancel();
+            _ioLoopStopped.TrySetResult();
+        }
+
+        await _ioLoopStopped.Task.ConfigureAwait(false);
 
         var connections = new HashSet<IoUringConnection>();
         foreach (var conn in _connectionSlots)
@@ -1351,12 +1523,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             RunDisposeCleanupStepAsync,
             EventFdTeardownAsync).ConfigureAwait(false);
 
-        RunDisposeCleanupStep("listen socket handle release", () =>
-        {
-            if (_listenSocketFdRefAdded)
-                _listenSocket.SafeHandle.DangerousRelease();
-        });
-        RunDisposeCleanupStep("listen socket dispose", _listenSocket.Dispose);
+        // Normally released on the IO loop during unbind; this covers a loop that never ran or failed.
+        ReleaseListenSocket(unregisterFixedFile: false);
 
         RunDisposeCleanupStep("listener cancellation source dispose", _cts.Dispose);
 
@@ -1421,8 +1589,12 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
         public static void ReleaseConnection(
             ref ProductionCloseFinalizationAdapter self,
-            long connectionId) =>
+            long connectionId)
+        {
             self._listener.RemoveConnection(connectionId);
+            // The socket is closed and the slot released: Kestrel's DisposeAsync on this connection may complete.
+            self._connection.MarkFinalized();
+        }
 
         public static void LogCloseFinalizationFailure(
             ref ProductionCloseFinalizationAdapter self,

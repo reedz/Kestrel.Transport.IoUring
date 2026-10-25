@@ -514,6 +514,9 @@ public sealed class Ring : IDisposable
     /// <summary>Gets the number of completion queue entries ready to be consumed.</summary>
     public uint AvailableCompletions => _cq.Available;
 
+    /// <summary>Number of completion queue entries the kernel allocated (by default twice the SQ size).</summary>
+    internal uint CqEntries => _cq.RingEntries;
+
     /// <summary>Returns the kernel's CQ overflow counter.</summary>
     internal uint CqOverflowCount => _cq.OverflowCount;
 

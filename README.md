@@ -42,7 +42,6 @@ var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseIoUring(options =>
 {
     options.RingSize = 1024;
-    options.BufferRingSize = 1024;
     options.MaxConnections = 16_384;
 });
 
@@ -59,7 +58,7 @@ use `services.AddIoUringTransport(...)`.
 | Option | Default | Description |
 |---|---:|---|
 | `RingSize` | 1024 | SQ/CQ depth; power of two, maximum 32768. |
-| `BufferRingSize` | 1024 | Provided receive buffers per ring; power of two. |
+| `BufferRingSize` | 0 (auto) | Provided receive buffers per ring; power of two, or 0 to size from `MaxConnections` (1024-4096). Keep it at least the number of concurrent connections per ring, or receives fail with `ENOBUFS` and stall. |
 | `ReceiveBufferSize` | 2048 | Bytes per receive buffer. |
 | `MaxConnections` | 16384 | Aggregate simultaneous connection limit. |
 | `AcceptQueueCapacity` | 1024 | Accepted connections waiting for Kestrel. |

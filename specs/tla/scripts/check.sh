@@ -160,7 +160,7 @@ Listener_FixRetryPassParkCorrected.cfg|pass|focused liveness|pass|ReceiveRetryPa
 Listener_FixRetryPassParkExpectedViolation.cfg|violation|focused liveness|temporal|ReceiveRetryPassEventuallyArms|10
 Listener_FixStaleCancelSetOnCloseCorrected.cfg|pass|focused safety|pass|TypeOK, SlotPartition, ReleasedSlotsNoCancelRetryReference, NoStaleRetryCrossGeneration, GenerationSafeDispatch, FixedFileSafety, FdAccounting|10
 Listener_FixStaleCancelSetOnCloseExpectedViolation.cfg|violation|focused safety|invariant|ReleasedSlotsNoCancelRetryReference|5
-Listener_LifecycleFocused.cfg|pass|focused safety|pass|TypeOK, SlotPartition, FdAccounting, RingCloseAfterDisposeDrain|5000
+Listener_LifecycleFocused.cfg|pass|focused safety|pass|TypeOK, SlotPartition, FdAccounting, RingCloseAfterDisposeDrain, UnbindAloneKeepsLoopRunning|5000
 Listener_RecvFocused.cfg|pass|focused safety|pass|TypeOK, SlotPartition, FixedFileSafety, RecvTokenOrder, FdAccounting|200
 Listener_RecvResubmitFocused.cfg|pass|focused liveness|pass|EventuallyRecvResubmitDrainRearms|2
 Listener_SendFocused.cfg|pass|focused safety|pass|TypeOK, SlotPartition, SendTokenOrder, SendPinSafety, FdAccounting|5000
