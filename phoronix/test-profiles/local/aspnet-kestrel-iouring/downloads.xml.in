@@ -2,14 +2,11 @@
 <!--Phoronix Test Suite v10.8.4-->
 <!--Template: phoronix/make-bundle.sh fills @SRC_SHA256@ and @SRC_SIZE@ with the source bundle it just built. The
     source bundle has no URL on purpose: PTS then takes it from its download cache, so installing needs no
-    upload and no public copy of the source. Every other package is verified against the SHA256 below.-->
+    upload and no public copy of the source. Every other package is verified against the SHA256 below.
+    Keep the cache-only package LAST: `phoronix-test-suite validate-test-profile` rewrites this file by zipping
+    the per-field URL/MD5 lists by index, which misaligns every package after a URL-less one.-->
 <PhoronixTestSuite>
   <Downloads>
-    <Package>
-      <FileName>aspnet-kestrel-iouring-src.tar.gz</FileName>
-      <SHA256>@SRC_SHA256@</SHA256>
-      <FileSize>@SRC_SIZE@</FileSize>
-    </Package>
     <Package>
       <URL>https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.402/dotnet-sdk-10.0.402-linux-x64.tar.gz</URL>
       <MD5>48f3627f1bc2dd7de2df0a1cb4ac0ac6</MD5>
@@ -41,6 +38,11 @@
       <SHA256>9d6eace9544c59b910ea403a4693338efc12a6b0915fe227aed86c971b82d3dd</SHA256>
       <FileName>http-test-files-1.tar.xz</FileName>
       <FileSize>2346324</FileSize>
+    </Package>
+    <Package>
+      <SHA256>@SRC_SHA256@</SHA256>
+      <FileName>aspnet-kestrel-iouring-src.tar.gz</FileName>
+      <FileSize>@SRC_SIZE@</FileSize>
     </Package>
   </Downloads>
 </PhoronixTestSuite>
