@@ -953,14 +953,23 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     }
 
     /// <summary>
-    /// Ends the application-facing side of a connection whose ring was quarantined. The output pipe (whose
-    /// segments a send may still reference), the send pins and the receive buffer are deliberately left alone.
+    /// Ends the application-facing side of a connection whose ring was quarantined (the IO loop has stopped). The
+    /// output pipe (whose segments a send may still reference), the send pins and the receive buffer are left
+    /// alone. Finalization is signalled first and the input is completed on the thread pool: with inline scheduling,
+    /// completing it here would run application continuations on the disposing thread, and one waiting for this
+    /// connection's DisposeAsync would deadlock.
     /// </summary>
     internal void AbandonAfterFailedTeardown()
     {
-        try { _inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
-        SignalReceiveClosed();
         MarkFinalized();
+        ThreadPool.UnsafeQueueUserWorkItem(
+            static connection =>
+            {
+                try { connection._inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
+                connection.CancelConnectionClosed();
+            },
+            this,
+            preferLocal: false);
     }
 
     private sealed class DuplexPipe(PipeReader reader, PipeWriter writer) : IDuplexPipe

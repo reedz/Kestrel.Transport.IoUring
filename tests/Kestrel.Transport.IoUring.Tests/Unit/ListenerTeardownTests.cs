@@ -99,6 +99,47 @@ public class ListenerTeardownTests
     }
 
     [Fact]
+    public async Task Dispose_WhenTheLoopIsWedged_QuarantinesWithoutTouchingWhatTheLoopOwns()
+    {
+        if (!Ring.IsSupported) return;
+
+        using var wedge = new ManualResetEventSlim(false);
+        using var wedged = new ManualResetEventSlim(false);
+        int wedging = 0;
+        var (listener, ring) = CreateListener(() =>
+        {
+            if (Volatile.Read(ref wedging) == 1)
+            {
+                wedged.Set();
+                wedge.Wait();
+            }
+        });
+        listener.ShutdownStepTimeout = TimeSpan.FromMilliseconds(200);
+        listener.TeardownDrainTimeout = TimeSpan.FromMilliseconds(200);
+        using var client = new TcpClient();
+        try
+        {
+            await client.ConnectAsync((IPEndPoint)listener.EndPoint);
+            var connection = await listener.AcceptAsync();
+            connection.Should().NotBeNull();
+
+            Volatile.Write(ref wedging, 1);
+            await client.GetStream().WriteAsync(new byte[] { 1 }); // wakes the loop into the wedge
+            wedged.Wait(Limit).Should().BeTrue();
+
+            await listener.DisposeAsync().AsTask().WaitAsync(Limit);
+
+            IoUringQuarantine.Contains(listener).Should().BeTrue();
+            ring.IsDisposed.Should().BeFalse();
+            await connection!.DisposeAsync().AsTask().WaitAsync(Limit); // finalization was still signalled
+        }
+        finally
+        {
+            wedge.Set(); // let the loop run its own teardown
+        }
+    }
+
+    [Fact]
     public async Task Dispose_WhenARequestNeverEnds_QuarantinesInsteadOfReleasing()
     {
         if (!Ring.IsSupported) return;
@@ -152,6 +193,9 @@ public class ListenerTeardownTests
                 case 1:
                     held.Set();
                     hold.Wait();
+                    // Fail before this iteration dispatches the queued accepts normally.
+                    if (Volatile.Read(ref phase) == 2)
+                        throw new InvalidOperationException("injected io loop fault");
                     break;
                 case 2:
                     throw new InvalidOperationException("injected io loop fault");
@@ -179,6 +223,13 @@ public class ListenerTeardownTests
 
             listener.Teardown.Should().Be(IoUringConnectionListener.TeardownOutcome.Quiesced);
             ring.OutstandingOperations.Should().Be(0, "the accept request ended and every queued completion was consumed");
+
+            // Only the connection accepted before the loop was parked became a connection; the queued accepts were
+            // reclaimed by the drain, not dispatched.
+            int delivered = 0;
+            while (await listener.AcceptAsync().AsTask().WaitAsync(Limit) is not null)
+                delivered++;
+            delivered.Should().BeLessThanOrEqualTo(1);
         }
         finally
         {

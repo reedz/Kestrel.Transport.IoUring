@@ -120,8 +120,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     // Test seam: issue no cancel requests while draining, so a request the listener does not know about never ends.
     internal bool SuppressTeardownCancels { get; set; }
 
-    // Upper bound for each step of disposal that waits on another party (accept shutdown, connection drain).
-    private static readonly TimeSpan ShutdownStepTimeout = TimeSpan.FromSeconds(5);
+    // Upper bound for each step of disposal that waits on another party (accept shutdown, connection drain, the loop
+    // stopping). Settable for tests.
+    internal TimeSpan ShutdownStepTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     internal Task IoLoopStopped => _ioLoopStopped.Task;
 
@@ -1929,6 +1930,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             loopStopped = true;
         }
 
+        if (!loopStopped)
+        {
+            // The owner still runs: its collections, pipes and sockets are not ours to touch.
+            QuarantineWedgedLoop();
+            return;
+        }
+
         var connections = new HashSet<IoUringConnection>();
         foreach (var conn in _connectionSlots)
         {
@@ -1938,9 +1946,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         foreach (var conn in _closingConnections.Values)
             connections.Add(conn);
 
-        if (!loopStopped || Teardown != TeardownOutcome.Quiesced)
+        if (Teardown != TeardownOutcome.Quiesced)
         {
-            Quarantine(connections, loopStopped);
+            Quarantine(connections);
             return;
         }
 
@@ -2001,47 +2009,70 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     }
 
     /// <summary>
-    /// Disposal could not show that the kernel is done with this ring (<see cref="DrainKernelOperations"/> timed out,
-    /// a completion was lost, or the loop is wedged). Releases only what the kernel cannot be using and parks the
-    /// listener, and with it the ring, its mappings, the provided buffers and every connection's receive buffer and
-    /// send pins, in <see cref="IoUringQuarantine"/> for the rest of the process.
+    /// The IO loop did not stop in time: it still owns the ring, its collections, the connections' pipes and their
+    /// sockets, so none of them is touched here. Root everything for the rest of the process and only complete the
+    /// thread-safe finalization signals (their continuations run asynchronously) so Kestrel's connection disposal
+    /// cannot hang.
     /// </summary>
-    private void Quarantine(HashSet<IoUringConnection> connections, bool loopStopped)
+    private void QuarantineWedgedLoop()
     {
-        long outstanding = loopStopped ? _ring.OutstandingOperations : 0;
+        IoUringQuarantine.Add(this, 0, 0);
+        _logger.LogError(
+            "io_uring listener {EndPoint}: the IO loop did not stop; the listener, its ring and every buffer it may " +
+            "still use are quarantined for the rest of the process.",
+            EndPoint);
+
+        // Array element reads are safe while the owner runs; MarkFinalized only completes a task.
+        foreach (var conn in _connectionSlots)
+            conn?.MarkFinalized();
+
+        RunDisposeCleanupStep("send diagnostics timer dispose", () => _diagTimer?.Dispose());
+        RunDisposeCleanupStep("recv diagnostics timer dispose", () => _recvDiagTimer?.Dispose());
+        RunDisposeCleanupStep("accept retry timer dispose", _acceptRetryTimer.Dispose);
+        RunDisposeCleanupStep("recv retry timer dispose", _recvRetryTimer.Dispose);
+        RunDisposeCleanupStep("unregister retry timer dispose", _unregisterRetryTimer.Dispose);
+    }
+
+    /// <summary>
+    /// The loop has stopped but could not prove the ring idle (<see cref="DrainKernelOperations"/> timed out or a
+    /// completion was lost). Releases only what the kernel cannot be using and parks the listener, and with it the
+    /// ring, its mappings, the provided buffers and every connection's receive buffer and send pins, in
+    /// <see cref="IoUringQuarantine"/> for the rest of the process.
+    /// </summary>
+    private void Quarantine(HashSet<IoUringConnection> connections)
+    {
+        long outstanding = _ring.OutstandingOperations;
         IoUringQuarantine.Add(this, connections.Count, outstanding);
         _logger.LogError(
             "io_uring listener {EndPoint} could not prove its ring idle during shutdown ({Outstanding} request(s) " +
-            "outstanding, loop stopped: {LoopStopped}); the ring and the memory of {Connections} connection(s) are " +
-            "quarantined for the rest of the process.",
+            "outstanding); the ring and the memory of {Connections} connection(s) are quarantined for the rest of " +
+            "the process.",
             EndPoint,
             outstanding,
-            loopStopped,
             connections.Count);
 
-        if (loopStopped)
+        // Nothing else consumes the queue now: close sockets accepted by completions already posted.
+        RunDisposeCleanupStep("quarantine completion snapshot drain", () =>
         {
-            // Nothing else consumes the queue now: close sockets accepted by completions already posted.
-            RunDisposeCleanupStep("quarantine completion snapshot drain", () =>
-            {
-                var result = ListenerStoppedCompletionDrain.Drain(_ring);
-                if (result.Failure is not null)
-                    throw result.Failure;
-            });
-            // A kernel request holds its own reference to the socket, so closing our descriptor is memory-safe.
-            ListenerDisposeCleanup.RunIsolatedPerItem(
-                connections,
-                "connection close",
-                RunDisposeCleanupStep,
-                static conn => conn.CloseSocketFd());
-            ReleaseListenSocket(unregisterFixedFile: false);
-        }
+            var result = ListenerStoppedCompletionDrain.Drain(_ring);
+            if (result.Failure is not null)
+                throw result.Failure;
+        });
 
+        // Finalize first: closing a socket cancels ConnectionClosed, whose callbacks run inline.
         ListenerDisposeCleanup.RunIsolatedPerItem(
             connections,
             "connection abandon",
             RunDisposeCleanupStep,
             static conn => conn.AbandonAfterFailedTeardown());
+
+        // A kernel request holds its own reference to the socket, so closing our descriptor is memory-safe.
+        ListenerDisposeCleanup.RunIsolatedPerItem(
+            connections,
+            "connection close",
+            RunDisposeCleanupStep,
+            static conn => conn.CloseSocketFd());
+        ReleaseListenSocket(unregisterFixedFile: false);
 
         RunDisposeCleanupStep("send diagnostics timer dispose", () => _diagTimer?.Dispose());
         RunDisposeCleanupStep("recv diagnostics timer dispose", () => _recvDiagTimer?.Dispose());
