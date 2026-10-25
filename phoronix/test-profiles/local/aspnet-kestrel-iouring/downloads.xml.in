@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<!--Phoronix Test Suite v10.8.4-->
+<!--Template: phoronix/make-bundle.sh fills @SRC_SHA256@ and @SRC_SIZE@ with the source bundle it just built. The
+    source bundle has no URL on purpose: PTS then takes it from its download cache, so installing needs no
+    upload and no public copy of the source. Every other package is verified against the SHA256 below.-->
+<PhoronixTestSuite>
+  <Downloads>
+    <Package>
+      <FileName>aspnet-kestrel-iouring-src.tar.gz</FileName>
+      <SHA256>@SRC_SHA256@</SHA256>
+      <FileSize>@SRC_SIZE@</FileSize>
+    </Package>
+    <Package>
+      <URL>https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.402/dotnet-sdk-10.0.402-linux-x64.tar.gz</URL>
+      <MD5>48f3627f1bc2dd7de2df0a1cb4ac0ac6</MD5>
+      <SHA256>a131496fe7dac21dceea13354e50a3636126fac05d6e5ccf5fb250829c6e9b6a</SHA256>
+      <FileName>dotnet-sdk-10.0.402-linux-x64.tar.gz</FileName>
+      <FileSize>240279509</FileSize>
+      <PlatformSpecific>Linux</PlatformSpecific>
+      <ArchitectureSpecific>x86_64</ArchitectureSpecific>
+    </Package>
+    <Package>
+      <URL>https://builds.dotnet.microsoft.com/dotnet/Sdk/11.0.100-rc.2.26504.105/dotnet-sdk-11.0.100-rc.2.26504.105-linux-x64.tar.gz</URL>
+      <MD5>d9eaefcf22a7a4fa0633ee221c48a5e2</MD5>
+      <SHA256>a468acd553a4c5ee4cd15e49afd54c986f75aba8cbb64e55168aadce3c422a7e</SHA256>
+      <FileName>dotnet-sdk-11.0.100-rc.2.26504.105-linux-x64.tar.gz</FileName>
+      <FileSize>211123163</FileSize>
+      <PlatformSpecific>Linux</PlatformSpecific>
+      <ArchitectureSpecific>x86_64</ArchitectureSpecific>
+    </Package>
+    <Package>
+      <URL>https://github.com/wg/wrk/archive/refs/tags/4.2.0.tar.gz</URL>
+      <MD5>bd3ee6407b1aa8b66abfa6ee2c166849</MD5>
+      <SHA256>e255f696bff6e329f5d19091da6b06164b8d59d62cb9e673625bdcd27fe7bdad</SHA256>
+      <FileName>wrk-4.2.0.tar.gz</FileName>
+      <FileSize>10973405</FileSize>
+    </Package>
+    <Package>
+      <URL>http://www.phoronix-test-suite.com/benchmark-files/http-test-files-1.tar.xz</URL>
+      <MD5>b86f3e8f5bc9d0014818c5122a6f784d</MD5>
+      <SHA256>9d6eace9544c59b910ea403a4693338efc12a6b0915fe227aed86c971b82d3dd</SHA256>
+      <FileName>http-test-files-1.tar.xz</FileName>
+      <FileSize>2346324</FileSize>
+    </Package>
+  </Downloads>
+</PhoronixTestSuite>

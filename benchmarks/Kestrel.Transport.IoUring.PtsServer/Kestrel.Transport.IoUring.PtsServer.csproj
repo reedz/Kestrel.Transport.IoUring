@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <!-- Default net10.0; publish for another runtime with -p:PtsTargetFramework=net11.0 (needs that SDK). -->
+    <TargetFramework Condition="'$(PtsTargetFramework)' == ''">net10.0</TargetFramework>
+    <TargetFramework Condition="'$(PtsTargetFramework)' != ''">$(PtsTargetFramework)</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>PtsServer</AssemblyName>
+    <RootNamespace>Kestrel.Transport.IoUring.PtsServer</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsPackable>false</IsPackable>
+    <!-- Reproducible runtime knobs; override at run time with DOTNET_gcServer / DOTNET_TieredPGO. -->
+    <ServerGarbageCollector>true</ServerGarbageCollector>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Kestrel.Transport.IoUring/Kestrel.Transport.IoUring.csproj" />
+  </ItemGroup>
+</Project>
