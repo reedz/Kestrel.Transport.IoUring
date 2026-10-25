@@ -11,6 +11,8 @@ permissions:
 jobs:
   build-test-pack:
     runs-on: ubuntu-24.04
+    env:
+      TEST_REQUIRE_NATIVE_IOURING: 1
     strategy:
       fail-fast: false
       matrix:
@@ -55,6 +57,58 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
+
+      - run: >-
+          dotnet test
+          tests/Kestrel.Transport.IoUring.Tests/Kestrel.Transport.IoUring.Tests.csproj
+          --framework net10.0
+          --configuration Release
+          --verbosity minimal
+
+  # Single-shot receive (the path kernels 5.10-5.19 take) on this kernel: every listener and host the tests build
+  # runs without the provided-buffer ring (TestTransport). A guard test fails the lane if io_uring is not native.
+  single-shot-receive:
+    runs-on: ubuntu-24.04
+    env:
+      TEST_IOURING_SINGLESHOT: 1
+      TEST_REQUIRE_NATIVE_IOURING: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - run: >-
+          dotnet test
+          tests/Kestrel.Transport.IoUring.Tests/Kestrel.Transport.IoUring.Tests.csproj
+          --framework net10.0
+          --configuration Release
+          --verbosity minimal
+
+  # The library's net10.0 build on the .NET 11 runtime (what a net11.0 app consumes). The runner also has .NET 10,
+  # so Major roll-forward would stay on 10: LatestMajor (plus prerelease until 11 is GA) is required, and a guard
+  # test checks the runtime inside the test process.
+  dotnet11-runtime:
+    runs-on: ubuntu-24.04
+    env:
+      DOTNET_ROLL_FORWARD: LatestMajor
+      DOTNET_ROLL_FORWARD_TO_PRERELEASE: 1
+      EXPECT_DOTNET_MAJOR: 11
+      TEST_REQUIRE_NATIVE_IOURING: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 11.0.x
+          dotnet-quality: preview
 
       - run: >-
           dotnet test

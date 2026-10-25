@@ -39,7 +39,10 @@ public class RecvEofOrderingTests
                 true, Kestrel.Transport.IoUring.Native.IoUringKernelFeatures.CurrentKernel());
             if (!capable)
                 return;
-            listener.UsesBufferRing.Should().BeTrue("a kernel with multishot receive must use the provided-buffer ring");
+            // Exercised on both receive paths: the single-shot lane must not let the EOF overtake queued data either.
+            listener.UsesBufferRing.Should().Be(
+                !TestTransport.SingleShotLane,
+                "a kernel with multishot receive uses the provided-buffer ring unless the lane disables it");
 
             var failures = new List<string>();
             for (int round = 0; round < Totals.Length * 6; round++)

@@ -61,6 +61,7 @@ internal static class TestHost
         {
             options.RequireIoUring = Ring.IsSupported;
             configure?.Invoke(options);
+            TestTransport.ApplyLane(options);
         });
         builder.WebHost.ConfigureKestrel(o =>
         {

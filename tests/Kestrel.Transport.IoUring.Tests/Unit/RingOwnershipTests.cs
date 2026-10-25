@@ -40,14 +40,14 @@ public class RingOwnershipTests
         if (!SupportsSingleIssuer) return;
 
         var factory = new IoUringTransportFactory(
-            Options.Create(new IoUringTransportOptions
+            Options.Create(TestTransport.Apply(new IoUringTransportOptions
             {
                 RequireIoUring = true,
                 ThreadCount = threadCount,
                 EnableSingleIssuer = true,
                 EnableDeferTaskRun = deferTaskRun,
                 EnableRegisteredFiles = true,
-            }),
+            })),
             Options.Create(new SocketTransportOptions()),
             NullLoggerFactory.Instance);
 
@@ -78,7 +78,7 @@ public class RingOwnershipTests
     {
         if (!Ring.IsSupported) return;
 
-        var options = new IoUringTransportOptions { ThreadCount = 1, EnableRegisteredFiles = true };
+        var options = TestTransport.Apply(new IoUringTransportOptions { ThreadCount = 1, EnableRegisteredFiles = true });
         var ring = new Ring((uint)options.EffectiveRingSize);
         var listener = new IoUringConnectionListener(
             new IPEndPoint(IPAddress.Loopback, 0),

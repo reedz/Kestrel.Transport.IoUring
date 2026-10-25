@@ -21,7 +21,7 @@ public class TransportActivationTests
         Func<bool>? isSupported = null,
         Func<uint, uint, Ring>? createRing = null) =>
         new(
-            Options.Create(options),
+            Options.Create(TestTransport.Apply(options)),
             Options.Create(new SocketTransportOptions()),
             NullLoggerFactory.Instance,
             isSupported,

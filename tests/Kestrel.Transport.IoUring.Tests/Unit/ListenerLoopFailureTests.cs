@@ -18,7 +18,7 @@ public class ListenerLoopFailureTests
 
     internal static IoUringConnectionListener CreateListener(Action? loopHook = null)
     {
-        var options = new IoUringTransportOptions { ThreadCount = 1 };
+        var options = TestTransport.Apply(new IoUringTransportOptions { ThreadCount = 1 });
         var listener = new IoUringConnectionListener(
             new IPEndPoint(IPAddress.Loopback, 0),
             new Ring((uint)options.EffectiveRingSize),

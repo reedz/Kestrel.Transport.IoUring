@@ -48,7 +48,11 @@ public class GracefulShutdownTests
         // SocketTransport tolerates that; the io_uring listener must too.
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
-        builder.WebHost.UseIoUring(o => o.RequireIoUring = Ring.IsSupported);
+        builder.WebHost.UseIoUring(o =>
+        {
+            o.RequireIoUring = Ring.IsSupported;
+            TestTransport.ApplyLane(o);
+        });
         builder.WebHost.ConfigureKestrel(o => o.Listen(IPAddress.Loopback, 0));
         var app = builder.Build();
         app.MapGet("/", () => "ok");

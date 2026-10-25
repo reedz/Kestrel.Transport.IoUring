@@ -90,6 +90,12 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private const int UnregisterRetryWarnAttempts = 32;
     private long _acceptRetryNotBeforeTimestamp;
     private long _recvRetryNotBeforeTimestamp;
+    // Set by each retry timer when it fires. Timers run on the coarse monotonic clock and can fire a few
+    // milliseconds before the Stopwatch deadline the retry checks; a retry found not yet due after its timer fired
+    // re-arms the timer for the remainder (RearmIfFiredEarly), or an idle loop would park with nothing left to wake it.
+    private int _acceptRetryTimerFired;
+    private int _recvRetryTimerFired;
+    private int _unregisterRetryTimerFired;
     private int _acceptErrorBackoffMs;
     private int _recvErrorBackoffMs;
     // Consecutive ENOBUFS completions with no successful buffer receive in between.
@@ -204,17 +210,32 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         _sockOptHandle = _sockOptBuf.AsMemory().Pin();
         _sendRetryState = new(WakeIoLoop);
         _acceptRetryTimer = new Timer(
-            static state => ((IoUringConnectionListener)state!).WakeIoLoop(),
+            static state =>
+            {
+                var listener = (IoUringConnectionListener)state!;
+                Volatile.Write(ref listener._acceptRetryTimerFired, 1);
+                listener.WakeIoLoop();
+            },
             this,
             Timeout.Infinite,
             Timeout.Infinite);
         _recvRetryTimer = new Timer(
-            static state => ((IoUringConnectionListener)state!).WakeIoLoop(),
+            static state =>
+            {
+                var listener = (IoUringConnectionListener)state!;
+                Volatile.Write(ref listener._recvRetryTimerFired, 1);
+                listener.WakeIoLoop();
+            },
             this,
             Timeout.Infinite,
             Timeout.Infinite);
         _unregisterRetryTimer = new Timer(
-            static state => ((IoUringConnectionListener)state!).WakeIoLoop(),
+            static state =>
+            {
+                var listener = (IoUringConnectionListener)state!;
+                Volatile.Write(ref listener._unregisterRetryTimerFired, 1);
+                listener.WakeIoLoop();
+            },
             this,
             Timeout.Infinite,
             Timeout.Infinite);
@@ -1058,8 +1079,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     /// <summary>Retries RECV submissions that previously failed (SQ full, or the buffer pool ran dry).</summary>
     private void RetryFailedRecvs()
     {
-        if (Stopwatch.GetTimestamp() < Volatile.Read(ref _recvRetryNotBeforeTimestamp))
+        long now = Stopwatch.GetTimestamp();
+        long notBefore = Volatile.Read(ref _recvRetryNotBeforeTimestamp);
+        if (now < notBefore)
+        {
+            RearmIfFiredEarly(ref _recvRetryTimerFired, _recvRetryTimer, notBefore, now);
             return;
+        }
 
         // Re-arming more sockets than there are free provided buffers only produces another round of
         // ENOBUFS. All buffers are free right after the CQ drains, so half the ring bounds the number of
@@ -1092,21 +1118,36 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             ref _recvRetryNotBeforeTimestamp,
             Stopwatch.GetTimestamp() +
             (long)(_recvErrorBackoffMs * (double)Stopwatch.Frequency / 1000));
+        Volatile.Write(ref _recvRetryTimerFired, 0);
         _recvRetryTimer.Change(_recvErrorBackoffMs, Timeout.Infinite);
+    }
+
+    private static void RearmIfFiredEarly(ref int fired, Timer timer, long notBeforeTimestamp, long now)
+    {
+        if (Interlocked.Exchange(ref fired, 0) == 0)
+            return;
+
+        long remainingMs = (notBeforeTimestamp - now) * 1000 / Stopwatch.Frequency + 1;
+        timer.Change(remainingMs, Timeout.Infinite);
     }
 
     private void RetryControlOperations()
     {
         long now = Stopwatch.GetTimestamp();
+        long acceptNotBefore = Volatile.Read(ref _acceptRetryNotBeforeTimestamp);
         if (ListenerAcceptRetryState.IsDueNow(
             _acceptRetryRequired,
             _acceptInFlight,
             _stopping,
             _cts.IsCancellationRequested,
             now,
-            Volatile.Read(ref _acceptRetryNotBeforeTimestamp)))
+            acceptNotBefore))
         {
             SubmitAccept();
+        }
+        else if (_acceptRetryRequired && !_acceptInFlight && now < acceptNotBefore)
+        {
+            RearmIfFiredEarly(ref _acceptRetryTimerFired, _acceptRetryTimer, acceptNotBefore, now);
         }
         if (_eventFdReadState.RetryRequired && !_cts.IsCancellationRequested)
         {
@@ -1122,8 +1163,12 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             return;
 
         long now = Stopwatch.GetTimestamp();
-        if (now < Volatile.Read(ref _unregisterRetryNotBeforeTimestamp))
+        long notBefore = Volatile.Read(ref _unregisterRetryNotBeforeTimestamp);
+        if (now < notBefore)
+        {
+            RearmIfFiredEarly(ref _unregisterRetryTimerFired, _unregisterRetryTimer, notBefore, now);
             return;
+        }
 
         if (_ring.RetryFailedUnregisters() == 0)
         {
@@ -1145,6 +1190,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         Volatile.Write(
             ref _unregisterRetryNotBeforeTimestamp,
             now + (long)(delayMs * (double)Stopwatch.Frequency / 1000));
+        Volatile.Write(ref _unregisterRetryTimerFired, 0);
         _unregisterRetryTimer.Change(delayMs, Timeout.Infinite);
     }
 
@@ -1168,6 +1214,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             ref _acceptRetryNotBeforeTimestamp,
             Stopwatch.GetTimestamp() +
             (long)(_acceptErrorBackoffMs * (double)Stopwatch.Frequency / 1000));
+        Volatile.Write(ref _acceptRetryTimerFired, 0);
         _acceptRetryTimer.Change(_acceptErrorBackoffMs, Timeout.Infinite);
     }
 

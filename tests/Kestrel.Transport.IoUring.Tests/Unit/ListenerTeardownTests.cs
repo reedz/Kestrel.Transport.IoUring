@@ -27,7 +27,7 @@ public class ListenerTeardownTests
         Action? loopHook = null,
         ForeignEventFdRead? foreign = null)
     {
-        var options = new IoUringTransportOptions { ThreadCount = 1 };
+        var options = TestTransport.Apply(new IoUringTransportOptions { ThreadCount = 1 });
         var ring = new Ring((uint)options.EffectiveRingSize);
         foreign?.Attach(ring);
         var listener = new IoUringConnectionListener(

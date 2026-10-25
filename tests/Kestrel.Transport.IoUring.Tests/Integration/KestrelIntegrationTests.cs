@@ -32,7 +32,11 @@ public class KestrelIntegrationTests : IAsyncLifetime
         builder.Logging.ClearProviders();
         // Refuse a silent socket fallback: on a host that supports io_uring these tests must exercise it.
         // (IOURING_FORCE_FALLBACK=1 makes Ring.IsSupported false, so the socket-fallback CI lane still works.)
-        builder.WebHost.UseIoUring(o => o.RequireIoUring = Ring.IsSupported);
+        builder.WebHost.UseIoUring(o =>
+        {
+            o.RequireIoUring = Ring.IsSupported;
+            TestTransport.ApplyLane(o);
+        });
         builder.WebHost.ConfigureKestrel(o => o.Listen(IPAddress.Loopback, port));
 
         _app = builder.Build();
@@ -210,7 +214,7 @@ public class KestrelIntegrationTests : IAsyncLifetime
         string socketPath = Path.Combine(Path.GetTempPath(), $"iouring-{Guid.NewGuid():N}.sock");
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
-        builder.WebHost.UseIoUring();
+        builder.WebHost.UseIoUring(TestTransport.ApplyLane);
         builder.WebHost.ConfigureKestrel(options => options.ListenUnixSocket(socketPath));
 
         await using var app = builder.Build();
@@ -316,6 +320,7 @@ public class KestrelIntegrationTests : IAsyncLifetime
             options.ThreadCount = threadCount;
             options.MaxConnections = 32;
             options.RequireIoUring = Ring.IsSupported;
+            TestTransport.ApplyLane(options);
         });
         builder.WebHost.ConfigureKestrel(options =>
             options.Listen(IPAddress.Loopback, 0));
@@ -345,6 +350,7 @@ public class KestrelIntegrationTests : IAsyncLifetime
             options.MaxConnections = 1;
             options.AcceptQueueCapacity = 1;
             options.RequireIoUring = Ring.IsSupported;
+            TestTransport.ApplyLane(options);
         });
         builder.WebHost.ConfigureKestrel(options =>
             options.Listen(IPAddress.Loopback, 0));
