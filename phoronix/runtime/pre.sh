@@ -47,6 +47,9 @@ export PTS_TRANSPORT="$TRANSPORT" PTS_PORT="$PTS_PORT" PTS_WWWROOT="${PTS_HOME}/
 # stdio MUST be redirected: PTS captures this script's output through a pipe and would wait for it to close,
 # i.e. until the server exits, if the background server inherited it. setsid detaches it from PTS's process group.
 setsid "$DOTNET_DIR/dotnet" "$PUBLISH_DIR/PtsServer.dll" > "$PTS_SERVER_LOG" 2>&1 < /dev/null &
+# Recorded immediately so that fail() can stop a server that never becomes ready; overwritten below with the
+# pid the server itself reports.
+echo "$!" > "$PTS_SERVER_PID_FILE"
 
 for _ in $(seq 1 80); do
     grep -q "PTS_SERVER_READY" "$PTS_SERVER_LOG" 2>/dev/null && break
