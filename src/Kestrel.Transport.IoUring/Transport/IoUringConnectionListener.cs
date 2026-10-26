@@ -427,6 +427,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         if (!_loopActivated.Task.Wait(ShutdownStepTimeout))
             throw new InvalidOperationException("The io_uring loop did not start.");
         _loopActivated.Task.GetAwaiter().GetResult();
+        LoopActivatedInBindForTests?.Invoke();
 
         // Opt-in periodic diagnostic logging (Round-3, Opt G validation).
         // Read interval from option OR env var (env var allows debug without source changes
@@ -478,6 +479,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     internal int ActiveConnectionCountForTests => Volatile.Read(ref _activeConnectionCount);
 
     internal bool OwnsListenSocket => _ownsListenSocket;
+
+    // Test seam: runs in Bind once the IO loop has taken over the ring (a throw makes Bind fail at that point).
+    internal Action? LoopActivatedInBindForTests { get; set; }
 
     internal bool UsesMultishotAcceptForTests => _useMultishotAccept;
 

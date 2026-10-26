@@ -37,9 +37,9 @@ v2.4.0
 - SINGLE_ISSUER rings are enabled by their IO thread (no more endless EEXIST retries); a failed fixed-file unregister
   shuts the socket down and is retried.
 - MaxConnections is one limit shared by all rings; a full accept queue pauses accepting instead of aborting accepted
-  connections. Multi-ring listeners accept from one shared, exclusively bound socket by default (no other process
-  can join the port; single-shot accept per ring spreads the connections); EnableReusePort restores per-ring
-  SO_REUSEPORT sockets, whose explicit port is checked first.
+  connections; multi-ring listeners refuse an explicit port that is already bound. EnableReusePort=false (new; the
+  default stays per-ring SO_REUSEPORT sockets) makes the rings share one exclusively bound socket that no other
+  process can join, at the cost of slower acceptance of connection bursts.
 - SocketTransportOptions NoDelay, Backlog, MaxReadBufferSize and MaxWriteBufferSize are honoured.
 - ConnectionClosed/RequestAborted fire promptly on peer EOF/reset; recv EOF no longer overtakes data queued behind
   backpressure; slow uploads no longer abort at 1 MiB of queued receive data.

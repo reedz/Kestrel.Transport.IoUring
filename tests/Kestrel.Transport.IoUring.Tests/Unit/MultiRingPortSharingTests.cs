@@ -11,17 +11,18 @@ using Xunit;
 namespace Kestrel.Transport.IoUring.Tests.Unit;
 
 /// <summary>
-/// By default the rings of a multi-ring listener accept from one exclusively bound socket, so no other process can
-/// join the port (an SO_REUSEPORT group admits any process of the same user at any time). Each ring keeps one
-/// single-shot accept queued on it, which spreads connections over the rings; EnableReusePort restores per-ring
-/// SO_REUSEPORT sockets.
+/// By default (EnableReusePort) each ring of a multi-ring listener binds its own SO_REUSEPORT socket, which any
+/// process of the same user can join at any time. With EnableReusePort=false the rings accept from one exclusively
+/// bound socket, so no other process can join the port; each ring keeps one single-shot accept queued on it, which
+/// spreads connections over the rings.
 /// </summary>
+[Collection(Integration.ProcessWideResourcesCollection.Name)] // WorkerCreatedForTests is process-wide
 public class MultiRingPortSharingTests
 {
     private static readonly TimeSpan Limit = TimeSpan.FromSeconds(20);
 
     [Fact]
-    public async Task Default_RingsShareOneExclusiveSocket_SoNoOtherSocketCanJoinThePort()
+    public async Task Shared_RingsShareOneExclusiveSocket_SoNoOtherSocketCanJoinThePort()
     {
         if (!Ring.IsSupported) return;
 
@@ -49,7 +50,7 @@ public class MultiRingPortSharingTests
     }
 
     [Fact]
-    public async Task Default_SpreadsConnectionsOverTheRings()
+    public async Task Shared_SpreadsConnectionsOverTheRings()
     {
         if (!Ring.IsSupported) return;
 
@@ -78,9 +79,12 @@ public class MultiRingPortSharingTests
 
             int[] perRing = Workers(listener).Select(static w => w.ActiveConnectionCountForTests).ToArray();
             perRing.Sum().Should().Be(total);
+            // How evenly depends on scheduling (a ring whose thread runs less re-arms less often: 121/7 was seen on a
+            // loaded 2-CPU machine). What must hold is that no ring is starved, as a multishot accept on the shared
+            // socket starved the others (256/0): a queued accept reaches the head once a sibling requeues behind it.
             perRing.Should().OnlyContain(
-                count => count >= total / 8,
-                $"connections must be spread over the rings (got {string.Join("/", perRing)})");
+                count => count > 0,
+                $"every ring must get connections (got {string.Join("/", perRing)})");
         }
         finally
         {
@@ -93,7 +97,7 @@ public class MultiRingPortSharingTests
     }
 
     [Fact]
-    public async Task Default_UnbindStopsListening_AndDisposeFreesThePort()
+    public async Task Shared_UnbindStopsListening_AndDisposeFreesThePort()
     {
         if (!Ring.IsSupported) return;
 
@@ -114,7 +118,7 @@ public class MultiRingPortSharingTests
     }
 
     [Fact]
-    public async Task Default_ARingWhoseLoopDies_LeavesTheSharedSocketToItsSibling()
+    public async Task Shared_ARingWhoseLoopDies_LeavesTheSharedSocketToItsSibling()
     {
         if (!Ring.IsSupported) return;
 
@@ -150,7 +154,7 @@ public class MultiRingPortSharingTests
     }
 
     [Fact]
-    public async Task Default_DisposeWithAWedgedRing_DoesNotHang_AndStopsListening()
+    public async Task Shared_DisposeWithAWedgedRing_DoesNotHang_AndStopsListening()
     {
         if (!Ring.IsSupported) return;
 
@@ -189,7 +193,7 @@ public class MultiRingPortSharingTests
     }
 
     [Fact]
-    public async Task Default_WhenEveryRingDies_ThePortStopsListening()
+    public async Task Shared_WhenEveryRingDies_ThePortStopsListening()
     {
         if (!Ring.IsSupported) return;
 
@@ -221,15 +225,74 @@ public class MultiRingPortSharingTests
     }
 
     [Fact]
-    public async Task ReusePortOptIn_GivesEachRingItsOwnSocket_WhichOtherSocketsOfTheUserCanJoin()
+    public async Task Shared_BuildRollbackWithAWedgedRingWhoseBindFailed_DoesNotHang_AndStopsListening()
     {
         if (!Ring.IsSupported) return;
 
-        var listener = await BindAsync(reusePort: true);
+        using var wedge = new ManualResetEventSlim(false);
+        using var wedged = new ManualResetEventSlim(false);
+        IoUringConnectionListener? failedRing = null;
+        IPEndPoint? endPoint = null;
+        IoUringMultiListener.WorkerCreatedForTests = ring =>
+        {
+            if (Interlocked.CompareExchange(ref failedRing, ring, null) != null)
+                return;
+            ring.ShutdownStepTimeout = TimeSpan.FromMilliseconds(200);
+            ring.TeardownDrainTimeout = TimeSpan.FromMilliseconds(200);
+            int wedging = 0;
+            ring.IoLoopIterationHook = () =>
+            {
+                if (Volatile.Read(ref wedging) == 1)
+                {
+                    wedged.Set();
+                    wedge.Wait();
+                }
+            };
+            // Bind fails after the ring took its reference to the shared socket, with the loop wedged, so its
+            // disposal quarantines it with that reference still held.
+            ring.LoopActivatedInBindForTests = () =>
+            {
+                endPoint = (IPEndPoint)ring.EndPoint;
+                Volatile.Write(ref wedging, 1);
+                ring.WakeIoLoopForTests();
+                wedged.Wait(Limit).Should().BeTrue();
+                throw new InvalidOperationException("injected bind failure");
+            };
+        };
+        try
+        {
+            // Off the test thread: the rollback used to spin forever closing a socket the failed ring referenced.
+            Func<Task> bind = () => Task.Run(() => BindAsync(reusePort: false)).WaitAsync(Limit);
+            (await bind.Should().ThrowAsync<Exception>()).Which.Should().NotBeOfType<TimeoutException>();
+
+            failedRing!.HoldsListenSocketReference.Should().BeTrue();
+            IoUringQuarantine.Contains(failedRing).Should().BeTrue();
+            using var late = new TcpClient();
+            Func<Task> connect = () => late.ConnectAsync(endPoint!);
+            (await connect.Should().ThrowAsync<SocketException>())
+                .Which.SocketErrorCode.Should().Be(SocketError.ConnectionRefused, "a failed bind leaves nothing listening");
+        }
+        finally
+        {
+            IoUringMultiListener.WorkerCreatedForTests = null;
+            wedge.Set();
+        }
+    }
+
+    [Fact]
+    public async Task ReusePortDefault_GivesEachRingItsOwnSocket_WhichOtherSocketsOfTheUserCanJoin()
+    {
+        if (!Ring.IsSupported) return;
+
+        new IoUringTransportOptions().EnableReusePort.Should().BeTrue();
+        var listener = await BindAsync(reusePort: null);
         try
         {
             foreach (var worker in Workers(listener))
+            {
                 worker.OwnsListenSocket.Should().BeTrue();
+                worker.UsesMultishotAcceptForTests.Should().BeTrue();
+            }
 
             using var joiner = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             joiner.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
@@ -241,16 +304,18 @@ public class MultiRingPortSharingTests
         }
     }
 
-    private static async Task<IoUringMultiListener> BindAsync(bool reusePort, int maxConnections = 64)
+    private static async Task<IoUringMultiListener> BindAsync(bool? reusePort, int maxConnections = 64)
     {
+        var options = new IoUringTransportOptions
+        {
+            RequireIoUring = true,
+            ThreadCount = 2,
+            MaxConnections = maxConnections,
+        };
+        if (reusePort is { } value)
+            options.EnableReusePort = value;
         var factory = new IoUringTransportFactory(
-            Options.Create(TestTransport.Apply(new IoUringTransportOptions
-            {
-                RequireIoUring = true,
-                ThreadCount = 2,
-                MaxConnections = maxConnections,
-                EnableReusePort = reusePort,
-            })),
+            Options.Create(TestTransport.Apply(options)),
             Options.Create(new SocketTransportOptions()),
             NullLoggerFactory.Instance);
         return (IoUringMultiListener)await factory.BindAsync(new IPEndPoint(IPAddress.Loopback, 0));

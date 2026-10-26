@@ -140,13 +140,14 @@ public sealed class IoUringTransportOptions
 
     /// <summary>
     /// How the rings of a multi-ring listener (<see cref="ThreadCount"/> &gt; 1) share the port. When
-    /// <see langword="false"/> (the default), one listening socket is bound exclusively, like Kestrel's socket
-    /// transport, and every ring accepts from it; nothing else can bind the port. When <see langword="true"/>, each
-    /// ring binds its own <c>SO_REUSEPORT</c> socket and the kernel spreads new connections across them by hash;
-    /// Linux then also lets any process running as the same user join the group later and receive a share of the
-    /// connections. Ignored with a single ring, whose socket is always exclusive.
+    /// <see langword="true"/> (the default), each ring binds its own <c>SO_REUSEPORT</c> socket with a multishot
+    /// accept and the kernel spreads new connections across them by hash; Linux then also lets any process running
+    /// as the same user join the group later and receive a share of the connections. When <see langword="false"/>,
+    /// one listening socket is bound exclusively, like Kestrel's socket transport, and every ring accepts from it
+    /// with single-shot accepts: nothing else can bind the port, but bursts of new connections are accepted more
+    /// slowly (see docs/KNOWN-ISSUES.md). Ignored with a single ring, whose socket is always exclusive.
     /// </summary>
-    public bool EnableReusePort { get; set; }
+    public bool EnableReusePort { get; set; } = true;
 
     /// <summary>
     /// When <see langword="true"/>, binding an IP endpoint throws <see cref="NotSupportedException"/> instead of

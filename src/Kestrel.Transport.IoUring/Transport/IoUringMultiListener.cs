@@ -13,9 +13,9 @@ namespace Kestrel.Transport.IoUring.Transport;
 /// <summary>
 /// Multiplexed connection listener that distributes connections across multiple
 /// <see cref="IoUringConnectionListener"/> workers, each with its own io_uring ring
-/// and IO loop thread. By default every worker accepts from one exclusively bound socket this listener owns; with
-/// <see cref="IoUringTransportOptions.EnableReusePort"/> each worker binds its own SO_REUSEPORT socket and the kernel
-/// distributes connections across them.
+/// and IO loop thread. By default (<see cref="IoUringTransportOptions.EnableReusePort"/>) each worker binds its own
+/// SO_REUSEPORT socket and the kernel distributes connections across them; otherwise every worker accepts from one
+/// exclusively bound socket this listener owns.
 /// </summary>
 internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListenerInfo
 {
@@ -156,6 +156,10 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         var admission = new ConnectionAdmission(options.MaxConnections);
         bool reusePort = options.EnableReusePort;
         Socket? sharedSocket = null;
+        // Every ring constructed with the shared socket, including one whose Bind fails: any of them may still hold
+        // a reference to the socket's handle after its disposal (quarantined), which decides whether rollback may
+        // close the socket.
+        var borrowers = new List<IoUringConnectionListener>(threadCount);
         if (reusePort)
         {
             EnsurePortIsFree(endPoint);
@@ -202,6 +206,9 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
                         logger,
                         admission,
                         sharedSocket);
+                    if (sharedSocket is not null)
+                        borrowers.Add(worker);
+                    WorkerCreatedForTests?.Invoke(worker);
                     worker.Bind(options.ListenBacklog, reusePort);
                     if (i == 0)
                         publishedEndPoint = worker.EndPoint;
@@ -222,17 +229,20 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         {
             for (int i = createdWorkers - 1; i >= 0; i--)
                 workers[i].DisposeAsync().AsTask().GetAwaiter().GetResult();
-            ReleaseSharedListenSocket(sharedSocket, workers.Take(createdWorkers));
+            ReleaseSharedListenSocket(sharedSocket, borrowers);
             throw;
         }
 
         return new WorkerSet(publishedEndPoint, workers, sharedSocket);
     }
 
+    // Test seam: configures each ring after construction and before Bind. Set only from tests that run alone.
+    internal static Action<IoUringConnectionListener>? WorkerCreatedForTests { get; set; }
+
     /// <summary>
-    /// With <see cref="IoUringTransportOptions.EnableReusePort"/> the rings share the port through SO_REUSEPORT,
-    /// which would also let another process (a second instance of the application) bind it without error and
-    /// silently split the traffic. Binding an exclusive socket first fails with Kestrel's
+    /// With <see cref="IoUringTransportOptions.EnableReusePort"/> (the default) the rings share the port through
+    /// SO_REUSEPORT, which would also let another process (a second instance of the application) bind it without
+    /// error and silently split the traffic. Binding an exclusive socket first fails with Kestrel's
     /// <see cref="AddressInUseException"/>, as SocketTransport does. It does not reserve the port: Linux lets any
     /// process with the same effective user ID join the SO_REUSEPORT group later (see docs/KNOWN-ISSUES.md). An
     /// ephemeral port (0) needs no probe because nobody else can be bound to the one the kernel picks.

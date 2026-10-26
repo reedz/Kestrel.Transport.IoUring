@@ -19,20 +19,26 @@ probe showed it; otherwise it was established by independent source reviews.
 
 ## Multi-ring (`ThreadCount > 1`)
 
-* **`EnableReusePort` admits same-user processes.** With the opt-in per-ring `SO_REUSEPORT` sockets, Linux lets any
-  socket of a process with the same effective user ID join the group at any time, not only at startup (see
-  `socket(7)`): such a process then receives a share of the new connections (for example the plaintext HTTP
-  requests). nginx's `reuseport` and other `SO_REUSEPORT` servers have the same property. The exclusive bind that
-  checks an explicit port first only turns an instance that is already running into Kestrel's "address already in
-  use" error; it cannot keep a later joiner out. The default (one shared, exclusively bound socket) has no such
-  window. Ephemeral ports (0) are not checked.
-* **Shared-socket accept is single-shot.** Accept requests wait on the shared socket exclusively and the kernel gives
-  each new connection to the first one queued; a multishot accept stays first and took every connection (256 of 256
-  over two rings, measured), so the default multi-ring listener uses one single-shot accept per ring, which requeues
-  behind its siblings (117-139 of 256 per ring in the same test; `SO_REUSEPORT` hashing: 112-144). That is one accept
-  submission per connection instead of one per ring; a connection-churn test on this VM showed no loss
-  (6-14k accepts per second either way). The spread depends on which ring has an accept queued when a client
-  arrives, so a ring that is busy longer takes fewer new connections; it is not a hash.
+* **Multi-ring `SO_REUSEPORT` admits same-user processes.** With the default per-ring `SO_REUSEPORT` sockets
+  (`EnableReusePort=true`), Linux lets any socket of a process with the same effective user ID join the group at any
+  time, not only at startup (see `socket(7)`): such a process then receives a share of the new connections (for
+  example the plaintext HTTP requests). nginx's `reuseport` and other `SO_REUSEPORT` servers have the same property.
+  The exclusive bind that checks an explicit port first only turns an instance that is already running into
+  Kestrel's "address already in use" error; it cannot keep a later joiner out. Where untrusted code runs as the
+  service's user, use one ring, or `EnableReusePort=false` (next item). Ephemeral ports (0) are not checked.
+* **`EnableReusePort=false` absorbs connection bursts slowly.** The rings then share one exclusively bound socket.
+  Accept requests wait on it exclusively and the kernel gives each new connection to the first one queued; a
+  multishot accept stays first and took every connection (256 of 256 over two rings, measured), so each ring uses
+  one single-shot accept, which requeues behind its siblings (117-139 of 256 per ring on an idle machine;
+  `SO_REUSEPORT` hashing: 112-144). Unlike a hash, the spread follows scheduling: a ring whose thread runs less
+  re-arms less often (121 of 128 went to one ring once on the loaded test machine). And a single-shot accept takes
+  one connection per pass of the ring's loop, where a multishot accept empties the listen queue at once. With 4,000
+  clients connecting at once on two rings (this VM, 20-90 s plaintext runs, default backlog 512), 6 of 8
+  shared-socket runs (one through the Phoronix profile) had requests waiting over 2 s (wrk timeouts, 2 to 1,148 per
+  run; maximum latency 0.6-2.0 s) and the listen queue overflowed (up to 5,654 drops per run, resent SYNs); 5
+  `SO_REUSEPORT` runs had no errors, no overflows and a 0.22-0.31 s maximum. A backlog of 4,096 removed the
+  overflows but not the timeouts (1,247 in one of two runs). Throughput was the same. Handing accepted connections
+  from the ring that accepts them to its siblings would remove the limit; it is not implemented.
 * **Per-ring tables hold the whole limit.** Connection admission is shared, so each ring's slot table (about 20 bytes
   per slot) and, with `EnableRegisteredFiles`, its fixed-file table are sized for the full `MaxConnections`. A
   fixed-file table larger than `RLIMIT_NOFILE` cannot be registered and the ring silently runs without registered

@@ -16,8 +16,8 @@ A Linux `io_uring` transport for ASP.NET Core Kestrel. It is registered as an
   the same design on .NET 8/9.
 - Optional registered file descriptors (`EnableRegisteredFiles`).
 - Generation-tagged connection slots that reject stale completions.
-- One IO-loop thread per ring and optional multi-ring listeners (one shared, exclusively bound socket by default,
-  or per-ring `SO_REUSEPORT` sockets).
+- One IO-loop thread per ring and optional multi-ring listeners (per-ring `SO_REUSEPORT` sockets by default, or one
+  shared, exclusively bound socket).
 - Socket fallback for unsupported hosts, setup failures, and non-IP endpoints.
 - Targets .NET 8, .NET 9, and .NET 10.
 
@@ -67,9 +67,9 @@ use `services.AddIoUringTransport(...)`.
 | `ReceiveBufferSize` | 2048 | Bytes per receive buffer. |
 | `MaxConnections` | 16384 | Simultaneous connection limit for the listener, shared by all of its rings (one admission count, so an uneven spread of connections cannot make one ring refuse connections while another has room). |
 | `AcceptQueueCapacity` | 1024 | Accepted connections waiting for Kestrel. When it is full the transport pauses accepting (clients wait in the listen backlog) instead of aborting connections. |
-| `ThreadCount` | 1 | Rings/listener threads. With more than 1, the rings accept from one exclusively bound socket (a second instance fails with Kestrel's "address already in use", and no other process can join the port); each ring keeps one single-shot accept queued on it, which spreads new connections over the rings. |
-| `EnableReusePort` | `false` | With `ThreadCount` > 1: give each ring its own `SO_REUSEPORT` socket instead, and let the kernel spread connections by hash (multishot accept per ring). An explicit port is first checked with an exclusive bind, but any process running as the same user can join the `SO_REUSEPORT` group later and receive connections, so use it only where no untrusted code shares the service's user (see `docs/KNOWN-ISSUES.md`). |
-| `EnableMultishotAccept` | `true` | Multishot accept with kernel fallback. Not used by the rings of a default multi-ring listener (see `ThreadCount`). |
+| `ThreadCount` | 1 | Rings/listener threads. With more than 1, each ring binds its own `SO_REUSEPORT` socket by default (see `EnableReusePort`); an explicit port is first checked with an exclusive bind, so a second instance fails with Kestrel's "address already in use" like the default single-ring listener. |
+| `EnableReusePort` | `true` | With `ThreadCount` > 1: per-ring `SO_REUSEPORT` sockets, the kernel spreading connections by hash (multishot accept per ring). Any process running as the same user can join an `SO_REUSEPORT` group later and receive connections. `false` makes the rings accept from one exclusively bound socket that nothing else can join, with one single-shot accept per ring, which absorbs bursts of new connections much more slowly (see `docs/KNOWN-ISSUES.md`). |
+| `EnableMultishotAccept` | `true` | Multishot accept with kernel fallback. Not used by the rings of a multi-ring listener with `EnableReusePort=false`. |
 | `EnableBufferRing` | `true` | Provided-buffer multishot receive. |
 | `EnableRegisteredFiles` | `false` | Fixed-file table; adds synchronous updates on connection churn. |
 | `UnsafeInlineScheduling` | `true` | Runs Kestrel processing on the IO thread; disable for blocking middleware. |
