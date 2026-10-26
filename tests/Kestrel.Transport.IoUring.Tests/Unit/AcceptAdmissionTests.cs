@@ -91,10 +91,14 @@ public class AcceptAdmissionTests
         var clients = new List<TcpClient>();
         try
         {
-            // Nobody calls AcceptAsync while they connect: the channel (capacity 1) fills immediately.
+            // Nobody calls AcceptAsync while they connect: the channel (capacity 1) fills immediately. Completed
+            // handshakes do not mean the IO loop has dispatched the accepts yet, so wait for the pause (bounded).
             for (int i = 0; i < 6; i++)
                 clients.Add(await ConnectAsync(listener));
-            await Task.Delay(200);
+            var deadline = DateTime.UtcNow + Limit;
+            while (Interlocked.Read(ref IoUringConnectionListener.s_acceptPauses) <= pausesBefore &&
+                   DateTime.UtcNow < deadline)
+                await Task.Delay(20);
             Interlocked.Read(ref IoUringConnectionListener.s_acceptPauses).Should().BeGreaterThan(pausesBefore);
 
             for (int i = 0; i < 6; i++)

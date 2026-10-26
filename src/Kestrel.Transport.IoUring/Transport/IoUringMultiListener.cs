@@ -71,18 +71,28 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
     }
 
     private IoUringMultiListener(WorkerSet workerSet, int mergedCapacity)
-        : this(workerSet.EndPoint, mergedCapacity, workerSet.Workers)
+        : this(workerSet.EndPoint, mergedCapacity, workerSet.Workers, workerSet.SharedListenSocket)
     {
-        _sharedListenSocket = workerSet.SharedListenSocket;
     }
 
     internal IoUringMultiListener(
         EndPoint endPoint,
         int mergedCapacity,
         params IMultiListenerWorker[] workers)
+        : this(endPoint, mergedCapacity, workers, sharedListenSocket: null)
+    {
+    }
+
+    private IoUringMultiListener(
+        EndPoint endPoint,
+        int mergedCapacity,
+        IMultiListenerWorker[] workers,
+        Socket? sharedListenSocket)
     {
         EndPoint = workers.Length == 0 ? endPoint : workers[0].EndPoint;
         _workers = workers;
+        // Before the forwarders start: the last one to end may have to stop the socket listening.
+        _sharedListenSocket = sharedListenSocket;
         _mergedChannel = CreateMergedChannel(mergedCapacity);
         _forwardTasks = new Task[workers.Length];
         _activeForwarders = workers.Length;
@@ -212,7 +222,7 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         {
             for (int i = createdWorkers - 1; i >= 0; i--)
                 workers[i].DisposeAsync().AsTask().GetAwaiter().GetResult();
-            sharedSocket?.Dispose();
+            ReleaseSharedListenSocket(sharedSocket, workers.Take(createdWorkers));
             throw;
         }
 
@@ -287,7 +297,14 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         finally
         {
             if (Interlocked.Decrement(ref _activeForwarders) == 0)
+            {
                 CompleteMergedWriter();
+                // Every ring stopped accepting on its own (their loops failed): nobody will accept from the shared
+                // socket any more, so new clients must be refused rather than queue up. (Unbind stops it itself,
+                // once the rings have cancelled their accepts.)
+                if (Volatile.Read(ref _acceptsClosedToApp) == 0)
+                    StopSharedListening(_sharedListenSocket);
+            }
             ThrowCapturedFailures(failures);
         }
     }
@@ -408,16 +425,32 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         }
 
         // Every ring has stopped accepting from the shared socket: stop listening, so new clients are refused.
-        StopSharedListening();
+        StopSharedListening(_sharedListenSocket);
 
         ThrowCapturedFailures(failures);
     }
 
-    private void StopSharedListening()
+    private static void StopSharedListening(Socket? socket)
     {
-        try { _sharedListenSocket?.Shutdown(SocketShutdown.Both); }
+        try { socket?.Shutdown(SocketShutdown.Both); }
         catch (SocketException) { }
         catch (ObjectDisposedException) { }
+    }
+
+    /// <summary>
+    /// Stops the shared socket listening and closes it, unless a ring still holds its reference to the handle: a
+    /// ring whose loop is wedged is quarantined with the socket (it may still use the descriptor), and closing a
+    /// socket whose handle is still referenced waits for that reference (SafeSocketHandle.CloseAsIs spins until
+    /// it is released), which would hang disposal. Such a socket stays reachable through the quarantined ring.
+    /// </summary>
+    private static void ReleaseSharedListenSocket(Socket? socket, IEnumerable<IMultiListenerWorker> workers)
+    {
+        if (socket is null)
+            return;
+
+        StopSharedListening(socket);
+        if (!workers.Any(static worker => worker is IoUringConnectionListener { HoldsListenSocketReference: true }))
+            socket.Dispose();
     }
 
     private async Task DisposeCoreAsync()
@@ -456,10 +489,8 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
             CaptureFailure(ref failures, allTask.Exception ?? ex);
         }
 
-        // Also when an unbind never finished (a wedged ring): the port must stop listening. A ring that still holds
-        // the socket (quarantined) keeps its own reference; closing ours is safe.
-        StopSharedListening();
-        _sharedListenSocket?.Dispose();
+        // Also when an unbind never finished (a wedged ring): the port must stop listening.
+        ReleaseSharedListenSocket(_sharedListenSocket, _workers);
 
         CompleteMergedWriter();
 

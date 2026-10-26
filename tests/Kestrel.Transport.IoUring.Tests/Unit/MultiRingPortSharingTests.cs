@@ -150,6 +150,77 @@ public class MultiRingPortSharingTests
     }
 
     [Fact]
+    public async Task Default_DisposeWithAWedgedRing_DoesNotHang_AndStopsListening()
+    {
+        if (!Ring.IsSupported) return;
+
+        var listener = await BindAsync(reusePort: false);
+        listener.ShutdownStepTimeout = TimeSpan.FromMilliseconds(200);
+        var endPoint = (IPEndPoint)listener.EndPoint;
+        var wedgedRing = Workers(listener)[0];
+        wedgedRing.ShutdownStepTimeout = TimeSpan.FromMilliseconds(200);
+        wedgedRing.TeardownDrainTimeout = TimeSpan.FromMilliseconds(200);
+        using var wedge = new ManualResetEventSlim(false);
+        using var wedged = new ManualResetEventSlim(false);
+        wedgedRing.IoLoopIterationHook = () =>
+        {
+            wedged.Set();
+            wedge.Wait();
+        };
+        try
+        {
+            wedgedRing.WakeIoLoopForTests();
+            wedged.Wait(Limit).Should().BeTrue();
+
+            // Closing the shared socket would wait for the wedged ring's handle reference forever.
+            await listener.DisposeAsync().AsTask().WaitAsync(Limit);
+
+            IoUringQuarantine.Contains(wedgedRing).Should().BeTrue();
+            wedgedRing.HoldsListenSocketReference.Should().BeTrue();
+            using var late = new TcpClient();
+            Func<Task> connect = () => late.ConnectAsync(endPoint);
+            (await connect.Should().ThrowAsync<SocketException>())
+                .Which.SocketErrorCode.Should().Be(SocketError.ConnectionRefused);
+        }
+        finally
+        {
+            wedge.Set();
+        }
+    }
+
+    [Fact]
+    public async Task Default_WhenEveryRingDies_ThePortStopsListening()
+    {
+        if (!Ring.IsSupported) return;
+
+        var listener = await BindAsync(reusePort: false);
+        var endPoint = (IPEndPoint)listener.EndPoint;
+        try
+        {
+            foreach (var ring in Workers(listener))
+            {
+                ring.IoLoopIterationHook = static () => throw new InvalidOperationException("injected loop failure");
+                ring.WakeIoLoopForTests();
+            }
+            foreach (var ring in Workers(listener))
+                await ring.IoLoopStopped.WaitAsync(Limit);
+            (await listener.AcceptAsync().AsTask().WaitAsync(Limit)).Should().BeNull();
+
+            using var late = new TcpClient();
+            Func<Task> connect = () => late.ConnectAsync(endPoint);
+            (await connect.Should().ThrowAsync<SocketException>())
+                .Which.SocketErrorCode.Should().Be(
+                    SocketError.ConnectionRefused,
+                    "no ring accepts any more, so clients must not queue up on the socket");
+        }
+        finally
+        {
+            try { await listener.DisposeAsync().AsTask().WaitAsync(Limit); }
+            catch (Exception ex) when (ex is not TimeoutException) { }
+        }
+    }
+
+    [Fact]
     public async Task ReusePortOptIn_GivesEachRingItsOwnSocket_WhichOtherSocketsOfTheUserCanJoin()
     {
         if (!Ring.IsSupported) return;

@@ -81,6 +81,14 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private readonly TaskCompletionSource _connectionsDrained = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _listenSocketFd;
     private bool _listenSocketFdRefAdded;
+    private int _listenSocketReferenceReleased;
+
+    /// <summary>
+    /// True while this ring still holds its reference to the listening socket's handle (a wedged, quarantined ring
+    /// never drops it). The lender of a shared socket must not close it then: closing waits for the reference.
+    /// </summary>
+    internal bool HoldsListenSocketReference =>
+        _listenSocketFdRefAdded && Volatile.Read(ref _listenSocketReferenceReleased) == 0;
     private uint _lastOverflowCount;
     private bool _acceptMultishotActive;
     private bool _useMultishotAccept;
@@ -1122,7 +1130,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         RunDisposeCleanupStep("listen socket handle release", () =>
         {
             if (_listenSocketFdRefAdded)
+            {
                 _listenSocket.SafeHandle.DangerousRelease();
+                Volatile.Write(ref _listenSocketReferenceReleased, 1);
+            }
         });
         // A lent socket is shut down and closed by its owner once every ring has stopped accepting.
         if (_ownsListenSocket)
