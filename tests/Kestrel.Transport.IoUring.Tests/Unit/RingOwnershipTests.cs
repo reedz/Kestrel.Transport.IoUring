@@ -114,6 +114,46 @@ public class RingOwnershipTests
         }
     }
 
+    [Fact]
+    public async Task Unbind_WhenTheListenSocketsFixedFileCannotBeUnregistered_StillStopsListening()
+    {
+        if (!Ring.IsSupported) return;
+
+        var options = TestTransport.Apply(new IoUringTransportOptions
+        {
+            ThreadCount = 1,
+            EnableRegisteredFiles = true,
+            MaxConnections = 64,
+        });
+        var ring = new Ring((uint)options.EffectiveRingSize);
+        var listener = new IoUringConnectionListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            ring,
+            options,
+            NullLogger<IoUringConnectionListener>.Instance);
+        listener.Bind(options.ListenBacklog);
+        var endPoint = (IPEndPoint)listener.EndPoint;
+        int failing = 1;
+        ring.UnregisterFailureInjector = () => Volatile.Read(ref failing) != 0;
+        try
+        {
+            await listener.UnbindAsync().AsTask().WaitAsync(Limit);
+
+            ring.FailedUnregisterCount.Should().Be(1, "the ring's file table still references the listen socket");
+            using var client = new TcpClient();
+            Func<Task> connect = () => client.ConnectAsync(endPoint);
+            (await connect.Should().ThrowAsync<SocketException>())
+                .Which.SocketErrorCode.Should().Be(
+                    SocketError.ConnectionRefused,
+                    "after unbind nobody accepts, so the kernel must not keep listening for us");
+        }
+        finally
+        {
+            Volatile.Write(ref failing, 0);
+            await listener.DisposeAsync().AsTask().WaitAsync(Limit);
+        }
+    }
+
     private static async Task RoundTripAsync(IConnectionListener listener)
     {
         using var client = new TcpClient();

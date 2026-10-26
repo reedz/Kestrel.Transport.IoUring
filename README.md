@@ -66,7 +66,7 @@ use `services.AddIoUringTransport(...)`.
 | `ReceiveBufferSize` | 2048 | Bytes per receive buffer. |
 | `MaxConnections` | 16384 | Simultaneous connection limit for the listener, shared by all of its rings (one admission count, so the kernel's `SO_REUSEPORT` hashing cannot make one ring refuse connections while another has room). |
 | `AcceptQueueCapacity` | 1024 | Accepted connections waiting for Kestrel. When it is full the transport pauses accepting (clients wait in the listen backlog) instead of aborting connections. |
-| `ThreadCount` | 1 | Rings/listener threads. More than 1 binds one `SO_REUSEPORT` socket per ring; an explicit port is first checked with an exclusive bind, so a second instance fails with Kestrel's "address already in use" like the default single-ring listener (a process binding in the instant between that check and the rings can still share the port). |
+| `ThreadCount` | 1 | Rings/listener threads. More than 1 binds one `SO_REUSEPORT` socket per ring; an explicit port is first checked with an exclusive bind, so a second instance fails with Kestrel's "address already in use" like the default single-ring listener. Any process running as the same user can still join the `SO_REUSEPORT` group later and receive connections, so keep the default where untrusted code shares the service's user (see `docs/KNOWN-ISSUES.md`). |
 | `EnableMultishotAccept` | `true` | Multishot accept with kernel fallback. |
 | `EnableBufferRing` | `true` | Provided-buffer multishot receive. |
 | `EnableRegisteredFiles` | `false` | Fixed-file table; adds synchronous updates on connection churn. |
@@ -93,7 +93,8 @@ output pipe limits; `null` means unlimited). Configure them with
 owner thread cancels every outstanding request and consumes completions until each request has ended, and only
 then is memory released (closing the ring alone does not stop the kernel from using it). If that cannot be shown
 within 5 seconds, the listener and its memory are kept for the rest of the process instead (logged as an error)
-rather than risk the kernel writing into released memory.
+rather than risk the kernel writing into released memory; its port stops listening either way. Every wait during
+disposal is bounded, also with several rings, so a stuck ring cannot hang host shutdown.
 
 ### Verifying which transport is active
 

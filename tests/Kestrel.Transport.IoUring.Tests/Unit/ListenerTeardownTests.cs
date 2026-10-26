@@ -135,6 +135,14 @@ public class ListenerTeardownTests
             ring.IsDisposed.Should().BeFalse();
             ((PinnedBlockMemoryPool)listener.MemoryPoolForTests).IsDisposed.Should().BeFalse(
                 "the wedged loop's connections may still use pipe memory");
+            using (var late = new TcpClient())
+            {
+                Func<Task> connect = () => late.ConnectAsync((IPEndPoint)listener.EndPoint);
+                (await connect.Should().ThrowAsync<SocketException>())
+                    .Which.SocketErrorCode.Should().Be(
+                        SocketError.ConnectionRefused,
+                        "a listener nobody can serve stops listening instead of letting the kernel accept for it");
+            }
             await connection!.DisposeAsync().AsTask().WaitAsync(Limit); // finalization was still signalled
         }
         finally

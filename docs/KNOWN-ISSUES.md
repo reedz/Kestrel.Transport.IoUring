@@ -19,9 +19,14 @@ probe showed it; otherwise it was established by independent source reviews.
 
 ## Multi-ring (`ThreadCount > 1`)
 
-* **Port check window.** An explicit port is checked with an exclusive bind before the rings bind it with
-  `SO_REUSEPORT`; a process that binds the port with `SO_REUSEPORT` in the instant between the two can still share
-  it. Ephemeral ports (0) are not checked (nobody else can hold the port the kernel picks).
+* **Port sharing with same-user processes.** The rings share the port through an `SO_REUSEPORT` group, and Linux lets
+  any socket of a process with the same effective user ID join that group at any time, not only at startup (see
+  `socket(7)`): such a process then receives a share of the new connections (for example the plaintext HTTP
+  requests). nginx's `reuseport` and other `SO_REUSEPORT` servers have the same property. The exclusive bind that
+  checks an explicit port first only turns an instance that is already running into Kestrel's "address already in
+  use" error; it cannot keep a later joiner out. Do not use `ThreadCount > 1` where untrusted code runs as the
+  service's user; the default single ring binds an ordinary socket that nothing else can share. Ephemeral ports (0)
+  are not checked.
 * **Per-ring tables hold the whole limit.** Connection admission is shared, so each ring's slot table (about 20 bytes
   per slot) and, with `EnableRegisteredFiles`, its fixed-file table are sized for the full `MaxConnections`. A
   fixed-file table larger than `RLIMIT_NOFILE` cannot be registered and the ring silently runs without registered

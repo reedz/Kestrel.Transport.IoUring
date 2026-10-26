@@ -27,6 +27,9 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
     private readonly SemaphoreSlim _acceptReadLock = new(1, 1);
     private Task? _unbindTask;
     private Task? _disposeTask;
+
+    /// <summary>How long disposal waits for the workers to finish unbinding before it disposes them anyway.</summary>
+    internal TimeSpan ShutdownStepTimeout { get; set; } = TimeSpan.FromSeconds(5);
     private int _acceptsClosedToApp;
     private int _mergedWriterCompleted;
     // Forwarders still running. When the last one ends on its own (every worker stopped accepting, e.g. their IO
@@ -184,9 +187,10 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
     /// <summary>
     /// The workers share the port through SO_REUSEPORT, which would also let another process (a second instance of
     /// the application) bind it without error and silently split the traffic. Binding an exclusive socket first
-    /// fails with Kestrel's <see cref="AddressInUseException"/>, as SocketTransport does. A process that binds in
-    /// the short window between this probe and the workers can still share the port; an ephemeral port (0) needs
-    /// no probe because nobody else can be bound to the one the kernel picks.
+    /// fails with Kestrel's <see cref="AddressInUseException"/>, as SocketTransport does. It does not reserve the
+    /// port: Linux lets any process with the same effective user ID join the SO_REUSEPORT group later (see
+    /// docs/KNOWN-ISSUES.md). An ephemeral port (0) needs no probe because nobody else can be bound to the one the
+    /// kernel picks.
     /// </summary>
     internal static void EnsurePortIsFree(EndPoint endPoint)
     {
@@ -375,9 +379,20 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
     {
         List<Exception>? failures = null;
 
+        // Bounded like the single-ring listener's unbind: a worker whose IO loop is wedged never finishes unbinding,
+        // and its own DisposeAsync (bounded, and quarantining such a ring) must still run.
+        Task unbindTask = EnsureUnbindTask();
         try
         {
-            await EnsureUnbindTask().ConfigureAwait(false);
+            await unbindTask.WaitAsync(ShutdownStepTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _ = unbindTask.ContinueWith(
+                static task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
         }
         catch (Exception ex)
         {

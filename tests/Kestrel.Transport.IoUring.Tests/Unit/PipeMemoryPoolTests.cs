@@ -103,6 +103,48 @@ public class PipeMemoryPoolTests
         pool.Disposed.Should().BeTrue();
     }
 
+    [Fact]
+    public void Listener_WhosePoolFactoryThrows_LeaksNothing()
+    {
+        if (!Ring.IsSupported) return;
+
+        var options = TestTransport.Apply(new IoUringTransportOptions
+        {
+            ThreadCount = 1,
+            MemoryPoolFactory = () => throw new InvalidOperationException("pool"),
+        });
+        int eventFdsBefore = CountEventFds();
+        for (int i = 0; i < 3; i++)
+        {
+            using var ring = new Ring((uint)options.EffectiveRingSize);
+            Action create = () => _ = new IoUringConnectionListener(
+                new IPEndPoint(IPAddress.Loopback, 0),
+                ring,
+                options,
+                NullLogger<IoUringConnectionListener>.Instance);
+            create.Should().Throw<InvalidOperationException>().WithMessage("pool");
+        }
+
+        CountEventFds().Should().Be(eventFdsBefore, "a failed constructor must release its eventfd");
+    }
+
+    private static int CountEventFds()
+    {
+        int count = 0;
+        foreach (var fd in Directory.EnumerateFileSystemEntries("/proc/self/fd"))
+        {
+            try
+            {
+                if (new FileInfo(fd).LinkTarget == "anon_inode:[eventfd]")
+                    count++;
+            }
+            catch (IOException)
+            {
+            }
+        }
+        return count;
+    }
+
 #if NET10_0_OR_GREATER
     [Fact]
     public async Task KestrelHost_GivesTheTransportKestrelsMemoryPool()

@@ -192,71 +192,91 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         _maxConnections = options.MaxConnections;
         _receiveBufferSize = options.ReceiveBufferSize;
         _options = options;
-        _useMultishotAccept = options.EnableMultishotAccept;
-        _connectionSlots = new IoUringConnection?[options.MaxConnections];
-        _slotGenerations = new long[options.MaxConnections];
-        _freeSlots = new Stack<int>(options.MaxConnections);
-        // Pre-populate free-list with all slot indices. Push highest first so Pop()
-        // returns 0 first — stable small connIds under light load for easier debugging.
-        for (int i = options.MaxConnections - 1; i >= 0; i--) _freeSlots.Push(i);
-        _listenSocket = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-        _acceptChannel = Channel.CreateBounded<ConnectionContext>(new BoundedChannelOptions(options.AcceptQueueCapacity)
-        {
-            FullMode = BoundedChannelFullMode.Wait,
-            SingleReader = true,
-            SingleWriter = true,
-        });
-
-        // Create an eventfd for waking the IO loop when a send is enqueued.
-        // EFD_NONBLOCK = 0x800 prevents writes from blocking when the counter saturates.
-        _eventFd = Libc.eventfd(0, IoUringConstants.EFD_NONBLOCK);
-        if (_eventFd < 0)
-            throw new InvalidOperationException($"eventfd failed: {Marshal.GetLastPInvokeError()}");
-
-        _eventFdReadBuf = GC.AllocateUninitializedArray<ulong>(1, pinned: true);
-        _eventFdReadHandle = _eventFdReadBuf.AsMemory().Pin();
-
-        _eventFdWriteBuf = GC.AllocateUninitializedArray<ulong>(1, pinned: true);
-        _eventFdWriteBuf[0] = 1UL;
-        _eventFdWriteHandle = _eventFdWriteBuf.AsMemory().Pin();
-
-        // Pinned buffer for setsockopt value (TCP_NODELAY = 1).
-        _sockOptBuf = GC.AllocateUninitializedArray<int>(1, pinned: true);
-        _sockOptBuf[0] = 1;
-        _sockOptHandle = _sockOptBuf.AsMemory().Pin();
-        _sendRetryState = new(WakeIoLoop);
-        _acceptRetryTimer = new Timer(
-            static state =>
-            {
-                var listener = (IoUringConnectionListener)state!;
-                Volatile.Write(ref listener._acceptRetryTimerFired, 1);
-                listener.WakeIoLoop();
-            },
-            this,
-            Timeout.Infinite,
-            Timeout.Infinite);
-        _recvRetryTimer = new Timer(
-            static state =>
-            {
-                var listener = (IoUringConnectionListener)state!;
-                Volatile.Write(ref listener._recvRetryTimerFired, 1);
-                listener.WakeIoLoop();
-            },
-            this,
-            Timeout.Infinite,
-            Timeout.Infinite);
-        _unregisterRetryTimer = new Timer(
-            static state =>
-            {
-                var listener = (IoUringConnectionListener)state!;
-                Volatile.Write(ref listener._unregisterRetryTimerFired, 1);
-                listener.WakeIoLoop();
-            },
-            this,
-            Timeout.Infinite,
-            Timeout.Infinite);
-        // Last: a pool from Kestrel's factory is tracked by it until disposed, so nothing may throw after this.
+        // First, before anything that needs releasing: the factory may throw.
         _memoryPool = options.MemoryPoolFactory?.Invoke() ?? new PinnedBlockMemoryPool();
+        _eventFd = -1;
+        try
+        {
+            _useMultishotAccept = options.EnableMultishotAccept;
+            _connectionSlots = new IoUringConnection?[options.MaxConnections];
+            _slotGenerations = new long[options.MaxConnections];
+            _freeSlots = new Stack<int>(options.MaxConnections);
+            // Pre-populate free-list with all slot indices. Push highest first so Pop()
+            // returns 0 first — stable small connIds under light load for easier debugging.
+            for (int i = options.MaxConnections - 1; i >= 0; i--) _freeSlots.Push(i);
+            _listenSocket = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            _acceptChannel = Channel.CreateBounded<ConnectionContext>(
+                new BoundedChannelOptions(options.AcceptQueueCapacity)
+                {
+                    FullMode = BoundedChannelFullMode.Wait,
+                    SingleReader = true,
+                    SingleWriter = true,
+                });
+
+            // Create an eventfd for waking the IO loop when a send is enqueued.
+            // EFD_NONBLOCK = 0x800 prevents writes from blocking when the counter saturates.
+            _eventFd = Libc.eventfd(0, IoUringConstants.EFD_NONBLOCK);
+            if (_eventFd < 0)
+                throw new InvalidOperationException($"eventfd failed: {Marshal.GetLastPInvokeError()}");
+
+            _eventFdReadBuf = GC.AllocateUninitializedArray<ulong>(1, pinned: true);
+            _eventFdReadHandle = _eventFdReadBuf.AsMemory().Pin();
+
+            _eventFdWriteBuf = GC.AllocateUninitializedArray<ulong>(1, pinned: true);
+            _eventFdWriteBuf[0] = 1UL;
+            _eventFdWriteHandle = _eventFdWriteBuf.AsMemory().Pin();
+
+            // Pinned buffer for setsockopt value (TCP_NODELAY = 1).
+            _sockOptBuf = GC.AllocateUninitializedArray<int>(1, pinned: true);
+            _sockOptBuf[0] = 1;
+            _sockOptHandle = _sockOptBuf.AsMemory().Pin();
+            _sendRetryState = new(WakeIoLoop);
+            _acceptRetryTimer = new Timer(
+                static state =>
+                {
+                    var listener = (IoUringConnectionListener)state!;
+                    Volatile.Write(ref listener._acceptRetryTimerFired, 1);
+                    listener.WakeIoLoop();
+                },
+                this,
+                Timeout.Infinite,
+                Timeout.Infinite);
+            _recvRetryTimer = new Timer(
+                static state =>
+                {
+                    var listener = (IoUringConnectionListener)state!;
+                    Volatile.Write(ref listener._recvRetryTimerFired, 1);
+                    listener.WakeIoLoop();
+                },
+                this,
+                Timeout.Infinite,
+                Timeout.Infinite);
+            _unregisterRetryTimer = new Timer(
+                static state =>
+                {
+                    var listener = (IoUringConnectionListener)state!;
+                    Volatile.Write(ref listener._unregisterRetryTimerFired, 1);
+                    listener.WakeIoLoop();
+                },
+                this,
+                Timeout.Infinite,
+                Timeout.Infinite);
+        }
+        catch
+        {
+            // There is no listener to dispose: release what this constructor acquired.
+            _unregisterRetryTimer?.Dispose();
+            _recvRetryTimer?.Dispose();
+            _acceptRetryTimer?.Dispose();
+            _sockOptHandle.Dispose();
+            _eventFdWriteHandle.Dispose();
+            _eventFdReadHandle.Dispose();
+            if (_eventFd >= 0)
+                Libc.close(_eventFd);
+            _listenSocket?.Dispose();
+            _memoryPool.Dispose();
+            throw;
+        }
     }
 
     public void Bind(int listenBacklog, bool reusePort = false)
@@ -1050,6 +1070,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         if (Interlocked.Exchange(ref _listenSocketReleased, 1) != 0)
             return;
 
+        // Stop listening before anything else: closing our descriptor alone does not, while a fixed-file slot whose
+        // unregister failed, or a ring that is kept (quarantine), still references the socket.
+        StopListening();
+
         // Only valid while the ring is open (fd numbers can be reused after it closes).
         if (unregisterFixedFile && _listenSocketFileIndex >= 0)
         {
@@ -1063,6 +1087,18 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 _listenSocket.SafeHandle.DangerousRelease();
         });
         RunDisposeCleanupStep("listen socket dispose", _listenSocket.Dispose);
+    }
+
+    /// <summary>
+    /// shutdown(2) on a listening TCP socket stops it listening (the kernel unhashes it, so new clients are refused
+    /// and pending accepts fail) whoever else still holds a reference to it. Best effort and thread-safe (the
+    /// socket's handle is reference-counted); a socket that never listened just reports ENOTCONN.
+    /// </summary>
+    private void StopListening()
+    {
+        try { _listenSocket.Shutdown(SocketShutdown.Both); }
+        catch (SocketException) { }
+        catch (ObjectDisposedException) { }
     }
 
     /// <summary>Resubmits RECV SQEs for connections that had async flush (back-pressure resolved).</summary>
@@ -2150,6 +2186,11 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         // Array element reads are safe while the owner runs; MarkFinalized only completes a task.
         foreach (var conn in _connectionSlots)
             conn?.MarkFinalized();
+
+        // The loop cannot serve anyone: stop the kernel from accepting (a multishot accept keeps taking connections)
+        // and refuse new clients. Shutdown goes through the socket's reference-counted handle, so it is safe beside
+        // the owner; the socket itself stays the owner's to release.
+        StopListening();
 
         RunDisposeCleanupStep("send diagnostics timer dispose", () => _diagTimer?.Dispose());
         RunDisposeCleanupStep("recv diagnostics timer dispose", () => _recvDiagTimer?.Dispose());
