@@ -1,6 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+    <!-- PtsLibraryTfm lets the Phoronix profile build only the framework it runs (avoids restoring unused targeting packs). -->
+    <TargetFrameworks Condition="'$(PtsLibraryTfm)' == ''">net8.0;net9.0;net10.0</TargetFrameworks>
+    <TargetFrameworks Condition="'$(PtsLibraryTfm)' != ''">$(PtsLibraryTfm)</TargetFrameworks>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -14,7 +16,7 @@
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
 
     <PackageId>Kestrel.Transport.IoUring</PackageId>
-    <Version>2.3.0</Version>
+    <Version>2.4.0</Version>
     <Authors>reedz</Authors>
     <Description>Production-oriented io_uring transport for ASP.NET Core Kestrel with multishot accept/receive, provided buffer rings, lifecycle-safe cancellation, multi-ring listeners, and SocketTransport fallback.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -25,6 +27,36 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <Copyright>Copyright (c) 2026 reedz</Copyright>
     <PackageReleaseNotes>
+v2.4.0
+- UnbindAsync only stops accepting; Kestrel's graceful shutdown can drain live connections (previously every
+  connection was aborted). DisposeAsync force-aborts what the application has not disposed and waits for connection
+  finalization.
+- Disposal releases memory only after every io_uring request has completed (closing the ring is not a barrier for
+  the kernel); a ring that cannot be shown idle within 5 s is quarantined (kept alive) instead. Sockets the kernel
+  accepted during shutdown, or while the IO loop was failing, are always closed.
+- SINGLE_ISSUER rings are enabled by their IO thread (no more endless EEXIST retries); a failed fixed-file unregister
+  shuts the socket down and is retried.
+- MaxConnections is one limit shared by all rings; a full accept queue pauses accepting instead of aborting accepted
+  connections; multi-ring listeners refuse an explicit port that is already bound. EnableReusePort=false (new; the
+  default stays per-ring SO_REUSEPORT sockets) makes the rings share one exclusively bound socket that no other
+  process can join, at the cost of slower acceptance of connection bursts.
+- SocketTransportOptions NoDelay, Backlog, MaxReadBufferSize and MaxWriteBufferSize are honoured.
+- ConnectionClosed/RequestAborted fire promptly on peer EOF/reset; recv EOF no longer overtakes data queued behind
+  backpressure; slow uploads no longer abort at 1 MiB of queued receive data.
+- Receive retry after provided-buffer exhaustion is progress-driven, bounded and fair (fixes an ENOBUFS storm and
+  client timeouts at thousands of connections); BufferRingSize 0 (default) sizes itself from MaxConnections.
+- Send path gathers many pipe segments into one SENDMSG (about 2x static-file throughput).
+- Connection pipes use recycled pinned 4 KiB blocks (Kestrel's memory pool on .NET 10, the same design on .NET 8/9)
+  instead of the shared ArrayPool: a 118 KB static file is 9-25% faster and now ahead of the socket transport.
+- A dead IO loop no longer hangs UnbindAsync/DisposeAsync and stops accepting; a fatal ring error after unbind still
+  aborts connections; multi-ring UnbindAsync no longer throws for a cancelled token; the merged accept channel
+  completes when every ring has stopped.
+- Retry timers that fire early (coarse clock) re-arm instead of leaving an idle loop parked.
+- Multishot receive is used only on Linux 6.0+; kernels older than 5.10, or rings that fail an opcode probe, fall back to SocketTransport. The single-ring
+  listener no longer shares its port via SO_REUSEPORT; bind conflicts raise Kestrel's AddressInUseException.
+- RequireIoUring / IOURING_REQUIRE and IoUringTransportFactory.Bindings report what actually serves each bind.
+- Unique process-wide ConnectionId values; stale control requests cannot reach a reused slot (64-bit generations).
+
 v2.3.0
 - Fix default ring sizing so the transport binds with default options.
 - Drain final response buffers and close connection-churn sockets without fd leaks.
@@ -39,7 +71,8 @@ v2.3.0
 
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+    <!-- SourceLink needs a git checkout and a NuGet restore; neither exists in the Phoronix source bundle, which builds offline. -->
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" Condition="'$(PtsLibraryTfm)' == ''" />
     <None Include="../../README.md" Pack="true" PackagePath="/" />
     <None Include="../../LICENSE" Pack="true" PackagePath="/" />
   </ItemGroup>

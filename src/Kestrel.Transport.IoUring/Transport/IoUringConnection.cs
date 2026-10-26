@@ -42,18 +42,31 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     private readonly ILogger _logger;
     private readonly int _receiveBufferSize;
     private readonly CancellationTokenSource _connectionCts = new();
+    // Public ConnectionClosed. Separate from _connectionCts (which the send loop watches) so that the receive
+    // side ending (EOF/RST) can notify the application, as SocketTransport does, without cutting off a
+    // response that is still being sent to a client that half-closed.
+    private readonly CancellationTokenSource _connectionClosedCts = new();
+    private int _receiveClosedSignaled;
     private readonly Pipe _inputPipe;
     private readonly Pipe _outputPipe;
     private int _disposed;
+    private readonly TaskCompletionSource _finalized = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    /// <summary>Generation counter — incremented on each connection using this slot.
-    /// Encoded into UserData to detect stale CQEs from previous connections.</summary>
-    internal ushort Generation { get; set; }
+    /// <summary>
+    /// Generation of this slot's occupant: incremented each time the slot is reused. It is 64-bit and never wraps,
+    /// so the listener's control queues (close, receive resubmit, send retry, cancel retry) use it to reject a
+    /// request left over from an earlier occupant. Only its low 16 bits fit in a completion's user_data
+    /// (<see cref="WireGeneration"/>); that is safe because a slot is reused only after every request of the
+    /// previous occupant has completed (TryFinalizeClose), so no completion can arrive for a stale occupant.
+    /// </summary>
+    internal long Generation { get; set; }
+
+    private ushort WireGeneration => (ushort)Generation;
 
     // Callback to request a RECV resubmission from the IO loop after async flush completes.
-    private Action<long, ushort>? _requestRecvResubmit;
-    private Action<long, ushort>? _requestSendRetry;
-    private Action<long, ushort, ConnectionAbortedException?>? _requestClose;
+    private Action<long, long>? _requestRecvResubmit;
+    private Action<long, long>? _requestSendRetry;
+    private Action<long, long, ConnectionAbortedException?>? _requestClose;
     private TaskCompletionSource? _sendRetryCompletion;
     private int _closeRequested;
     private int _abortRequested;
@@ -101,6 +114,12 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     /// <summary>Tracks whether a RECV SQE is currently in-flight for this connection.</summary>
     internal bool HasRecvInFlight { get; set; }
 
+    /// <summary>
+    /// Monotonically tracks successful receive arms so cancel retries can target
+    /// the same live receive and diagnostics can detect stale retry origins.
+    /// </summary>
+    internal ulong RecvEpoch { get; private set; }
+
     /// <summary>Tracks whether a SEND SQE is currently in-flight for this connection.</summary>
     internal bool HasSendInFlight { get; set; }
 
@@ -112,10 +131,41 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
 
     /// <summary>True when an async flush is pending and will trigger a recv rearm on completion.</summary>
     internal bool RecvRearmPending { get; set; }
+
+    /// <summary>
+    /// True when the peer's EOF arrived while earlier data was still queued behind input-pipe backpressure.
+    /// The input is completed (and closure signalled) only after that data has been delivered.
+    /// </summary>
+    internal bool ReceiveEofPending { get; private set; }
+
+    /// <summary>
+    /// Records a receive EOF that must wait for already-received data to reach the application.
+    /// Returns false when nothing is queued and the EOF can complete immediately.
+    /// </summary>
+    internal bool TryDeferReceiveEof()
+    {
+        if (!RecvRearmPending)
+            return false;
+
+        ReceiveEofPending = true;
+        return true;
+    }
     internal bool RecvCancelPending { get; set; }
     private Queue<byte[]>? _pendingRecvData;
     private int _pendingRecvBytes;
-    private const int MaxPendingRecvBytes = 1024 * 1024;
+
+    // Upper bound for receive data queued while the application's input pipe is paused. The multishot receive is
+    // cancelled when the pipe pauses, but completions already posted keep arriving until the cancel takes
+    // effect: up to a full completion queue of buffers, plus whatever the peer's socket buffer holds (a few MiB
+    // on loopback). That data was already received and cannot be dropped, so this is a runaway guard, not the
+    // backpressure mechanism: once the cancel lands, TCP flow control throttles the peer.
+    private const int MinPendingRecvLimitBytes = 8 * 1024 * 1024;
+    private static long s_connectionOrdinal;
+    private readonly int _maxPendingRecvBytes;
+
+    // Widened so a cap near int.MaxValue (huge ring x huge buffers) still rejects instead of wrapping negative.
+    internal static bool ExceedsPendingRecvLimit(int pendingBytes, int incomingBytes, int limitBytes) =>
+        (long)pendingBytes + incomingBytes > limitBytes;
 
     /// <summary>True after the output-pipe send loop has stopped and cannot submit more sends.</summary>
     internal bool SendLoopCompleted { get; private set; } = true;
@@ -139,7 +189,10 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         IoUringPipeScheduler transportScheduler,
         bool unsafeInlineScheduling,
         ILogger logger,
-        bool useBufferRing = false)
+        bool useBufferRing = false,
+        long? maxReadBufferSize = 1024 * 1024,
+        long? maxWriteBufferSize = 64 * 1024,
+        System.Buffers.MemoryPool<byte>? memoryPool = null)
     {
         _connectionId = connectionId;
         _socketFd = socketFd;
@@ -147,8 +200,13 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         _ring = ring;
         _logger = logger;
         _receiveBufferSize = receiveBufferSize;
+        _maxPendingRecvBytes = (int)Math.Min(
+            int.MaxValue,
+            Math.Max(MinPendingRecvLimitBytes, (long)ring.CqEntries * receiveBufferSize));
         UsingBufferRing = useBufferRing;
-        ConnectionId = $"iouring:{connectionId}";
+        // Process-wide, not the slot/generation pair: that repeats across workers and listeners, and Kestrel logs
+        // and correlates by this string.
+        ConnectionId = "iouring:" + Interlocked.Increment(ref s_connectionOrdinal).ToString("x");
         RemoteEndPoint = remoteEndPoint;
         LocalEndPoint = localEndPoint;
 
@@ -171,28 +229,78 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             ? PipeScheduler.Inline
             : PipeScheduler.ThreadPool;
 
+        // Like SocketTransport: MaxReadBufferSize / MaxWriteBufferSize pause the writer, resume at half,
+        // and null (or 0) means no limit.
+        InputPauseThreshold = maxReadBufferSize ?? 0;
+        OutputPauseThreshold = maxWriteBufferSize ?? 0;
+        // The listener's pool (null: the pipe default). Like the socket transport, both pipes use pinned 4 KiB blocks
+        // that are recycled, so sends need no per-segment GCHandle.
         var inputOptions = new PipeOptions(
+            pool: memoryPool,
             writerScheduler: transportScheduler,
             readerScheduler: appReadScheduler,
-            pauseWriterThreshold: 1024 * 1024,
-            resumeWriterThreshold: 512 * 1024,
+            pauseWriterThreshold: InputPauseThreshold,
+            resumeWriterThreshold: InputPauseThreshold / 2,
             useSynchronizationContext: false);
         var outputOptions = new PipeOptions(
+            pool: memoryPool,
             writerScheduler: PipeScheduler.ThreadPool,
             readerScheduler: transportScheduler,
-            pauseWriterThreshold: 64 * 1024,
-            resumeWriterThreshold: 32 * 1024,
+            pauseWriterThreshold: OutputPauseThreshold,
+            resumeWriterThreshold: OutputPauseThreshold / 2,
             useSynchronizationContext: false);
         _inputPipe = new Pipe(inputOptions);
         _outputPipe = new Pipe(outputOptions);
 
         Transport = new DuplexPipe(_inputPipe.Reader, _outputPipe.Writer);
         Application = new DuplexPipe(_outputPipe.Reader, _inputPipe.Writer);
+
+        // Abort and final close cancel _connectionCts; the application-visible token follows it.
+        _connectionCts.Token.UnsafeRegister(
+            static state => ((IoUringConnection)state!)._connectionClosedCts.Cancel(),
+            this);
     }
 
     public IDuplexPipe Application { get; }
 
-    public override CancellationToken ConnectionClosed => _connectionCts.Token;
+    /// <summary>Input pipe pause threshold (SocketTransportOptions.MaxReadBufferSize; 0 = unlimited).</summary>
+    internal long InputPauseThreshold { get; }
+
+    /// <summary>Output pipe pause threshold (SocketTransportOptions.MaxWriteBufferSize; 0 = unlimited).</summary>
+    internal long OutputPauseThreshold { get; }
+
+    public override CancellationToken ConnectionClosed => _connectionClosedCts.Token;
+
+    /// <summary>
+    /// Notifies the application that the connection is closed because the receive side ended (EOF or a
+    /// terminal error such as a peer reset). Kestrel uses this to abort an in-flight request. Callbacks are
+    /// application code, so they run on the thread pool rather than on the IO loop.
+    /// </summary>
+    internal void SignalReceiveClosed()
+    {
+        if (Interlocked.Exchange(ref _receiveClosedSignaled, 1) != 0)
+            return;
+
+        ThreadPool.UnsafeQueueUserWorkItem(
+            static connection => connection.CancelConnectionClosed(),
+            this,
+            preferLocal: false);
+    }
+
+    private void CancelConnectionClosed()
+    {
+        try
+        {
+            _connectionClosedCts.Cancel();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "ConnectionClosed callbacks failed after the receive side of connection {Id} ended.",
+                _connectionId);
+        }
+    }
 
     /// <summary>Sets the fd on an SQE, using fixed-file index if registered.</summary>
     private unsafe void SetSqeFd(IoUringSqe* sqe)
@@ -222,8 +330,9 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             sqe->Len = (uint)_receiveBufferSize;
             sqe->OpFlags = 0;
             sqe->IoPrio = 0;
-            sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Recv);
+            sqe->UserData = EncodeUserData(_connectionId, WireGeneration, OpType.Recv);
             HasRecvInFlight = true;
+            RecvEpoch++;
             return true;
         }
 
@@ -253,8 +362,9 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         sqe->IoPrio = (ushort)IoUringConstants.IORING_RECV_MULTISHOT;
         sqe->Flags |= IoUringConstants.IOSQE_BUFFER_SELECT;
         sqe->BufIndexOrGroup = bufferGroupId;
-        sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Recv);
+        sqe->UserData = EncodeUserData(_connectionId, WireGeneration, OpType.Recv);
         HasRecvInFlight = true;
+        RecvEpoch++;
         return true;
     }
 
@@ -265,8 +375,8 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
 
         sqe->Opcode = IoUringConstants.IORING_OP_ASYNC_CANCEL;
         sqe->Fd = -1;
-        sqe->AddrOrSpliceOffIn = EncodeUserData(_connectionId, Generation, OpType.Recv);
-        sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Cancel);
+        sqe->AddrOrSpliceOffIn = EncodeUserData(_connectionId, WireGeneration, OpType.Recv);
+        sqe->UserData = EncodeUserData(_connectionId, WireGeneration, OpType.Cancel);
         RecvCancelPending = true;
         return true;
     }
@@ -275,6 +385,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     internal void CompleteInputWriter()
     {
         try { _inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
+        SignalReceiveClosed();
     }
 
     /// <summary>
@@ -286,7 +397,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     {
         if (RecvRearmPending)
         {
-            if (_pendingRecvBytes + data.Length > MaxPendingRecvBytes)
+            if (ExceedsPendingRecvLimit(_pendingRecvBytes, data.Length, _maxPendingRecvBytes))
             {
                 _requestClose?.Invoke(
                     _connectionId,
@@ -370,6 +481,14 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     private byte[]? _smallSendBuffer;
     private nint _smallSendBasePtr;
     private nint _sendPtr;
+
+    // Gather send: one SENDMSG covers up to MaxGatherSegments pipe segments. A 118 KB static file arrives as
+    // ~29 segments of 4 KB; sending them one SEND + CQE at a time costs ~29 IO-loop round trips per response.
+    private const int MaxGatherSegments = 64;
+    private const int MsgHdrSize = 56; // sizeof(struct msghdr) on 64-bit Linux
+    private byte[]? _gatherBlock;      // pinned: msghdr followed by the iovec array
+    private nint _gatherBlockPtr;
+    private List<MemoryHandle>? _gatherPins;
     // Diagnostic shadow state: timestamp + byte count of the current pin (0 when no pin held).
     private long _sendPinStartTs;
     private int _sendPinByteLen;
@@ -396,6 +515,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         if (bytesRead <= 0)
         {
             _inputPipe.Writer.Complete();
+            SignalReceiveClosed();
             return RecvOutcome.Closed;
         }
 
@@ -500,6 +620,67 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             _smallSendBasePtr = (nint)pointer;
     }
 
+    /// <summary>
+    /// Pins up to <see cref="MaxGatherSegments"/> segments of <paramref name="remaining"/> and describes them
+    /// with an iovec array for one SENDMSG. Returns the number of bytes described. IO-loop thread only.
+    /// </summary>
+    private unsafe int PrepareGather(in ReadOnlySequence<byte> remaining)
+    {
+        if (_gatherBlock == null)
+        {
+            _gatherBlock = GC.AllocateArray<byte>(
+                MsgHdrSize + MaxGatherSegments * sizeof(IoUringIoVec),
+                pinned: true);
+            fixed (byte* pointer = _gatherBlock)
+                _gatherBlockPtr = (nint)pointer;
+        }
+
+        byte* block = (byte*)_gatherBlockPtr;
+        var iov = (IoUringIoVec*)(block + MsgHdrSize);
+        int count = 0;
+        long total = 0;
+        foreach (ReadOnlyMemory<byte> segment in remaining)
+        {
+            if (segment.IsEmpty)
+                continue;
+            if (count == MaxGatherSegments)
+                break;
+
+            MemoryHandle pin = segment.Pin();
+            (_gatherPins ??= new List<MemoryHandle>(MaxGatherSegments)).Add(pin);
+            iov[count].Base = (nint)pin.Pointer;
+            iov[count].Len = (nuint)segment.Length;
+            total += segment.Length;
+            count++;
+        }
+
+        // struct msghdr: name, namelen, iov, iovlen, control, controllen, flags (only iov/iovlen are used).
+        new Span<byte>(block, MsgHdrSize).Clear();
+        *(IoUringIoVec**)(block + 16) = iov;
+        *(nuint*)(block + 24) = (nuint)count;
+        return (int)Math.Min(total, int.MaxValue);
+    }
+
+    private unsafe bool TrySubmitPreparedSendMsg()
+    {
+        if (!_ring.TryGetSqe(out IoUringSqe* sqe))
+        {
+            _ring.Submit();
+            if (!_ring.TryGetSqe(out sqe))
+                return false;
+        }
+
+        sqe->Opcode = IoUringConstants.IORING_OP_SENDMSG;
+        SetSqeFd(sqe);
+        sqe->AddrOrSpliceOffIn = (ulong)_gatherBlockPtr;
+        sqe->Len = 1;
+        sqe->OpFlags = 0;
+        sqe->IoPrio = 0;
+        sqe->UserData = EncodeUserData(_connectionId, WireGeneration, OpType.Send);
+        HasSendInFlight = true;
+        return true;
+    }
+
     private unsafe bool TrySubmitPreparedSend(int length)
     {
         if (!_ring.TryGetSqe(out IoUringSqe* sqe))
@@ -515,7 +696,7 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         sqe->Len = (uint)length;
         sqe->OpFlags = 0;
         sqe->IoPrio = 0;
-        sqe->UserData = EncodeUserData(_connectionId, Generation, OpType.Send);
+        sqe->UserData = EncodeUserData(_connectionId, WireGeneration, OpType.Send);
         HasSendInFlight = true;
         return true;
     }
@@ -553,6 +734,12 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
             _sendHandle.Dispose();
             SendDiagnostics.OnPinDispose(_sendPinStartTs, _sendPinByteLen);
         }
+        if (_gatherPins is { Count: > 0 })
+        {
+            foreach (MemoryHandle pin in _gatherPins)
+                pin.Dispose();
+            _gatherPins.Clear();
+        }
         _sendHandle = default;
         _sendPtr = nint.Zero;
         _sendPinStartTs = 0;
@@ -564,9 +751,9 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     /// No drain task thread — the output pipe's readerScheduler routes continuations to the IO loop.
     /// </summary>
     public void InitializeIoCallbacks(
-        Action<long, ushort> requestRecvResubmit,
-        Action<long, ushort> requestSendRetry,
-        Action<long, ushort, ConnectionAbortedException?> requestClose)
+        Action<long, long> requestRecvResubmit,
+        Action<long, long> requestSendRetry,
+        Action<long, long, ConnectionAbortedException?> requestClose)
     {
         _requestRecvResubmit = requestRecvResubmit;
         _requestSendRetry = requestSendRetry;
@@ -611,37 +798,44 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
                     continue;
                 }
 
-                // Send across all segments of the buffer (multi-segment safe).
-                // Bug history: previously only buffer.First was sent and the rest
-                // was silently dropped via AdvanceTo(examined: buffer.End).
+                // Send the whole buffer, gathering many pipe segments into one SENDMSG where needed.
+                // A short send (peer window full) resubmits exactly the unsent remainder, so byte order
+                // is preserved across segments.
                 long totalConsumed = 0;
                 bool aborted = false;
-                foreach (var segment in buffer)
+                while (totalConsumed < buffer.Length)
                 {
-                    int segOffset = 0;
-                    while (segOffset < segment.Length)
+                    ReadOnlySequence<byte> remaining = buffer.Slice(totalConsumed);
+                    bool gather;
+                    int requestedLen;
+                    if (remaining.IsSingleSegment && remaining.First.Length <= SmallSendBufferSize)
                     {
-                        var slice = segment.Slice(segOffset);
-                        PrepareSendSlice(slice);
-                        int requestedLen = slice.Length;
-                        try
-                        {
-                            while (!TrySubmitPreparedSend(requestedLen))
-                                await WaitForSendRetry().ConfigureAwait(false);
-                        }
-                        catch
-                        {
-                            DisposeSendPin();
-                            throw;
-                        }
-
-                        int sent = await AwaitSendCompletion().ConfigureAwait(false);
-                        if (sent <= 0) { aborted = true; break; }
-                        if (sent < requestedLen) SendDiagnostics.OnShortSendResubmit();
-                        segOffset += sent;
-                        totalConsumed += sent;
+                        // Typical small response (plaintext/JSON): copy into the per-connection scratch buffer.
+                        gather = false;
+                        PrepareSendSlice(remaining.First);
+                        requestedLen = remaining.First.Length;
                     }
-                    if (aborted) break;
+                    else
+                    {
+                        gather = true;
+                        requestedLen = PrepareGather(remaining);
+                    }
+
+                    try
+                    {
+                        while (!(gather ? TrySubmitPreparedSendMsg() : TrySubmitPreparedSend(requestedLen)))
+                            await WaitForSendRetry().ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        DisposeSendPin();
+                        throw;
+                    }
+
+                    int sent = await AwaitSendCompletion().ConfigureAwait(false);
+                    if (sent <= 0) { aborted = true; break; }
+                    if (sent < requestedLen) SendDiagnostics.OnShortSendResubmit();
+                    totalConsumed += sent;
                 }
 
                 // Tell the pipe how many bytes we consumed; examined = consumed so the
@@ -672,12 +866,22 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
 
     public override ValueTask DisposeAsync()
     {
-        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
-            return ValueTask.CompletedTask;
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) == 0)
+            RequestClose(null);
 
-        RequestClose(null);
-        return ValueTask.CompletedTask;
+        // Kestrel removes the connection from its manager only after this completes, so it must not complete
+        // before the IO loop has drained the final response and reclaimed the socket.
+        return new ValueTask(_finalized.Task);
     }
+
+    /// <summary>True once the application has disposed the connection (its final response may still be sending).</summary>
+    internal bool ApplicationDisposed => Volatile.Read(ref _disposed) != 0;
+
+    /// <summary>
+    /// Signals that the transport has finished with this connection: its socket is reclaimed (or the transport
+    /// stopped and can make no further progress). Completes <see cref="DisposeAsync"/>.
+    /// </summary>
+    internal void MarkFinalized() => _finalized.TrySetResult();
 
     private void RequestClose(ConnectionAbortedException? reason)
     {
@@ -711,16 +915,8 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         if (Interlocked.Exchange(ref _transportAborted, 1) != 0)
             return;
 
-        _connectionCts.Cancel();
-        CancelSendRetry();
-        try
-        {
-            _inputPipe.Writer.Complete(reason);
-        }
-        catch (InvalidOperationException) { }
-        _outputPipe.Reader.CancelPendingRead();
-
-        ShutdownSocket();
+        var abortAdapter = new ProductionTransportAbortAdapter(this);
+        ConnectionTransportAbort.Run(_connectionCts, reason, ref abortAdapter);
     }
 
     internal void ShutdownSocket()
@@ -737,16 +933,16 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
     }
 
     /// <summary>Closes the socket fd. Called by the listener after in-flight ops are drained.</summary>
+    /// <remarks>
+    /// This requests <c>ConnectionClosed</c> cancellation and still attempts fixed-file unregister plus
+    /// <c>close(2)</c> reclamation before surfacing callback or cleanup/logging failures.
+    /// Callers must contain those post-reclamation failures; <c>ListenerCloseFinalization.Run</c> and
+    /// <see cref="IoUringConnectionListener.DisposeAsync"/> are the finalization and dispose containment layers.
+    /// </remarks>
     internal void CloseSocketFd()
     {
-        if (Interlocked.Exchange(ref _socketClosed, 1) != 0)
-            return;
-
-        _connectionCts.Cancel();
-        if (_fileIndex >= 0 && !_ring.UnregisterFd(_fileIndex))
-            _logger.LogWarning("Failed to unregister fixed-file slot {Slot}.", _fileIndex);
-        if (Libc.close(_socketFd) < 0)
-            _logger.LogWarning("close(fd={Fd}) failed with errno {Errno}", _socketFd, Marshal.GetLastPInvokeError());
+        var closeAdapter = new ConnectionSocketClose.ProductionCloseAdapter(_ring, _logger);
+        ConnectionSocketClose.Run(_connectionCts, _fileIndex, _socketFd, ref _socketClosed, ref closeAdapter);
     }
 
     /// <summary>Releases managed transport resources after the ring has stopped and closed.</summary>
@@ -758,11 +954,60 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         try { _outputPipe.Reader.Complete(); } catch (InvalidOperationException) { }
         _pendingRecvData?.Clear();
         _pendingRecvBytes = 0;
+        MarkFinalized();
+    }
+
+    /// <summary>
+    /// Ends the application-facing side of a connection whose ring was quarantined (the IO loop has stopped). The
+    /// output pipe (whose segments a send may still reference), the send pins and the receive buffer are left
+    /// alone. Finalization is signalled first and the input is completed on the thread pool: with inline scheduling,
+    /// completing it here would run application continuations on the disposing thread, and one waiting for this
+    /// connection's DisposeAsync would deadlock.
+    /// </summary>
+    internal void AbandonAfterFailedTeardown()
+    {
+        MarkFinalized();
+        ThreadPool.UnsafeQueueUserWorkItem(
+            static connection =>
+            {
+                try { connection._inputPipe.Writer.Complete(); } catch (InvalidOperationException) { }
+                connection.CancelConnectionClosed();
+            },
+            this,
+            preferLocal: false);
     }
 
     private sealed class DuplexPipe(PipeReader reader, PipeWriter writer) : IDuplexPipe
     {
         public PipeReader Input { get; } = reader;
         public PipeWriter Output { get; } = writer;
+    }
+
+    private readonly struct ProductionTransportAbortAdapter(IoUringConnection connection)
+        : ConnectionTransportAbort.IAbortAdapter<ProductionTransportAbortAdapter>
+    {
+        private readonly IoUringConnection _connection = connection;
+
+        public static void CancelSendRetry(ref ProductionTransportAbortAdapter self) =>
+            self._connection.CancelSendRetry();
+
+        public static void CompleteInput(
+            ref ProductionTransportAbortAdapter self,
+            ConnectionAbortedException reason) =>
+            self._connection._inputPipe.Writer.Complete(reason);
+
+        public static void CancelOutputPendingRead(ref ProductionTransportAbortAdapter self) =>
+            self._connection._outputPipe.Reader.CancelPendingRead();
+
+        public static void ShutdownSocket(ref ProductionTransportAbortAdapter self) =>
+            self._connection.ShutdownSocket();
+
+        public static void LogConnectionClosedCallbackFailure(
+            ref ProductionTransportAbortAdapter self,
+            Exception exception) =>
+            self._connection._logger.LogWarning(
+                exception,
+                "ConnectionClosed callbacks failed during transport abort for connection {Id}; continuing cleanup.",
+                self._connection._connectionId);
     }
 }

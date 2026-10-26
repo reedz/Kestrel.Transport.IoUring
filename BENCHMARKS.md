@@ -67,6 +67,86 @@ Matrix medians:
 Raw CSV and `wrk`/`wrk2` output for this run are retained as session witness
 artifacts rather than committed benchmark products.
 
+## ASP.NET Core workloads under the Phoronix profile (2 vCPU development VM)
+
+These numbers come from the `phoronix/` profile and an A/B harness on a **2 vCPU, shared** Azure VM (Linux 6.17,
+.NET 10.0.13), one io_uring ring, server and `wrk` pinned to separate CPUs, 8 s runs, 3 rounds with rotating
+variant order. They validate correctness and relative effects, **not** multi-ring scaling or absolute throughput,
+and spreads between rounds were large (the plaintext rows moved by 40-100%), so only large, consistent effects are
+reported. Variants: `base` is the baseline commit `ff018fb` (before the lifecycle and receive-retry fixes and
+before gather send), `no-gather` is the current tree with gather send reverted, `current` is the current tree.
+
+| Workload | Connections | base | no-gather | current | Sockets |
+|---|---:|---:|---:|---:|---:|
+| JSON (RPS) | 20 | 48.7k | 45.2k | 42.8k | 33.5k |
+| JSON (RPS) | 100 | 47.1k | 45.7k | 44.8k | 34.5k |
+| Static 118 KB (RPS) | 20 | 2.6k | 2.3k | **6.2k** | 6.4k |
+| Static 118 KB (RPS) | 100 | 2.7k | 2.6k | **5.6k** | 6.4k |
+| Static 118 KB (RPS) | 500 | 2.6k | 2.5k | **5.2k** | 4.3k |
+
+Server CPU per 1,000 requests (ms, lower is better): static file 361/382 (base/no-gather) vs 146-195 (current) vs
+140-221 (sockets); JSON about 20 (io_uring, all variants) vs 24-28 (sockets).
+
+* **Gather send is kept.** Sending a response that arrives as many pipe segments with one `SENDMSG` instead of one
+  `SEND` plus completion per segment roughly **doubles** the static-file throughput and halves its CPU per request
+  (the `no-gather` variant matches `base`). Single small segments (plaintext, JSON) still use the scratch `SEND`.
+* **Static file versus sockets:** io_uring was behind by about 0-15% at 20-100 connections and ahead by about 20% at
+  500 on this machine. The cause was the pipes' memory pool; with it fixed io_uring is ahead at every connection
+  count (see the follow-up below).
+* **JSON** is consistently 27-30% faster than sockets at 20/100 connections with 18-25% less CPU per request.
+  The earlier small-connection plaintext figures are too noisy on this VM to quote.
+* **Sustained gates through the PTS pipeline** (90 s, 1 run, one ring, no errors of any kind): plaintext at 4,000
+  connections 37.9k (io_uring) vs 27.5k (sockets) RPS; static file at 1,000 connections 5.1k vs 5.8k. 4,000
+  connections is the case that produced an ENOBUFS storm (27k-89k completions per second with thousands of client
+  timeouts) before the receive-retry rewrite; it now completes with zero errors. Rerun on the final tree
+  (`e392f35`, `--no-egress`, all without errors): plaintext at 4,000 connections 39.6k (io_uring) vs 41.1k (sockets)
+  on one ring and 48.3k vs 39.6k with `rings=auto` (two rings here); static file at 1,000 connections 7.7k vs 7.7k.
+  Single runs on a shared VM: treat these as gates, not comparisons. Repeated 30 s runs outside PTS later showed
+  that this gate is borderline on this machine: even the build from before this work had a few requests waiting
+  over 2 s (wrk timeouts) in about 1 run in 10 (2 of 15),
+  and a change to when the IO loop submits mid-batch raised that to about 4 in 10 until it was narrowed again (in
+  randomized comparisons with one binary: the final condition 1 of 8, the original 1 of 15, the broad one 5 of 15;
+  with each completion pass also limited to one queue's worth, 0 of 8 against 1 of 8 without the limit, at the same
+  throughput). The pipe memory pool made no difference there (4 of 8 runs either way).
+* Not measured here: multi-ring scaling (two rings on two CPUs only show the multi-ring path works), TLS/HTTP2, any
+  machine with more than 2 CPUs. Run `phoronix/run-local.sh` on a larger machine for those (see
+  `phoronix/README.md`).
+
+### Follow-up: the static-file gap and its fix (pipe memory pool)
+
+Same VM, one ring, a fresh server process per run on CPU 0 and `wrk -t1` on CPU 1, 3 s warm-up then 6 s measured,
+5 rounds with every (variant, workload) pair in shuffled order per round. `pool` is the current tree, `before` the
+same tree without the change below, `sockets` Kestrel's socket transport. ± is a 95% Student-t interval (n = 5);
+CPU is server CPU per 1,000 requests. No run had an error.
+
+| Workload | Conns | pool RPS | before RPS | Sockets RPS | CPU pool / before / sockets (ms) |
+|---|---:|---:|---:|---:|---:|
+| Static 118 KB | 20 | 6,075 ± 219 | 5,567 ± 161 | 5,777 ± 263 | 157 / 172 / 165 |
+| Static 118 KB | 100 | 6,333 ± 355 | 5,070 ± 204 | 5,625 ± 410 | 155 / 194 / 175 |
+| Static 118 KB | 500 | 5,020 ± 164 | 4,471 ± 151 | 4,345 ± 186 | 197 / 221 / 227 |
+| Plaintext | 100 | 38,617 ± 2,477 | 39,555 ± 1,259 | 33,647 ± 1,180 | 24.8 / 24.3 / 28.4 |
+| JSON | 100 | 45,098 ± 1,436 | 42,551 ± 1,830 | 34,089 ± 3,004 | 21.1 / 22.3 / 28.1 |
+
+* **The gap was real.** `before` trailed sockets in every round at 20 and 100 connections (by 2-17%). An earlier
+  write-up called it noise: it used normal rather than Student-t intervals and did not compare the rounds.
+* **Cause:** the connection pipes used the pipe default, which rents from `ArrayPool<byte>.Shared`. Output blocks
+  are rented on ThreadPool threads and returned on the IO thread, and a 118 KB response needs about 29 of them;
+  the measurements fit the shared pool's bounded per-thread and per-core caches overflowing, so new arrays kept
+  being allocated (and each send had to pin its arrays with a `GCHandle`). Per request at 100 connections (two
+  measurements): 6.1-6.8 page faults versus 1.4-1.6 for sockets, and 3.4-4.1x the `madvise`/`mprotect` calls; a
+  page-fault profile put 91% of the faults under the static-file copy loop.
+* **Fix:** each listener now gives its connections a pool of recycled, pinned 4 KiB blocks, as the socket transport
+  does: Kestrel's pool on .NET 10 (`IMemoryPoolFactory<byte>`), a copy of its design on .NET 8/9. Page faults drop
+  to about 1.0 per request. `pool` beats `before` in every round on the static file (+6% to +33%) and beats sockets
+  in 14 of 15 static rounds.
+* **Plaintext and JSON are unchanged:** a separate paired run, 10 rounds of `pool` against `before` only, gives
+  +1.1% ± 2.3% (plaintext) and -0.1% ± 2.0% (JSON).
+* **Memory:** after a 10 s static-file run at 500 connections, resident memory 5 s later is 228 MB (`pool`), 172 MB
+  (`before`) and 232 MB (sockets); the peaks are 282, 207 and 239 MB. Like the socket transport's, the pool keeps
+  blocks for reuse; on .NET 10 Kestrel's pool releases idle blocks over time, on .NET 8/9 it keeps its peak (as
+  Kestrel's own pool does on those versions).
+* Measured on .NET 10 only. Scripts and raw data are not part of the repository.
+
 ## Prerequisites
 
 Install `wrk`:

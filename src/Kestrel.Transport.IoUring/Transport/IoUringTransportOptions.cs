@@ -1,3 +1,6 @@
+using Kestrel.Transport.IoUring.Native;
+using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets;
+
 namespace Kestrel.Transport.IoUring.Transport;
 
 /// <summary>Configuration options for the io_uring transport.</summary>
@@ -11,8 +14,56 @@ public sealed class IoUringTransportOptions
     /// <summary>Maximum number of simultaneous connections. Excess connections are rejected.</summary>
     public int MaxConnections { get; set; } = 16384;
 
-    /// <summary>TCP listen backlog passed to <c>listen(2)</c>.</summary>
-    public int ListenBacklog { get; set; } = 512;
+    private const int DefaultListenBacklog = 512;
+    private int? _listenBacklog;
+
+    /// <summary>
+    /// TCP listen backlog passed to <c>listen(2)</c>. When not set, <c>SocketTransportOptions.Backlog</c> applies
+    /// (512 by default), as it would for Kestrel's socket transport.
+    /// </summary>
+    public int ListenBacklog
+    {
+        get => _listenBacklog ?? DefaultListenBacklog;
+        set => _listenBacklog = value;
+    }
+
+    internal bool IsListenBacklogSet => _listenBacklog.HasValue;
+
+    // Taken from SocketTransportOptions by ResolveWith; the defaults are SocketTransportOptions' defaults.
+    internal bool NoDelay { get; set; } = true;
+    internal long? MaxReadBufferSize { get; set; } = 1024 * 1024;
+    internal long? MaxWriteBufferSize { get; set; } = 64 * 1024;
+
+    internal IoUringTransportOptions Clone() => (IoUringTransportOptions)MemberwiseClone();
+
+    /// <summary>
+    /// Creates the memory pool a listener (each multi-ring worker) gives its connections' pipes. Set by the factory to
+    /// Kestrel's pool on .NET 10 (<c>IMemoryPoolFactory&lt;byte&gt;</c>, the pool the socket transport uses); when
+    /// unset, listeners use <see cref="PinnedBlockMemoryPool"/>.
+    /// </summary>
+    internal Func<System.Buffers.MemoryPool<byte>>? MemoryPoolFactory { get; set; }
+
+    /// <summary>
+    /// Multi-ring workers: the ring's even share of <see cref="MaxConnections"/>. Every worker can hold the full
+    /// limit (admission is shared), but buffers are sized for the share, as the kernel spreads connections evenly.
+    /// </summary>
+    internal int? BufferRingConnectionShare { get; set; }
+
+    /// <summary>
+    /// The options listeners actually use: these options plus the <see cref="SocketTransportOptions"/> settings
+    /// that mean the same thing for this transport (<c>NoDelay</c>, <c>Backlog</c>, <c>MaxReadBufferSize</c>,
+    /// <c>MaxWriteBufferSize</c>). An explicitly set <see cref="ListenBacklog"/> wins over <c>Backlog</c>.
+    /// </summary>
+    internal IoUringTransportOptions ResolveWith(SocketTransportOptions socketOptions)
+    {
+        var resolved = Clone();
+        if (!IsListenBacklogSet)
+            resolved._listenBacklog = socketOptions.Backlog;
+        resolved.NoDelay = socketOptions.NoDelay;
+        resolved.MaxReadBufferSize = socketOptions.MaxReadBufferSize;
+        resolved.MaxWriteBufferSize = socketOptions.MaxWriteBufferSize;
+        return resolved;
+    }
 
     /// <summary>Capacity of the internal accept channel (buffered accepted-connection queue).</summary>
     public int AcceptQueueCapacity { get; set; } = 1024;
@@ -28,7 +79,7 @@ public sealed class IoUringTransportOptions
     /// <summary>Per-connection receive buffer size in bytes.
     /// Also controls per-buffer size in the provided buffer ring when EnableBufferRing=true.
     /// 2 KB is plenty for keep-alive HTTP/1.1 small-payload workloads (Plaintext/JSON);
-    /// raise for upload-heavy workloads. Pinned heap cost = BufferRingSize × ReceiveBufferSize × ThreadCount.</summary>
+    /// raise for upload-heavy workloads. Pinned heap cost = <see cref="BufferRingSize"/> × ReceiveBufferSize × ThreadCount.</summary>
     public int ReceiveBufferSize { get; set; } = 2048;
 
     /// <summary>
@@ -59,9 +110,10 @@ public sealed class IoUringTransportOptions
     public bool EnableCoopTaskRun { get; set; } = false;
 
     /// <summary>
-    /// Enable IORING_SETUP_SINGLE_ISSUER (kernel 6.0+). Asserts a single submitter, allowing
-    /// kernel-side optimisations and is required for DEFER_TASKRUN. Defaults to true
-    /// (auto-fallback on older kernels).
+    /// Enable IORING_SETUP_SINGLE_ISSUER (kernel 6.0+). Asserts a single submitter, allowing kernel-side
+    /// optimisations, and is required for DEFER_TASKRUN. The ring is created disabled and enabled by its IO loop
+    /// thread, which makes that thread the issuer. Defaults to <c>false</c>; falls back automatically on older
+    /// kernels (check <see cref="IoUringTransportFactory.Bindings"/> for the flags actually accepted).
     /// </summary>
     public bool EnableSingleIssuer { get; set; } = false;
 
@@ -87,14 +139,43 @@ public sealed class IoUringTransportOptions
     public bool EnableMultishotAccept { get; set; } = true;
 
     /// <summary>
+    /// How the rings of a multi-ring listener (<see cref="ThreadCount"/> &gt; 1) share the port. When
+    /// <see langword="true"/> (the default), each ring binds its own <c>SO_REUSEPORT</c> socket with a multishot
+    /// accept and the kernel spreads new connections across them by hash; Linux then also lets any process running
+    /// as the same user join the group later and receive a share of the connections. When <see langword="false"/>,
+    /// one listening socket is bound exclusively, like Kestrel's socket transport, and every ring accepts from it
+    /// with single-shot accepts: nothing else can bind the port, but bursts of new connections are accepted more
+    /// slowly (see docs/KNOWN-ISSUES.md). Ignored with a single ring, whose socket is always exclusive.
+    /// </summary>
+    public bool EnableReusePort { get; set; } = true;
+
+    /// <summary>
+    /// When <see langword="true"/>, binding an IP endpoint throws <see cref="NotSupportedException"/> instead of
+    /// silently falling back to the socket transport when io_uring is unavailable (unsupported kernel, seccomp,
+    /// <c>kernel.io_uring_disabled</c>, <c>IOURING_FORCE_FALLBACK=1</c>) or ring setup fails. Intended for
+    /// benchmarks and tests that must not report socket-transport results as io_uring results.
+    /// The <c>IOURING_REQUIRE=1</c> environment variable has the same effect. Endpoint types io_uring never serves
+    /// (for example Unix domain sockets) still use the socket transport; see
+    /// <see cref="Transport.IoUringTransportFactory.Bindings"/> to inspect what actually served each bind.
+    /// </summary>
+    public bool RequireIoUring { get; set; }
+
+    /// <summary>
     /// Enables registered file descriptors. This requires a synchronous kernel table update
     /// for every accepted and closed connection, so it is disabled by default for balanced
     /// persistent-connection and connection-churn performance.
     /// </summary>
     public bool EnableRegisteredFiles { get; set; }
 
-    /// <summary>Number of buffers in the provided buffer ring (must be power of two).</summary>
-    public int BufferRingSize { get; set; } = 1024;
+    /// <summary>
+    /// Number of buffers in the provided buffer ring (a power of two), or <c>0</c> (the default) to size it from
+    /// <see cref="MaxConnections"/>: the next power of two, between 1024 and 4096. Every ready socket's receive
+    /// takes a buffer, so a ring smaller than the number of active connections makes receives fail with
+    /// <c>ENOBUFS</c> and stalls connections under load; keep this at least as large as the number of
+    /// concurrent connections you expect per ring. Pinned heap cost = buffers × <see cref="ReceiveBufferSize"/>
+    /// × <see cref="ThreadCount"/>.
+    /// </summary>
+    public int BufferRingSize { get; set; }
 
     /// <summary>
     /// When true, Kestrel HTTP processing runs inline on the IO loop thread,
@@ -111,6 +192,59 @@ public sealed class IoUringTransportOptions
     /// </summary>
     internal int EffectiveRingSize => RingSize;
 
+    /// <summary>
+    /// io_uring_setup flags requested by these options. SINGLE_ISSUER rings are created disabled
+    /// (IORING_SETUP_R_DISABLED) so the IO loop thread, which enables them, becomes the issuer; the constructing
+    /// thread could not submit anything else.
+    /// </summary>
+    internal uint SetupFlags
+    {
+        get
+        {
+            uint flags = 0;
+            if (EnableSqPoll)
+                flags |= IoUringConstants.IORING_SETUP_SQPOLL;
+            if (EnableCoopTaskRun)
+                flags |= IoUringConstants.IORING_SETUP_COOP_TASKRUN;
+            if (EnableSingleIssuer)
+                flags |= IoUringConstants.IORING_SETUP_SINGLE_ISSUER | IoUringConstants.IORING_SETUP_R_DISABLED;
+            // DEFER_TASKRUN requires SINGLE_ISSUER; the kernel will EINVAL otherwise (and Ring will retry).
+            if (EnableDeferTaskRun && EnableSingleIssuer)
+                flags |= IoUringConstants.IORING_SETUP_DEFER_TASKRUN;
+            return flags;
+        }
+    }
+
+    internal const int AutoBufferRingMin = 1024;
+    internal const int AutoBufferRingMax = 4096;
+
+    /// <summary>
+    /// The provided buffer ring size actually used: <see cref="BufferRingSize"/>, or when that is 0 a power of
+    /// two derived from the connections this ring is expected to serve (<see cref="BufferRingConnectionShare"/>
+    /// for a worker of a multi-ring listener, else <see cref="MaxConnections"/>). Also drives the receive-retry
+    /// budget and ENOBUFS backoff, so allocation and retry control always agree.
+    /// </summary>
+    internal int EffectiveBufferRingSize
+    {
+        get
+        {
+            if (BufferRingSize != 0)
+                return BufferRingSize;
+
+            long wanted = Math.Clamp(
+                (long)(BufferRingConnectionShare ?? MaxConnections),
+                AutoBufferRingMin,
+                AutoBufferRingMax);
+            int size = AutoBufferRingMin;
+            while (size < wanted)
+                size <<= 1;
+
+            while (size > 1 && (long)size * ReceiveBufferSize > int.MaxValue)
+                size >>= 1;
+            return size;
+        }
+    }
+
     internal void Validate()
     {
         if (RingSize < 2 || RingSize > MaxRingEntries || !IsPowerOfTwo(RingSize))
@@ -120,6 +254,12 @@ public sealed class IoUringTransportOptions
             throw new ArgumentOutOfRangeException(nameof(MaxConnections), "MaxConnections must be positive.");
         if (ListenBacklog < 1)
             throw new ArgumentOutOfRangeException(nameof(ListenBacklog), "ListenBacklog must be positive.");
+        if (MaxReadBufferSize < 0)
+            throw new ArgumentOutOfRangeException(nameof(MaxReadBufferSize),
+                "SocketTransportOptions.MaxReadBufferSize cannot be negative (null or 0 means unlimited).");
+        if (MaxWriteBufferSize < 0)
+            throw new ArgumentOutOfRangeException(nameof(MaxWriteBufferSize),
+                "SocketTransportOptions.MaxWriteBufferSize cannot be negative (null or 0 means unlimited).");
         if (AcceptQueueCapacity < 1)
             throw new ArgumentOutOfRangeException(nameof(AcceptQueueCapacity), "AcceptQueueCapacity must be positive.");
         if (ReceiveBufferSize < 1)
@@ -130,10 +270,11 @@ public sealed class IoUringTransportOptions
         if (LogPoolStatsInterval < 0)
             throw new ArgumentOutOfRangeException(nameof(LogPoolStatsInterval),
                 "LogPoolStatsInterval cannot be negative.");
-        if (BufferRingSize < 1 || BufferRingSize > MaxRingEntries || !IsPowerOfTwo(BufferRingSize))
+        if (BufferRingSize < 0 ||
+            (BufferRingSize != 0 && (BufferRingSize > MaxRingEntries || !IsPowerOfTwo(BufferRingSize))))
             throw new ArgumentOutOfRangeException(nameof(BufferRingSize),
-                $"BufferRingSize must be a power of two between 1 and {MaxRingEntries}.");
-        if ((long)BufferRingSize * ReceiveBufferSize > int.MaxValue)
+                $"BufferRingSize must be 0 (auto) or a power of two between 1 and {MaxRingEntries}.");
+        if ((long)EffectiveBufferRingSize * ReceiveBufferSize > int.MaxValue)
             throw new ArgumentOutOfRangeException(nameof(BufferRingSize),
                 "BufferRingSize multiplied by ReceiveBufferSize must fit in a managed array.");
         if ((long)AcceptQueueCapacity * ThreadCount > int.MaxValue)

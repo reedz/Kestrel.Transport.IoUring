@@ -39,16 +39,29 @@ internal sealed unsafe class SubmissionQueue
 
     public uint RingEntries => *_ringEntries;
 
+    public bool HasAvailableSqe
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            uint head = Volatile.Read(ref *_head);
+            return _sqeTail - head < *_ringEntries;
+        }
+    }
+
+    /// <summary>SQEs handed out but not yet published to the kernel by <see cref="Flush"/>.</summary>
+    public bool HasStaged => _sqeTail != _sqeHead;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetSqe(out IoUringSqe* sqe)
     {
-        uint head = Volatile.Read(ref *_head);
-        uint mask = *_ringMask;
-        if (_sqeTail - head >= *_ringEntries)
+        if (!HasAvailableSqe)
         {
             sqe = null;
             return false;
         }
+
+        uint mask = *_ringMask;
         uint index = _sqeTail & mask;
         sqe = _sqes + index;
         // io_uring requires unused SQE fields to be zero; zeroing the full struct is the safest approach.
@@ -76,6 +89,24 @@ internal sealed unsafe class SubmissionQueue
         return submitted;
     }
 
+    /// <summary>Kernel-visible SQEs pending submission; excludes local staged-only entries.</summary>
+    public uint PendingSubmit
+    {
+        get
+        {
+            // Read head before tail, then clamp: a stale head paired with a later tail
+            // from another Flush can transiently overstate pending beyond ring capacity.
+            uint head = Volatile.Read(ref *_head);
+            uint tail = Volatile.Read(ref *_tail);
+            uint pending = tail - head;
+            uint entries = *_ringEntries;
+            return pending <= entries ? pending : entries;
+        }
+    }
+
     public bool NeedsWakeup =>
         (Volatile.Read(ref *_flags) & IoUringConstants.IORING_SQ_NEED_WAKEUP) != 0;
+
+    public bool HasOverflowBacklog =>
+        (Volatile.Read(ref *_flags) & IoUringConstants.IORING_SQ_CQ_OVERFLOW) != 0;
 }

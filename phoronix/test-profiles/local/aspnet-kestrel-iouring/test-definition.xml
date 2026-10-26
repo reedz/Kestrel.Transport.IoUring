@@ -1,0 +1,146 @@
+<?xml version="1.0"?>
+<!--Phoronix Test Suite v10.8.4-->
+<PhoronixTestSuite>
+  <TestInformation>
+    <Title>ASP.NET Core Kestrel (transport comparison)</Title>
+    <AppVersion>2.4.0</AppVersion>
+    <Description>HTTP/1.1 throughput of ASP.NET Core's Kestrel server with either its default epoll socket transport or the Kestrel.Transport.IoUring transport (Linux io_uring), measured with wrk. Workloads: the nginx/apache profiles' 118 KB static test.html, a 13-byte plaintext response and a per-request serialized JSON response. The profile starts the server with the chosen transport and .NET runtime, verifies from /proc and over HTTP that this process serves the port with the requested transport and runtime (a silent fall back to sockets fails the run), checks the workload's response, warms it up, and fails any measured run that has socket errors or HTTP error responses.</Description>
+    <ResultScale>Requests Per Second</ResultScale>
+    <Proportion>HIB</Proportion>
+    <TimesToRun>3</TimesToRun>
+  </TestInformation>
+  <TestProfile>
+    <Version>1.0.0</Version>
+    <SupportedPlatforms>Linux</SupportedPlatforms>
+    <SoftwareType>Utility</SoftwareType>
+    <TestType>System</TestType>
+    <License>Free</License>
+    <Status>Private</Status>
+    <SupportedArchitectures>x86_64</SupportedArchitectures>
+    <ExternalDependencies>build-utilities, openssl-development</ExternalDependencies>
+    <EnvironmentSize>2600</EnvironmentSize>
+    <ProjectURL>https://github.com/reedz/Kestrel.Transport.IoUring</ProjectURL>
+    <RepositoryURL>https://github.com/reedz/Kestrel.Transport.IoUring</RepositoryURL>
+    <Maintainer>reedz</Maintainer>
+  </TestProfile>
+  <TestSettings>
+    <Option>
+      <DisplayName>Duration</DisplayName>
+      <Identifier>duration</Identifier>
+      <ArgumentPrefix>-d </ArgumentPrefix>
+      <Menu>
+        <Entry>
+          <Name>90 seconds</Name>
+          <Value>90</Value>
+        </Entry>
+        <Entry>
+          <Name>30 seconds</Name>
+          <Value>30</Value>
+        </Entry>
+        <Entry>
+          <Name>10 seconds (smoke test)</Name>
+          <Value>10</Value>
+        </Entry>
+      </Menu>
+    </Option>
+    <Option>
+      <DisplayName>Transport</DisplayName>
+      <Identifier>transport</Identifier>
+      <ArgumentPrefix>--transport </ArgumentPrefix>
+      <Menu>
+        <Entry>
+          <Name>io_uring</Name>
+          <Value>iouring</Value>
+        </Entry>
+        <Entry>
+          <Name>Sockets (epoll)</Name>
+          <Value>sockets</Value>
+        </Entry>
+      </Menu>
+    </Option>
+    <Option>
+      <DisplayName>Workload</DisplayName>
+      <Identifier>workload</Identifier>
+      <ArgumentPrefix>--workload </ArgumentPrefix>
+      <Menu>
+        <Entry>
+          <Name>Static File (118 KB)</Name>
+          <Value>test.html</Value>
+        </Entry>
+        <Entry>
+          <Name>Plaintext</Name>
+          <Value>plaintext</Value>
+        </Entry>
+        <Entry>
+          <Name>JSON</Name>
+          <Value>json</Value>
+        </Entry>
+      </Menu>
+    </Option>
+    <Option>
+      <DisplayName>Connections</DisplayName>
+      <Identifier>connections</Identifier>
+      <ArgumentPrefix>-c </ArgumentPrefix>
+      <Menu>
+        <Entry>
+          <Name>1</Name>
+          <Value>1</Value>
+        </Entry>
+        <Entry>
+          <Name>20</Name>
+          <Value>20</Value>
+        </Entry>
+        <Entry>
+          <Name>100</Name>
+          <Value>100</Value>
+        </Entry>
+        <Entry>
+          <Name>200</Name>
+          <Value>200</Value>
+        </Entry>
+        <Entry>
+          <Name>500</Name>
+          <Value>500</Value>
+        </Entry>
+        <Entry>
+          <Name>1000</Name>
+          <Value>1000</Value>
+        </Entry>
+        <Entry>
+          <Name>4000</Name>
+          <Value>4000</Value>
+        </Entry>
+      </Menu>
+    </Option>
+    <Option>
+      <DisplayName>.NET Runtime</DisplayName>
+      <Identifier>runtime</Identifier>
+      <ArgumentPrefix>--runtime </ArgumentPrefix>
+      <Menu>
+        <Entry>
+          <Name>.NET 10</Name>
+          <Value>net10</Value>
+        </Entry>
+        <Entry>
+          <Name>.NET 11 RC2</Name>
+          <Value>net11</Value>
+        </Entry>
+      </Menu>
+    </Option>
+    <Option>
+      <DisplayName>io_uring Rings (event-loop threads)</DisplayName>
+      <Identifier>rings</Identifier>
+      <ArgumentPrefix>--rings </ArgumentPrefix>
+      <Menu>
+        <Entry>
+          <Name>1</Name>
+          <Value>1</Value>
+        </Entry>
+        <Entry>
+          <Name>One per CPU core</Name>
+          <Value>auto</Value>
+        </Entry>
+      </Menu>
+    </Option>
+  </TestSettings>
+</PhoronixTestSuite>

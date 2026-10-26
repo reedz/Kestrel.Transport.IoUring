@@ -12,17 +12,22 @@ A Linux `io_uring` transport for ASP.NET Core Kestrel. It is registered as an
 - Multishot accept with automatic single-shot fallback.
 - Multishot receive backed by provided buffer rings, including cancellation under pipe backpressure.
 - Small-response sends through per-connection pinned scratch buffers.
+- Connection pipes on recycled pinned 4 KiB blocks: Kestrel's memory pool on .NET 10 (as the socket transport uses),
+  the same design on .NET 8/9.
 - Optional registered file descriptors (`EnableRegisteredFiles`).
 - Generation-tagged connection slots that reject stale completions.
-- One IO-loop thread per ring and optional multi-ring `SO_REUSEPORT` listeners.
+- One IO-loop thread per ring and optional multi-ring listeners (per-ring `SO_REUSEPORT` sockets by default, or one
+  shared, exclusively bound socket).
 - Socket fallback for unsupported hosts, setup failures, and non-IP endpoints.
 - Targets .NET 8, .NET 9, and .NET 10.
 
 ## Requirements
 
-- Linux 5.1+ for core `io_uring` operations.
-- Linux 5.19+/6.0+ for provided-buffer and multishot features; unsupported
-  features fall back automatically.
+- Linux 6.0+ for the default receive path (multishot receive with provided buffer rings).
+- Linux 5.10-5.19 works through automatic single-shot receive, which is slower and not covered by CI.
+  Older kernels, and environments whose io_uring does not implement the opcodes the transport needs (checked with
+  `IORING_REGISTER_PROBE`, for example gVisor's experimental support), use SocketTransport. Only Linux 6.17 has
+  been tested.
 - .NET 8 or later.
 
 Containers or hosts that block `io_uring_setup` through seccomp,
@@ -42,7 +47,6 @@ var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseIoUring(options =>
 {
     options.RingSize = 1024;
-    options.BufferRingSize = 1024;
     options.MaxConnections = 16_384;
 });
 
@@ -59,18 +63,56 @@ use `services.AddIoUringTransport(...)`.
 | Option | Default | Description |
 |---|---:|---|
 | `RingSize` | 1024 | SQ/CQ depth; power of two, maximum 32768. |
-| `BufferRingSize` | 1024 | Provided receive buffers per ring; power of two. |
+| `BufferRingSize` | 0 (auto) | Provided receive buffers per ring; power of two, or 0 to size from the connections the ring is expected to serve (`MaxConnections`, or its even share per ring with `ThreadCount` > 1; 1024-4096). Keep it at least the number of concurrent connections per ring: with fewer buffers, receives hit `ENOBUFS` and are re-armed as buffers are recycled, which costs throughput and can time out under thousands of simultaneously active connections. |
 | `ReceiveBufferSize` | 2048 | Bytes per receive buffer. |
-| `MaxConnections` | 16384 | Aggregate simultaneous connection limit. |
-| `AcceptQueueCapacity` | 1024 | Accepted connections waiting for Kestrel. |
-| `ThreadCount` | 1 | Rings/listener threads using `SO_REUSEPORT`. |
-| `EnableMultishotAccept` | `true` | Multishot accept with kernel fallback. |
+| `MaxConnections` | 16384 | Simultaneous connection limit for the listener, shared by all of its rings (one admission count, so an uneven spread of connections cannot make one ring refuse connections while another has room). |
+| `AcceptQueueCapacity` | 1024 | Accepted connections waiting for Kestrel. When it is full the transport pauses accepting (clients wait in the listen backlog) instead of aborting connections. |
+| `ThreadCount` | 1 | Rings/listener threads. With more than 1, each ring binds its own `SO_REUSEPORT` socket by default (see `EnableReusePort`); an explicit port is first checked with an exclusive bind, so a second instance fails with Kestrel's "address already in use" like the default single-ring listener. |
+| `EnableReusePort` | `true` | With `ThreadCount` > 1: per-ring `SO_REUSEPORT` sockets, the kernel spreading connections by hash (multishot accept per ring). Any process running as the same user can join an `SO_REUSEPORT` group later and receive connections. `false` makes the rings accept from one exclusively bound socket that nothing else can join, with one single-shot accept per ring, which absorbs bursts of new connections much more slowly (see `docs/KNOWN-ISSUES.md`). |
+| `EnableMultishotAccept` | `true` | Multishot accept with kernel fallback. Not used by the rings of a multi-ring listener with `EnableReusePort=false`. |
 | `EnableBufferRing` | `true` | Provided-buffer multishot receive. |
 | `EnableRegisteredFiles` | `false` | Fixed-file table; adds synchronous updates on connection churn. |
 | `UnsafeInlineScheduling` | `true` | Runs Kestrel processing on the IO thread; disable for blocking middleware. |
+| `RequireIoUring` | `false` | Throw instead of silently falling back to SocketTransport when io_uring is unavailable or ring setup fails (also `IOURING_REQUIRE=1`). |
+| `ListenBacklog` | 512 | `listen(2)` backlog. When not set, `SocketTransportOptions.Backlog` applies. |
 
 `EnableCoopTaskRun`, `EnableSingleIssuer`, `EnableDeferTaskRun`, and
-`EnableSqPoll` are advanced kernel options and default to `false`.
+`EnableSqPoll` are advanced kernel options and default to `false`. With `EnableSingleIssuer` the ring is created
+disabled and enabled by its IO loop thread, which becomes the ring's only issuer; whether the kernel accepted the flag
+is visible in `Bindings[..].SetupFlags`.
+
+### SocketTransportOptions
+
+The `SocketTransportOptions` settings that mean the same thing here are honoured: `NoDelay` (default `true`),
+`Backlog` (unless `ListenBacklog` is set explicitly), and `MaxReadBufferSize` / `MaxWriteBufferSize` (the input and
+output pipe limits; `null` means unlimited). Configure them with
+`services.Configure<SocketTransportOptions>(...)`. Socket-specific settings such as `IOQueueCount`,
+`WaitForDataBeforeAllocatingBuffer` and `UnsafePreferInlineScheduling` do not apply; see `UnsafeInlineScheduling`.
+
+### Shutdown
+
+`UnbindAsync` only stops accepting. `DisposeAsync` aborts what the application has not closed, then the ring's
+owner thread cancels every outstanding request and consumes completions until each request has ended, and only
+then is memory released (closing the ring alone does not stop the kernel from using it). If that cannot be shown
+within 5 seconds, the listener and its memory are kept for the rest of the process instead (logged as an error)
+rather than risk the kernel writing into released memory; its port stops listening either way. Every wait during
+disposal is bounded, also with several rings, so a stuck ring cannot hang host shutdown.
+
+### Verifying which transport is active
+
+`IoUringTransportFactory.IsUsingIoUring` only reports whether the host *supports* io_uring. To see what actually
+served each listener (for example before trusting a benchmark), resolve the factory and read `Bindings`:
+
+```csharp
+var factory = app.Services.GetServices<IConnectionListenerFactory>()
+    .OfType<IoUringTransportFactory>().Single();
+foreach (var b in factory.Bindings)
+    Console.WriteLine($"{b.EndPoint}: {b.Mode}, rings={b.RingCount}, fallback={b.FallbackReason}");
+```
+
+Set `RequireIoUring = true` in benchmarks and tests so a host that blocks io_uring fails loudly. Endpoint types that
+io_uring never serves (for example Unix domain sockets) still use SocketTransport and are reported as
+`SocketFallback`.
 
 Diagnostics can be enabled with `LogPoolStatsInterval` or the
 `IOURING_LOG_POOL_STATS_INTERVAL` environment variable. `IOURING_SPIN_COUNT`
@@ -97,11 +139,13 @@ Each SQE carries a 64-bit routing value:
 
 ```text
 bits 63..24: connection slot (40 bits)
-bits 23..8 : slot generation (16 bits)
+bits 23..8 : low 16 bits of the slot generation
 bits 7..0  : operation type (8 bits)
 ```
 
-Accept and eventfd operations use reserved sentinel values.
+Accept and eventfd operations use reserved sentinel values. The listener's own control queues compare the full
+64-bit generation; 16 bits suffice in completions because a slot is reused only after every request of its previous
+occupant has completed.
 
 ## Performance
 
@@ -115,7 +159,14 @@ On the repository's 2-CPU Linux witness host, the current matrix produced:
 - **Zero request errors**.
 
 See [BENCHMARKS.md](BENCHMARKS.md) for prerequisites, raw methodology, per-cell
-results, and the exact command.
+results, and the exact command. A local Phoronix Test Suite profile that compares
+the transports on ASP.NET Core workloads (static file, plaintext, JSON; .NET 10 and
+.NET 11 RC2) lives in [`phoronix/`](phoronix/README.md); it is not published anywhere.
+
+## More documentation
+
+- [docs/DOTNET11.md](docs/DOTNET11.md): evidence that stock .NET 11 has no io_uring socket transport.
+- [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md): review findings that are not fixed.
 
 ## License
 

@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/Kestrel.Transport.IoUring.Benchmarks/Kestrel.Transport.IoUring.Benchmarks.csproj" />
+    <Project Path="benchmarks/Kestrel.Transport.IoUring.PtsServer/Kestrel.Transport.IoUring.PtsServer.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/SampleApp/SampleApp.csproj" />
