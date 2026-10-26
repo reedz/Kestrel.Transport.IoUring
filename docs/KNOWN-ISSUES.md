@@ -79,3 +79,6 @@ probe showed it; otherwise it was established by independent source reviews.
 
 * All measurements were taken on a 2 vCPU shared VM with high run-to-run variance; see `BENCHMARKS.md` for what was
   and was not concluded. Multi-ring scaling, TLS and HTTP/2 were not measured.
+* **4,000 connections on one ring is borderline here.** A few requests occasionally wait over 2 s (about 1 run in
+  10 of 30 s, before and after this work; no listen-queue overflows), which fails the Phoronix profile's
+  zero-error rule for that configuration. The cause was not found; it is not the pipe memory pool.

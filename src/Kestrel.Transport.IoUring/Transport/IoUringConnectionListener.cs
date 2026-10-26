@@ -546,6 +546,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             _acceptInFlight = true;
             _acceptRetryRequired = false;
             _acceptCancelRequested = false;
+            _acceptControlUnsubmitted = true;
             return true;
         }
 
@@ -1100,6 +1101,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         sqe->UserData = IoUringConstants.ACCEPT_CANCEL_USER_DATA;
         _acceptCancelInFlight = true;
         _acceptCancelRequested = true;
+        _acceptControlUnsubmitted = true;
     }
 
     /// <summary>
@@ -1381,6 +1383,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     }
 
 
+    // An accept or accept-cancel request was staged and may not have reached the kernel yet (IO loop only). Cleared at
+    // a fairness point once nothing is left unsubmitted.
+    private bool _acceptControlUnsubmitted;
+
     private void ProcessCompletions()
     {
         const int CompletionFairnessBatch = 32;
@@ -1422,10 +1428,18 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 // accepts waiting for room in the accept channel.
                 ProcessLifecycleCommands();
                 FlushPendingAccepts();
-                // Whatever this batch staged (sends, re-arms, accept pause/resume, cancels), and anything an earlier
-                // short or EAGAIN enter left in the SQ ring, reaches the kernel now rather than after the CQ drains.
-                if (_ring.HasUnsubmittedSqes)
+                // Send continuations this batch produced reach the kernel now rather than after the CQ drains, and so
+                // do accept and accept-cancel requests (pause/resume, unbind), including one an earlier short or
+                // EAGAIN enter left unconsumed. Submitting on every staged request instead (re-arms, closes) made
+                // requests at 4,000 connections on one ring wait over 2 s several times as often (measured).
+                if (_pipeScheduler?.LastDrainedCount > 0 ||
+                    _acceptStopBegun && !_acceptStopped.Task.IsCompleted ||
+                    _acceptControlUnsubmitted)
+                {
                     _ring.Submit();
+                    if (!_ring.HasUnsubmittedSqes)
+                        _acceptControlUnsubmitted = false;
+                }
             }
         }
 
