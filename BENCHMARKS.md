@@ -98,7 +98,10 @@ Server CPU per 1,000 requests (ms, lower is better): static file 361/382 (base/n
 * **Sustained gates through the PTS pipeline** (90 s, 1 run, one ring, no errors of any kind): plaintext at 4,000
   connections 37.9k (io_uring) vs 27.5k (sockets) RPS; static file at 1,000 connections 5.1k vs 5.8k. 4,000
   connections is the case that produced an ENOBUFS storm (27k-89k completions per second with thousands of client
-  timeouts) before the receive-retry rewrite; it now completes with zero errors.
+  timeouts) before the receive-retry rewrite; it now completes with zero errors. Rerun on the final tree (with the
+  pipe memory pool below, `--no-egress`): plaintext at 4,000 connections 41.9k vs 39.9k, static file at 1,000
+  connections 7.4k vs 6.8k, again without errors. Single runs on a shared VM: treat these as gates, not
+  comparisons.
 * Not measured here: more than one ring, TLS/HTTP2, any machine with more than 2 CPUs. Run
   `phoronix/run-local.sh` on a larger machine for those (see `phoronix/README.md`).
 
@@ -122,13 +125,13 @@ CPU is server CPU per 1,000 requests. No run had an error.
 * **Cause:** the connection pipes used the pipe default, which rents from `ArrayPool<byte>.Shared`. Output blocks
   are rented on ThreadPool threads and returned on the IO thread, and a 118 KB response needs about 29 of them;
   the measurements fit the shared pool's bounded per-thread and per-core caches overflowing, so new arrays kept
-  being allocated (and each send had to pin its arrays with a `GCHandle`). Per request at 100 connections: 6.8 page
-  faults versus 1.6 for sockets, and 3.4-3.8x the `madvise`/`mprotect` calls; a page-fault profile put 91% of the
-  faults under the static-file copy loop.
+  being allocated (and each send had to pin its arrays with a `GCHandle`). Per request at 100 connections (two
+  measurements): 6.1-6.8 page faults versus 1.4-1.6 for sockets, and 3.4-4.1x the `madvise`/`mprotect` calls; a
+  page-fault profile put 91% of the faults under the static-file copy loop.
 * **Fix:** each listener now gives its connections a pool of recycled, pinned 4 KiB blocks, as the socket transport
   does: Kestrel's pool on .NET 10 (`IMemoryPoolFactory<byte>`), a copy of its design on .NET 8/9. Page faults drop
-  to 1.0 per request. `pool` beats `before` in every round on the static file (+6% to +33%) and beats sockets in
-  14 of 15 static rounds.
+  to about 1.0 per request. `pool` beats `before` in every round on the static file (+6% to +33%) and beats sockets
+  in 14 of 15 static rounds.
 * **Plaintext and JSON are unchanged:** a separate paired run, 10 rounds of `pool` against `before` only, gives
   +1.1% ± 2.3% (plaintext) and -0.1% ± 2.0% (JSON).
 * **Memory:** after a 10 s static-file run at 500 connections, resident memory 5 s later is 228 MB (`pool`), 172 MB
