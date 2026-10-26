@@ -55,8 +55,8 @@ probe showed it; otherwise it was established by independent source reviews.
   whole suite on the single-shot path (`TEST_IOURING_SINGLESHOT=1`) but on a current kernel; no 5.x kernel has been
   tested. The version floor is a heuristic (it exists because the non-blocking eventfd `READ` used for wake-ups does
   not wait correctly on 5.6-5.7); the probe is the real check.
-* **Retry passes run after each completion batch** (NEW-10b): sustained completion traffic delays receive, cancel and
-  send retries by up to one bounded batch.
+* **Retry passes run after each completion pass** (NEW-10b): receive, cancel and send retries wait for the current
+  pass, which handles at most one completion queue's worth of completions before the loop submits and retries.
 * **Pipe memory is kept for reuse.** Connection pipes use recycled pinned 4 KiB blocks, one pool per ring. On
   .NET 10 that is Kestrel's pool, which releases idle blocks over time; on .NET 8/9 the transport's own pool keeps
   its peak for the listener's lifetime, as Kestrel's socket transport does on those versions. A quarantined

@@ -551,6 +551,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         }
 
         _acceptRetryRequired = true;
+        _acceptControlUnsubmitted = true; // SQ full: let the fairness point drain it
         return false;
     }
 
@@ -1090,7 +1091,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
         if (!_ring.TryGetSqe(out IoUringSqe* sqe))
         {
-            // SQ full: the next loop iteration flushes it and retries.
+            // SQ full: the next loop iteration flushes it and retries. Until then make the fairness point submit, so
+            // the queue drains even while completions keep arriving.
+            _acceptControlUnsubmitted = true;
             WakeIoLoop();
             return;
         }
@@ -1387,10 +1390,18 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     // a fairness point once nothing is left unsubmitted.
     private bool _acceptControlUnsubmitted;
 
+    // Test seams: a smaller per-pass completion limit, and the number of completions each pass handled.
+    internal int? CompletionPassLimitForTests { get; set; }
+
+    internal Action<int>? CompletionPassEndedForTests { get; set; }
+
     private void ProcessCompletions()
     {
         const int CompletionFairnessBatch = 32;
         int processedCompletions = 0;
+        // One pass handles at most a full completion queue, then returns to the loop, which submits everything staged
+        // and runs the retry passes: completions that keep arriving must not hold back other connections' requests.
+        int passLimit = CompletionPassLimitForTests ?? (int)_ring.CqEntries;
 
         // The listener treats any overflow delta as fail-safe evidence that CQ
         // ownership may now be ambiguous, so it stops instead of guessing.
@@ -1404,7 +1415,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             return;
         }
 
-        while (_ring.TryPeekCompletion(out var cqe))
+        while (processedCompletions < passLimit && _ring.TryPeekCompletion(out var cqe))
         {
             try
             {
@@ -1428,9 +1439,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                 // accepts waiting for room in the accept channel.
                 ProcessLifecycleCommands();
                 FlushPendingAccepts();
-                // Send continuations this batch produced reach the kernel now rather than after the CQ drains, and so
-                // do accept and accept-cancel requests (pause/resume, unbind), including one an earlier short or
-                // EAGAIN enter left unconsumed. Submitting on every staged request instead (re-arms, closes) made
+                // Send continuations this batch produced reach the kernel now rather than after the pass, and so do
+                // accept and accept-cancel requests (pause/resume, unbind), including one an earlier short or EAGAIN
+                // enter left unconsumed. Everything else staged (re-arms, cancels) goes with the loop's submit after
+                // the pass, which the pass limit guarantees. Submitting on every staged request here instead made
                 // requests at 4,000 connections on one ring wait over 2 s several times as often (measured).
                 if (_pipeScheduler?.LastDrainedCount > 0 ||
                     _acceptStopBegun && !_acceptStopped.Task.IsCompleted ||
@@ -1449,6 +1461,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         FlushPendingAccepts();
         // Retry passes and closes remove entries; keep the process-wide gauge live.
         ReportRecvRetryDepth();
+        CompletionPassEndedForTests?.Invoke(processedCompletions);
     }
 
     private int _reportedRecvRetryDepth; // IO loop only
