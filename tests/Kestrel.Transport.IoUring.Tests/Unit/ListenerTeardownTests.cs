@@ -71,6 +71,8 @@ public class ListenerTeardownTests
         ring.OutstandingOperations.Should().Be(0);
         ring.IsDisposed.Should().BeTrue();
         IoUringQuarantine.Contains(listener).Should().BeFalse();
+        ((PinnedBlockMemoryPool)listener.MemoryPoolForTests).IsDisposed.Should().BeTrue(
+            "every connection is closed, so the pipe pool goes with the listener");
     }
 
     [Fact]
@@ -131,6 +133,8 @@ public class ListenerTeardownTests
 
             IoUringQuarantine.Contains(listener).Should().BeTrue();
             ring.IsDisposed.Should().BeFalse();
+            ((PinnedBlockMemoryPool)listener.MemoryPoolForTests).IsDisposed.Should().BeFalse(
+                "the wedged loop's connections may still use pipe memory");
             await connection!.DisposeAsync().AsTask().WaitAsync(Limit); // finalization was still signalled
         }
         finally
@@ -158,6 +162,8 @@ public class ListenerTeardownTests
         ring.IsDisposed.Should().BeFalse("the kernel may still write into memory the ring's requests reference");
         IoUringQuarantine.Contains(listener).Should().BeTrue();
         IoUringQuarantine.QuarantinedRings.Should().BeGreaterThan(quarantinedBefore);
+        ((PinnedBlockMemoryPool)listener.MemoryPoolForTests).IsDisposed.Should().BeFalse(
+            "a quarantined listener releases nothing");
     }
 
     [Fact]

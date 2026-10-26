@@ -44,6 +44,8 @@ v2.4.0
 - Receive retry after provided-buffer exhaustion is progress-driven, bounded and fair (fixes an ENOBUFS storm and
   client timeouts at thousands of connections); BufferRingSize 0 (default) sizes itself from MaxConnections.
 - Send path gathers many pipe segments into one SENDMSG (about 2x static-file throughput).
+- Connection pipes use recycled pinned 4 KiB blocks (Kestrel's memory pool on .NET 10, the same design on .NET 8/9)
+  instead of the shared ArrayPool: a 118 KB static file is 9-25% faster and now ahead of the socket transport.
 - A dead IO loop no longer hangs UnbindAsync/DisposeAsync and stops accepting; a fatal ring error after unbind still
   aborts connections; multi-ring UnbindAsync no longer throws for a cancelled token; the merged accept channel
   completes when every ring has stopped.

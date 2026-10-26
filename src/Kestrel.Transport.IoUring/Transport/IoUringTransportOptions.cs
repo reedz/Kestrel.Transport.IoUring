@@ -37,6 +37,13 @@ public sealed class IoUringTransportOptions
     internal IoUringTransportOptions Clone() => (IoUringTransportOptions)MemberwiseClone();
 
     /// <summary>
+    /// Creates the memory pool a listener (each multi-ring worker) gives its connections' pipes. Set by the factory to
+    /// Kestrel's pool on .NET 10 (<c>IMemoryPoolFactory&lt;byte&gt;</c>, the pool the socket transport uses); when
+    /// unset, listeners use <see cref="PinnedBlockMemoryPool"/>.
+    /// </summary>
+    internal Func<System.Buffers.MemoryPool<byte>>? MemoryPoolFactory { get; set; }
+
+    /// <summary>
     /// Multi-ring workers: the ring's even share of <see cref="MaxConnections"/>. Every worker can hold the full
     /// limit (admission is shared), but buffers are sized for the share, as the kernel spreads connections evenly.
     /// </summary>

@@ -33,6 +33,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private readonly ConnectionAdmission _admission;
     private readonly int _receiveBufferSize;
     private readonly IoUringTransportOptions _options;
+    // Pipe memory for this listener's connections; disposed only once every connection is closed, never in quarantine.
+    private readonly System.Buffers.MemoryPool<byte> _memoryPool;
 
     // Connections that need RECV resubmitted (after async pipe flush completes).
     private readonly ConcurrentQueue<(long ConnectionId, long Generation)> _recvResubmitQueue = new();
@@ -253,6 +255,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             this,
             Timeout.Infinite,
             Timeout.Infinite);
+        // Last: a pool from Kestrel's factory is tracked by it until disposed, so nothing may throw after this.
+        _memoryPool = options.MemoryPoolFactory?.Invoke() ?? new PinnedBlockMemoryPool();
     }
 
     public void Bind(int listenBacklog, bool reusePort = false)
@@ -409,6 +413,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     internal void SetSlotGenerationForTests(int slot, long generation) => _slotGenerations[slot] = generation;
 
     internal void WakeIoLoopForTests() => WakeIoLoop();
+
+    internal System.Buffers.MemoryPool<byte> MemoryPoolForTests => _memoryPool;
 
     /// <summary>
     /// Returns the admission reservations and gauge share of connections still counted. Only the ring's owner (or
@@ -1589,7 +1595,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
                         _logger,
                         useBufferRing: _bufferRing != null,
                         maxReadBufferSize: _options.MaxReadBufferSize,
-                        maxWriteBufferSize: _options.MaxWriteBufferSize);
+                        maxWriteBufferSize: _options.MaxWriteBufferSize,
+                        memoryPool: _memoryPool);
                 }
                 catch
                 {
@@ -2103,6 +2110,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
         // Normally released on the IO loop during unbind; this covers a loop that never ran or failed.
         ReleaseListenSocket(unregisterFixedFile: false);
+
+        // Every connection is closed (CloseSocketFd and ForceCleanupAfterRingClosed above), as the socket transport
+        // has it when it disposes its pool.
+        RunDisposeCleanupStep("memory pool dispose", _memoryPool.Dispose);
 
         RunDisposeCleanupStep("listener cancellation source dispose", _cts.Dispose);
 

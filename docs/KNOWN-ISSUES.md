@@ -40,6 +40,10 @@ probe showed it; otherwise it was established by independent source reviews.
   not wait correctly on 5.6-5.7); the probe is the real check.
 * **Retry passes run after each completion batch** (NEW-10b): sustained completion traffic delays receive, cancel and
   send retries by up to one bounded batch.
+* **Pipe memory is kept for reuse.** Connection pipes use recycled pinned 4 KiB blocks, one pool per ring. On
+  .NET 10 that is Kestrel's pool, which releases idle blocks over time; on .NET 8/9 the transport's own pool keeps
+  its peak for the listener's lifetime, as Kestrel's socket transport does on those versions. A quarantined
+  listener keeps its pool.
 
 ## Formal models
 

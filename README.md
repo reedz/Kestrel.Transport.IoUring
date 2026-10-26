@@ -12,6 +12,8 @@ A Linux `io_uring` transport for ASP.NET Core Kestrel. It is registered as an
 - Multishot accept with automatic single-shot fallback.
 - Multishot receive backed by provided buffer rings, including cancellation under pipe backpressure.
 - Small-response sends through per-connection pinned scratch buffers.
+- Connection pipes on recycled pinned 4 KiB blocks: Kestrel's memory pool on .NET 10 (as the socket transport uses),
+  the same design on .NET 8/9.
 - Optional registered file descriptors (`EnableRegisteredFiles`).
 - Generation-tagged connection slots that reject stale completions.
 - One IO-loop thread per ring and optional multi-ring `SO_REUSEPORT` listeners.

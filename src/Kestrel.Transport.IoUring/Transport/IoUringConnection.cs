@@ -191,7 +191,8 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         ILogger logger,
         bool useBufferRing = false,
         long? maxReadBufferSize = 1024 * 1024,
-        long? maxWriteBufferSize = 64 * 1024)
+        long? maxWriteBufferSize = 64 * 1024,
+        System.Buffers.MemoryPool<byte>? memoryPool = null)
     {
         _connectionId = connectionId;
         _socketFd = socketFd;
@@ -232,13 +233,17 @@ internal sealed class IoUringConnection : ConnectionContext, IValueTaskSource<in
         // and null (or 0) means no limit.
         InputPauseThreshold = maxReadBufferSize ?? 0;
         OutputPauseThreshold = maxWriteBufferSize ?? 0;
+        // The listener's pool (null: the pipe default). Like the socket transport, both pipes use pinned 4 KiB blocks
+        // that are recycled, so sends need no per-segment GCHandle.
         var inputOptions = new PipeOptions(
+            pool: memoryPool,
             writerScheduler: transportScheduler,
             readerScheduler: appReadScheduler,
             pauseWriterThreshold: InputPauseThreshold,
             resumeWriterThreshold: InputPauseThreshold / 2,
             useSynchronizationContext: false);
         var outputOptions = new PipeOptions(
+            pool: memoryPool,
             writerScheduler: PipeScheduler.ThreadPool,
             readerScheduler: transportScheduler,
             pauseWriterThreshold: OutputPauseThreshold,

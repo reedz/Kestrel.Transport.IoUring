@@ -91,8 +91,8 @@ Server CPU per 1,000 requests (ms, lower is better): static file 361/382 (base/n
   `SEND` plus completion per segment roughly **doubles** the static-file throughput and halves its CPU per request
   (the `no-gather` variant matches `base`). Single small segments (plaintext, JSON) still use the scratch `SEND`.
 * **Static file versus sockets:** io_uring was behind by about 0-15% at 20-100 connections and ahead by about 20% at
-  500 on this machine. The follow-up below, with an A/A control, puts the 20-100 connection difference within
-  run-to-run noise.
+  500 on this machine. The cause was the pipes' memory pool; with it fixed io_uring is ahead at every connection
+  count (see the follow-up below).
 * **JSON** is consistently 27-30% faster than sockets at 20/100 connections with 18-25% less CPU per request.
   The earlier small-connection plaintext figures are too noisy on this VM to quote.
 * **Sustained gates through the PTS pipeline** (90 s, 1 run, one ring, no errors of any kind): plaintext at 4,000
@@ -102,29 +102,40 @@ Server CPU per 1,000 requests (ms, lower is better): static file 361/382 (base/n
 * Not measured here: more than one ring, TLS/HTTP2, any machine with more than 2 CPUs. Run
   `phoronix/run-local.sh` on a larger machine for those (see `phoronix/README.md`).
 
-### Follow-up: static file versus sockets after the shutdown/admission work
+### Follow-up: the static-file gap and its fix (pipe memory pool)
 
-Same VM, current branch, one ring, a fresh server process per run on CPU 0 and `wrk -t1` on CPU 1, 3 s warm-up
-then 6 s measured, 5 rounds with every (variant, workload) pair in shuffled order per round. `io_uring (A/A)` is a second, identical io_uring
-variant whose spread shows the run-to-run noise. CPU is server CPU per 1,000 requests.
+Same VM, one ring, a fresh server process per run on CPU 0 and `wrk -t1` on CPU 1, 3 s warm-up then 6 s measured,
+5 rounds with every (variant, workload) pair in shuffled order per round. `pool` is the current tree, `before` the
+same tree without the change below, `sockets` Kestrel's socket transport. ± is a 95% Student-t interval (n = 5);
+CPU is server CPU per 1,000 requests. No run had an error.
 
-| Workload | Conns | io_uring RPS | io_uring (A/A) RPS | Sockets RPS | CPU io_uring / sockets (ms) |
+| Workload | Conns | pool RPS | before RPS | Sockets RPS | CPU pool / before / sockets (ms) |
 |---|---:|---:|---:|---:|---:|
-| Static 118 KB | 20 | 5,479 ± 35 | 5,227 ± 466 | 5,296 ± 832 | 175 / 178 |
-| Static 118 KB | 100 | 4,706 ± 679 | 4,943 ± 200 | 5,292 ± 194 | 208 / 185 |
-| Static 118 KB | 500 | 4,464 ± 94 | 4,416 ± 157 | 4,316 ± 88 | 222 / 228 |
-| Plaintext | 100 | 38,642 ± 390 | 37,733 ± 3,022 | 32,092 ± 3,680 | 25.0 / 28.7 |
-| JSON | 100 | 42,451 ± 1,176 | 38,530 ± 4,420 | 32,588 ± 3,198 | 22.3 / 28.5 |
+| Static 118 KB | 20 | 6,075 ± 219 | 5,567 ± 161 | 5,777 ± 263 | 157 / 172 / 165 |
+| Static 118 KB | 100 | 6,333 ± 355 | 5,070 ± 204 | 5,625 ± 410 | 155 / 194 / 175 |
+| Static 118 KB | 500 | 5,020 ± 164 | 4,471 ± 151 | 4,345 ± 186 | 197 / 221 / 227 |
+| Plaintext | 100 | 38,617 ± 2,477 | 39,555 ± 1,259 | 33,647 ± 1,180 | 24.8 / 24.3 / 28.4 |
+| JSON | 100 | 45,098 ± 1,436 | 42,551 ± 1,830 | 34,089 ± 3,004 | 21.1 / 22.3 / 28.1 |
 
-(± is the 95% confidence interval of the mean.) Per request, measured with `perf stat` on the server process for the
-static file at 20 / 100 connections: io_uring 0.71 / 0.29 context switches, 0.45 / 0.10 `io_uring_enter` and
-0.23 / 0.09 eventfd `write`s; sockets 1.69 / 1.35 context switches, 2.0 `sendmsg` and 0.82 / 0.71 `epoll_wait`.
-
-* Plaintext (+20%) and JSON (+30%) stay clearly ahead with less CPU per request.
-* The static file is at parity within the noise: io_uring is ahead at 20 and 500 connections and behind at 100,
-  where the A/A pair itself differs by 5%. The per-flush cross-thread hand-off suspected earlier does not show up
-  in the counts (well under one wake-up per request, and fewer context switches than sockets). No change was made;
-  a candidate would need to show a win larger than this noise.
+* **The gap was real.** `before` trailed sockets in every round at 20 and 100 connections (by 2-17%). An earlier
+  write-up called it noise: it used normal rather than Student-t intervals and did not compare the rounds.
+* **Cause:** the connection pipes used the pipe default, which rents from `ArrayPool<byte>.Shared`. Output blocks
+  are rented on ThreadPool threads and returned on the IO thread, and a 118 KB response needs about 29 of them;
+  the measurements fit the shared pool's bounded per-thread and per-core caches overflowing, so new arrays kept
+  being allocated (and each send had to pin its arrays with a `GCHandle`). Per request at 100 connections: 6.8 page
+  faults versus 1.6 for sockets, and 3.4-3.8x the `madvise`/`mprotect` calls; a page-fault profile put 91% of the
+  faults under the static-file copy loop.
+* **Fix:** each listener now gives its connections a pool of recycled, pinned 4 KiB blocks, as the socket transport
+  does: Kestrel's pool on .NET 10 (`IMemoryPoolFactory<byte>`), a copy of its design on .NET 8/9. Page faults drop
+  to 1.0 per request. `pool` beats `before` in every round on the static file (+6% to +33%) and beats sockets in
+  14 of 15 static rounds.
+* **Plaintext and JSON are unchanged:** a separate paired run, 10 rounds of `pool` against `before` only, gives
+  +1.1% ± 2.3% (plaintext) and -0.1% ± 2.0% (JSON).
+* **Memory:** after a 10 s static-file run at 500 connections, resident memory 5 s later is 228 MB (`pool`), 172 MB
+  (`before`) and 232 MB (sockets); the peaks are 282, 207 and 239 MB. Like the socket transport's, the pool keeps
+  blocks for reuse; on .NET 10 Kestrel's pool releases idle blocks over time, on .NET 8/9 it keeps its peak (as
+  Kestrel's own pool does on those versions).
+* Measured on .NET 10 only. Scripts and raw data are not part of the repository.
 
 ## Prerequisites
 

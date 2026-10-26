@@ -25,6 +25,9 @@ public sealed class IoUringTransportFactory :
     private readonly Lazy<SocketTransportFactory> _socketFallback;
     private readonly object _bindingsLock = new();
     private IoUringBindingInfo[] _bindings = [];
+#if NET10_0_OR_GREATER
+    private readonly Func<System.Buffers.MemoryPool<byte>>? _memoryPoolFactory;
+#endif
 
     /// <summary>Initializes a new instance of the <see cref="IoUringTransportFactory"/> class.</summary>
     public IoUringTransportFactory(
@@ -34,6 +37,23 @@ public sealed class IoUringTransportFactory :
         : this(options, socketOptions, loggerFactory, isSupported: null, createRing: null)
     {
     }
+
+#if NET10_0_OR_GREATER
+    /// <summary>
+    /// Initializes a new instance of the <see cref="IoUringTransportFactory"/> class whose connections use pipe
+    /// memory from <paramref name="memoryPoolFactory"/> (Kestrel registers one; the socket transport uses it too).
+    /// </summary>
+    public IoUringTransportFactory(
+        IOptions<IoUringTransportOptions> options,
+        IOptions<SocketTransportOptions> socketOptions,
+        ILoggerFactory loggerFactory,
+        IMemoryPoolFactory<byte> memoryPoolFactory)
+        : this(options, socketOptions, loggerFactory, isSupported: null, createRing: null)
+    {
+        ArgumentNullException.ThrowIfNull(memoryPoolFactory);
+        _memoryPoolFactory = () => memoryPoolFactory.Create(new MemoryPoolOptions { Owner = "iouring" });
+    }
+#endif
 
     // Test seam: lets unit tests simulate an unsupported host or a failing ring setup.
     internal IoUringTransportFactory(
@@ -73,6 +93,9 @@ public sealed class IoUringTransportFactory :
         CancellationToken cancellationToken = default)
     {
         var listenerOptions = _options.ResolveWith(_socketOptions);
+#if NET10_0_OR_GREATER
+        listenerOptions.MemoryPoolFactory = _memoryPoolFactory;
+#endif
         // Validate what listeners will actually use, including values taken from SocketTransportOptions.
         listenerOptions.Validate();
 
