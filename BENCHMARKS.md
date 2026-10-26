@@ -98,17 +98,19 @@ Server CPU per 1,000 requests (ms, lower is better): static file 361/382 (base/n
 * **Sustained gates through the PTS pipeline** (90 s, 1 run, one ring, no errors of any kind): plaintext at 4,000
   connections 37.9k (io_uring) vs 27.5k (sockets) RPS; static file at 1,000 connections 5.1k vs 5.8k. 4,000
   connections is the case that produced an ENOBUFS storm (27k-89k completions per second with thousands of client
-  timeouts) before the receive-retry rewrite; it now completes with zero errors. Rerun on the final tree (with the
-  pipe memory pool below, `--no-egress`): plaintext at 4,000 connections 41.9k vs 39.9k, static file at 1,000
-  connections 7.4k vs 6.8k, again without errors. Single runs on a shared VM: treat these as gates, not
-  comparisons. Repeated 30 s runs outside PTS later showed that this gate is borderline on this machine: even the
-  build from before this work had a few requests waiting over 2 s (wrk timeouts) in about 1 run in 10 (2 of 15),
+  timeouts) before the receive-retry rewrite; it now completes with zero errors. Rerun on the final tree
+  (`e392f35`, `--no-egress`, all without errors): plaintext at 4,000 connections 39.6k (io_uring) vs 41.1k (sockets)
+  on one ring and 48.3k vs 39.6k with `rings=auto` (two rings here); static file at 1,000 connections 7.7k vs 7.7k.
+  Single runs on a shared VM: treat these as gates, not comparisons. Repeated 30 s runs outside PTS later showed
+  that this gate is borderline on this machine: even the build from before this work had a few requests waiting
+  over 2 s (wrk timeouts) in about 1 run in 10 (2 of 15),
   and a change to when the IO loop submits mid-batch raised that to about 4 in 10 until it was narrowed again (in
   randomized comparisons with one binary: the final condition 1 of 8, the original 1 of 15, the broad one 5 of 15;
   with each completion pass also limited to one queue's worth, 0 of 8 against 1 of 8 without the limit, at the same
   throughput). The pipe memory pool made no difference there (4 of 8 runs either way).
-* Not measured here: more than one ring, TLS/HTTP2, any machine with more than 2 CPUs. Run
-  `phoronix/run-local.sh` on a larger machine for those (see `phoronix/README.md`).
+* Not measured here: multi-ring scaling (two rings on two CPUs only show the multi-ring path works), TLS/HTTP2, any
+  machine with more than 2 CPUs. Run `phoronix/run-local.sh` on a larger machine for those (see
+  `phoronix/README.md`).
 
 ### Follow-up: the static-file gap and its fix (pipe memory pool)
 
