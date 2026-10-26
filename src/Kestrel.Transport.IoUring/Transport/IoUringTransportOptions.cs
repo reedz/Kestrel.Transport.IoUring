@@ -139,6 +139,16 @@ public sealed class IoUringTransportOptions
     public bool EnableMultishotAccept { get; set; } = true;
 
     /// <summary>
+    /// How the rings of a multi-ring listener (<see cref="ThreadCount"/> &gt; 1) share the port. When
+    /// <see langword="false"/> (the default), one listening socket is bound exclusively, like Kestrel's socket
+    /// transport, and every ring accepts from it; nothing else can bind the port. When <see langword="true"/>, each
+    /// ring binds its own <c>SO_REUSEPORT</c> socket and the kernel spreads new connections across them by hash;
+    /// Linux then also lets any process running as the same user join the group later and receive a share of the
+    /// connections. Ignored with a single ring, whose socket is always exclusive.
+    /// </summary>
+    public bool EnableReusePort { get; set; }
+
+    /// <summary>
     /// When <see langword="true"/>, binding an IP endpoint throws <see cref="NotSupportedException"/> instead of
     /// silently falling back to the socket transport when io_uring is unavailable (unsupported kernel, seccomp,
     /// <c>kernel.io_uring_disabled</c>, <c>IOURING_FORCE_FALLBACK=1</c>) or ring setup fails. Intended for

@@ -19,14 +19,20 @@ probe showed it; otherwise it was established by independent source reviews.
 
 ## Multi-ring (`ThreadCount > 1`)
 
-* **Port sharing with same-user processes.** The rings share the port through an `SO_REUSEPORT` group, and Linux lets
-  any socket of a process with the same effective user ID join that group at any time, not only at startup (see
+* **`EnableReusePort` admits same-user processes.** With the opt-in per-ring `SO_REUSEPORT` sockets, Linux lets any
+  socket of a process with the same effective user ID join the group at any time, not only at startup (see
   `socket(7)`): such a process then receives a share of the new connections (for example the plaintext HTTP
   requests). nginx's `reuseport` and other `SO_REUSEPORT` servers have the same property. The exclusive bind that
   checks an explicit port first only turns an instance that is already running into Kestrel's "address already in
-  use" error; it cannot keep a later joiner out. Do not use `ThreadCount > 1` where untrusted code runs as the
-  service's user; the default single ring binds an ordinary socket that nothing else can share. Ephemeral ports (0)
-  are not checked.
+  use" error; it cannot keep a later joiner out. The default (one shared, exclusively bound socket) has no such
+  window. Ephemeral ports (0) are not checked.
+* **Shared-socket accept is single-shot.** Accept requests wait on the shared socket exclusively and the kernel gives
+  each new connection to the first one queued; a multishot accept stays first and took every connection (256 of 256
+  over two rings, measured), so the default multi-ring listener uses one single-shot accept per ring, which requeues
+  behind its siblings (117-139 of 256 per ring in the same test; `SO_REUSEPORT` hashing: 112-144). That is one accept
+  submission per connection instead of one per ring; a connection-churn test on this VM showed no loss
+  (6-14k accepts per second either way). The spread depends on which ring has an accept queued when a client
+  arrives, so a ring that is busy longer takes fewer new connections; it is not a hash.
 * **Per-ring tables hold the whole limit.** Connection admission is shared, so each ring's slot table (about 20 bytes
   per slot) and, with `EnableRegisteredFiles`, its fixed-file table are sized for the full `MaxConnections`. A
   fixed-file table larger than `RLIMIT_NOFILE` cannot be registered and the ring silently runs without registered
@@ -59,6 +65,9 @@ probe showed it; otherwise it was established by independent source reviews.
   models.
 * `Teardown.tla` models the drain with one request per kind and a bounded completion queue; `Listener.tla` models
   the bounded snapshot drain that now runs only for a quarantined ring.
+* Listening sockets are outside the models (`MultiListener.tla` header item 2). The shared-socket rule (a ring never
+  shuts down or closes the socket it was lent; the multi-ring listener stops it after every ring has unbound, and on
+  disposal) is covered by `MultiRingPortSharingTests` only.
 
 ## Benchmarking
 

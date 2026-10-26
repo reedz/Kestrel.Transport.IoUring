@@ -13,8 +13,9 @@ namespace Kestrel.Transport.IoUring.Transport;
 /// <summary>
 /// Multiplexed connection listener that distributes connections across multiple
 /// <see cref="IoUringConnectionListener"/> workers, each with its own io_uring ring
-/// and IO loop thread. Uses SO_REUSEPORT so the kernel distributes incoming
-/// connections across listen sockets.
+/// and IO loop thread. By default every worker accepts from one exclusively bound socket this listener owns; with
+/// <see cref="IoUringTransportOptions.EnableReusePort"/> each worker binds its own SO_REUSEPORT socket and the kernel
+/// distributes connections across them.
 /// </summary>
 internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListenerInfo
 {
@@ -37,7 +38,12 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
     private int _activeForwarders;
 
     private readonly record struct WorkerBuild(WorkerSet WorkerSet, int MergedCapacity);
-    private readonly record struct WorkerSet(EndPoint EndPoint, IMultiListenerWorker[] Workers);
+    private readonly record struct WorkerSet(EndPoint EndPoint, IMultiListenerWorker[] Workers, Socket? SharedListenSocket);
+
+    // The listening socket every ring accepts from (null with EnableReusePort, where each ring owns its own).
+    private readonly Socket? _sharedListenSocket;
+
+    internal IReadOnlyList<IMultiListenerWorker> WorkersForTests => _workers;
 
     public EndPoint EndPoint { get; private set; }
 
@@ -67,6 +73,7 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
     private IoUringMultiListener(WorkerSet workerSet, int mergedCapacity)
         : this(workerSet.EndPoint, mergedCapacity, workerSet.Workers)
     {
+        _sharedListenSocket = workerSet.SharedListenSocket;
     }
 
     internal IoUringMultiListener(
@@ -137,7 +144,28 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         int createdWorkers = 0;
         uint setupFlags = GetSetupFlags(options);
         var admission = new ConnectionAdmission(options.MaxConnections);
-        EnsurePortIsFree(endPoint);
+        bool reusePort = options.EnableReusePort;
+        Socket? sharedSocket = null;
+        if (reusePort)
+        {
+            EnsurePortIsFree(endPoint);
+        }
+        else
+        {
+            // One exclusively bound socket for every ring: a second instance fails to bind, and no other process can
+            // join the port later (as it could an SO_REUSEPORT group).
+            sharedSocket = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            try
+            {
+                IoUringConnectionListener.BindAndListen(sharedSocket, endPoint, options.ListenBacklog);
+                publishedEndPoint = sharedSocket.LocalEndPoint ?? endPoint;
+            }
+            catch
+            {
+                sharedSocket.Dispose();
+                throw;
+            }
+        }
 
         try
         {
@@ -146,6 +174,11 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
                 var workerOptions = CreateWorkerOptions(
                     options,
                     GetWorkerConnectionShare(options.MaxConnections, threadCount, i));
+                // Accept requests wait on a shared socket exclusively: the kernel hands each new connection to the
+                // first one queued. A multishot accept stays first and would take every connection (measured:
+                // 256/0 over two rings); a single-shot accept requeues behind its siblings once it completes.
+                if (!reusePort)
+                    workerOptions.EnableMultishotAccept = false;
                 Ring? ring = null;
                 IoUringConnectionListener? worker = null;
                 try
@@ -157,8 +190,9 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
                         ring,
                         workerOptions,
                         logger,
-                        admission);
-                    worker.Bind(options.ListenBacklog, reusePort: true);
+                        admission,
+                        sharedSocket);
+                    worker.Bind(options.ListenBacklog, reusePort);
                     if (i == 0)
                         publishedEndPoint = worker.EndPoint;
                     ring = null; // listener owns the ring
@@ -178,19 +212,20 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         {
             for (int i = createdWorkers - 1; i >= 0; i--)
                 workers[i].DisposeAsync().AsTask().GetAwaiter().GetResult();
+            sharedSocket?.Dispose();
             throw;
         }
 
-        return new WorkerSet(publishedEndPoint, workers);
+        return new WorkerSet(publishedEndPoint, workers, sharedSocket);
     }
 
     /// <summary>
-    /// The workers share the port through SO_REUSEPORT, which would also let another process (a second instance of
-    /// the application) bind it without error and silently split the traffic. Binding an exclusive socket first
-    /// fails with Kestrel's <see cref="AddressInUseException"/>, as SocketTransport does. It does not reserve the
-    /// port: Linux lets any process with the same effective user ID join the SO_REUSEPORT group later (see
-    /// docs/KNOWN-ISSUES.md). An ephemeral port (0) needs no probe because nobody else can be bound to the one the
-    /// kernel picks.
+    /// With <see cref="IoUringTransportOptions.EnableReusePort"/> the rings share the port through SO_REUSEPORT,
+    /// which would also let another process (a second instance of the application) bind it without error and
+    /// silently split the traffic. Binding an exclusive socket first fails with Kestrel's
+    /// <see cref="AddressInUseException"/>, as SocketTransport does. It does not reserve the port: Linux lets any
+    /// process with the same effective user ID join the SO_REUSEPORT group later (see docs/KNOWN-ISSUES.md). An
+    /// ephemeral port (0) needs no probe because nobody else can be bound to the one the kernel picks.
     /// </summary>
     internal static void EnsurePortIsFree(EndPoint endPoint)
     {
@@ -372,7 +407,17 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
             CaptureFailure(ref failures, allTask.Exception ?? ex);
         }
 
+        // Every ring has stopped accepting from the shared socket: stop listening, so new clients are refused.
+        StopSharedListening();
+
         ThrowCapturedFailures(failures);
+    }
+
+    private void StopSharedListening()
+    {
+        try { _sharedListenSocket?.Shutdown(SocketShutdown.Both); }
+        catch (SocketException) { }
+        catch (ObjectDisposedException) { }
     }
 
     private async Task DisposeCoreAsync()
@@ -410,6 +455,11 @@ internal sealed class IoUringMultiListener : IConnectionListener, IIoUringListen
         {
             CaptureFailure(ref failures, allTask.Exception ?? ex);
         }
+
+        // Also when an unbind never finished (a wedged ring): the port must stop listening. A ring that still holds
+        // the socket (quarantined) keeps its own reference; closing ours is safe.
+        StopSharedListening();
+        _sharedListenSocket?.Dispose();
 
         CompleteMergedWriter();
 

@@ -20,6 +20,9 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     private readonly Ring _ring;
     private readonly ILogger _logger;
     private readonly Socket _listenSocket;
+    // False when a multi-ring listener lent every ring the same listening socket: then only the lender may shut it
+    // down or close it (doing so here would stop the sibling rings too).
+    private readonly bool _ownsListenSocket;
     private readonly Channel<ConnectionContext> _acceptChannel;
     private readonly IoUringConnection?[] _connectionSlots;
     private readonly long[] _slotGenerations;
@@ -182,7 +185,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
         Ring ring,
         IoUringTransportOptions options,
         ILogger logger,
-        ConnectionAdmission? admission = null)
+        ConnectionAdmission? admission = null,
+        Socket? sharedListenSocket = null)
     {
         EndPoint = endPoint;
         _ring = ring;
@@ -204,7 +208,10 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             // Pre-populate free-list with all slot indices. Push highest first so Pop()
             // returns 0 first — stable small connIds under light load for easier debugging.
             for (int i = options.MaxConnections - 1; i >= 0; i--) _freeSlots.Push(i);
-            _listenSocket = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            // A multi-ring listener can hand every ring the same bound, listening socket; it stays the owner's.
+            _ownsListenSocket = sharedListenSocket is null;
+            _listenSocket = sharedListenSocket ??
+                new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             _acceptChannel = Channel.CreateBounded<ConnectionContext>(
                 new BoundedChannelOptions(options.AcceptQueueCapacity)
                 {
@@ -273,41 +280,64 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             _eventFdReadHandle.Dispose();
             if (_eventFd >= 0)
                 Libc.close(_eventFd);
-            _listenSocket?.Dispose();
+            if (_ownsListenSocket)
+                _listenSocket?.Dispose();
             _memoryPool.Dispose();
             throw;
         }
     }
 
-    public void Bind(int listenBacklog, bool reusePort = false)
+    private void BindOwnedListenSocket(int listenBacklog, bool reusePort)
     {
-        // Only the worker sockets of a multi-ring listener share a port. Setting ReuseAddress unconditionally (as
-        // before) is both unnecessary (plain sockets rebind fine through TIME_WAIT) and harmful: .NET also enables
-        // SO_REUSEPORT for it on Linux, so a second instance of the application would bind the same port without
-        // error and silently split the traffic, unlike stock Kestrel, which fails with "address already in use".
+        // Only the per-ring sockets of a multi-ring listener with EnableReusePort share a port. Setting ReuseAddress
+        // unconditionally (as before) is both unnecessary (plain sockets rebind fine through TIME_WAIT) and harmful:
+        // .NET also enables SO_REUSEPORT for it on Linux, so a second instance of the application would bind the same
+        // port without error and silently split the traffic, unlike stock Kestrel, which fails with "address already
+        // in use".
         if (reusePort)
         {
             _listenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             SetSocketOption(_listenSocket, IoUringConstants.SOL_SOCKET, IoUringConstants.SO_REUSEPORT);
         }
 
-        // Enable dual-stack for IPv6 sockets (accept both IPv4 and IPv6 connections),
-        // matching the default Kestrel socket transport behavior.
-        if (_listenSocket.AddressFamily == AddressFamily.InterNetworkV6)
-            _listenSocket.DualMode = true;
+        BindAndListen(_listenSocket, EndPoint, listenBacklog);
+        EndPoint = _listenSocket.LocalEndPoint ?? EndPoint;
+    }
+
+    /// <summary>
+    /// Binds and listens like Kestrel's socket transport: dual-stack for IPv6, and a port conflict raised as the
+    /// <see cref="AddressInUseException"/> Kestrel's address binder expects (it produces its standard "address
+    /// already in use" error and tolerates it for localhost dual binding).
+    /// </summary>
+    internal static void BindAndListen(Socket socket, EndPoint endPoint, int listenBacklog)
+    {
+        if (socket.AddressFamily == AddressFamily.InterNetworkV6)
+            socket.DualMode = true;
 
         try
         {
-            _listenSocket.Bind(EndPoint);
+            socket.Bind(endPoint);
         }
         catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressAlreadyInUse)
         {
-            // Kestrel's address binder expects this exception type (as thrown by SocketTransport) to produce its
-            // standard "address already in use" error and to tolerate it for localhost dual binding.
             throw new AddressInUseException(ex.Message, ex);
         }
-        EndPoint = _listenSocket.LocalEndPoint ?? EndPoint;
-        _listenSocket.Listen(listenBacklog);
+        socket.Listen(listenBacklog);
+    }
+
+    public void Bind(int listenBacklog, bool reusePort = false)
+    {
+        if (!_ownsListenSocket)
+        {
+            // A lent socket is already bound and listening; this ring only accepts from it.
+            if (reusePort)
+                throw new InvalidOperationException("A shared listening socket cannot also use SO_REUSEPORT.");
+            EndPoint = _listenSocket.LocalEndPoint ?? EndPoint;
+        }
+        else
+        {
+            BindOwnedListenSocket(listenBacklog, reusePort);
+        }
 
         // Safely acquire the socket fd with proper ref counting.
         bool refAdded = false;
@@ -435,6 +465,13 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     internal void WakeIoLoopForTests() => WakeIoLoop();
 
     internal System.Buffers.MemoryPool<byte> MemoryPoolForTests => _memoryPool;
+
+    // Test seams: the IO loop owns the count; tests read it once the ring is idle.
+    internal int ActiveConnectionCountForTests => Volatile.Read(ref _activeConnectionCount);
+
+    internal bool OwnsListenSocket => _ownsListenSocket;
+
+    internal bool UsesMultishotAcceptForTests => _useMultishotAccept;
 
     /// <summary>
     /// Returns the admission reservations and gauge share of connections still counted. Only the ring's owner (or
@@ -979,7 +1016,8 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
     /// </summary>
     private void StopAcceptingAfterLoopExit()
     {
-        if (Volatile.Read(ref _listenSocketReleased) != 0)
+        // A lent socket must keep serving the sibling rings; the drain cancels this ring's accept instead.
+        if (!_ownsListenSocket || Volatile.Read(ref _listenSocketReleased) != 0)
             return;
 
         try
@@ -1086,16 +1124,22 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
             if (_listenSocketFdRefAdded)
                 _listenSocket.SafeHandle.DangerousRelease();
         });
-        RunDisposeCleanupStep("listen socket dispose", _listenSocket.Dispose);
+        // A lent socket is shut down and closed by its owner once every ring has stopped accepting.
+        if (_ownsListenSocket)
+            RunDisposeCleanupStep("listen socket dispose", _listenSocket.Dispose);
     }
 
     /// <summary>
     /// shutdown(2) on a listening TCP socket stops it listening (the kernel unhashes it, so new clients are refused
     /// and pending accepts fail) whoever else still holds a reference to it. Best effort and thread-safe (the
-    /// socket's handle is reference-counted); a socket that never listened just reports ENOTCONN.
+    /// socket's handle is reference-counted); a socket that never listened just reports ENOTCONN. Not for a lent
+    /// socket: that would stop the sibling rings too.
     /// </summary>
     private void StopListening()
     {
+        if (!_ownsListenSocket)
+            return;
+
         try { _listenSocket.Shutdown(SocketShutdown.Both); }
         catch (SocketException) { }
         catch (ObjectDisposedException) { }
@@ -2189,7 +2233,7 @@ internal sealed class IoUringConnectionListener : IConnectionListener, IMultiLis
 
         // The loop cannot serve anyone: stop the kernel from accepting (a multishot accept keeps taking connections)
         // and refuse new clients. Shutdown goes through the socket's reference-counted handle, so it is safe beside
-        // the owner; the socket itself stays the owner's to release.
+        // the owner; the socket itself stays the owner's to release. (A lent socket is stopped by its lender.)
         StopListening();
 
         RunDisposeCleanupStep("send diagnostics timer dispose", () => _diagTimer?.Dispose());

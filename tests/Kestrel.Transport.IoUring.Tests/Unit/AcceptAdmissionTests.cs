@@ -112,19 +112,21 @@ public class AcceptAdmissionTests
         }
     }
 
-    [Fact]
-    public async Task MultiRingListener_RefusesAPortAlreadyBound()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MultiRingListener_RefusesAPortAlreadyBound(bool reusePort)
     {
         if (!Ring.IsSupported) return;
 
-        var holder = await CreateFactory(threadCount: 2).BindAsync(new IPEndPoint(IPAddress.Loopback, 0));
+        var holder = await CreateFactory(threadCount: 2, reusePort).BindAsync(new IPEndPoint(IPAddress.Loopback, 0));
         int port = ((IPEndPoint)holder.EndPoint).Port;
         try
         {
             Func<Task> secondMultiRing = async () =>
-                await CreateFactory(threadCount: 2).BindAsync(new IPEndPoint(IPAddress.Loopback, port));
+                await CreateFactory(threadCount: 2, reusePort).BindAsync(new IPEndPoint(IPAddress.Loopback, port));
             await secondMultiRing.Should().ThrowAsync<AddressInUseException>(
-                "SO_REUSEPORT must not let a second instance silently split the traffic");
+                "a second instance must not silently split the traffic");
 
             Func<Task> singleRing = async () =>
                 await CreateFactory(threadCount: 1).BindAsync(new IPEndPoint(IPAddress.Loopback, port));
@@ -136,7 +138,7 @@ public class AcceptAdmissionTests
         }
 
         // Free again once the holder is gone.
-        var rebound = await CreateFactory(threadCount: 2).BindAsync(new IPEndPoint(IPAddress.Loopback, port));
+        var rebound = await CreateFactory(threadCount: 2, reusePort).BindAsync(new IPEndPoint(IPAddress.Loopback, port));
         await rebound.DisposeAsync();
     }
 
@@ -153,13 +155,14 @@ public class AcceptAdmissionTests
         return listener;
     }
 
-    private static IoUringTransportFactory CreateFactory(int threadCount) =>
+    private static IoUringTransportFactory CreateFactory(int threadCount, bool reusePort = false) =>
         new(
             Options.Create(TestTransport.Apply(new IoUringTransportOptions
             {
                 RequireIoUring = true,
                 ThreadCount = threadCount,
                 MaxConnections = 16,
+                EnableReusePort = reusePort,
             })),
             Options.Create(new SocketTransportOptions()),
             NullLoggerFactory.Instance);

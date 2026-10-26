@@ -29,7 +29,8 @@ Guards that make a run fail instead of producing a misleading number:
 * **Endpoint ownership (sampled).** The port must be free before the server starts, the server binds `127.0.0.1`
   only, and before and after every measurement the profile asks `/__transport` and requires the answering process
   to be the one it started, with the requested runtime and transport. These are samples, not exclusivity: another
-  same-user listener that joins afterwards through `SO_REUSEPORT` (multi-ring io_uring, or any server that sets it)
+  same-user listener that joins afterwards through `SO_REUSEPORT` (multi-ring io_uring with `EnableReusePort`, or
+  any server that sets it)
   is not excluded. `run-local.sh --no-egress` runs in a private network namespace, where nothing else can bind
   the port, and is the way to get exclusivity.
 * **Workload sanity.** One request must return HTTP 200 with the expected size (118047 bytes for `test.html`, 13

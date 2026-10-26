@@ -16,7 +16,8 @@ A Linux `io_uring` transport for ASP.NET Core Kestrel. It is registered as an
   the same design on .NET 8/9.
 - Optional registered file descriptors (`EnableRegisteredFiles`).
 - Generation-tagged connection slots that reject stale completions.
-- One IO-loop thread per ring and optional multi-ring `SO_REUSEPORT` listeners.
+- One IO-loop thread per ring and optional multi-ring listeners (one shared, exclusively bound socket by default,
+  or per-ring `SO_REUSEPORT` sockets).
 - Socket fallback for unsupported hosts, setup failures, and non-IP endpoints.
 - Targets .NET 8, .NET 9, and .NET 10.
 
@@ -64,10 +65,11 @@ use `services.AddIoUringTransport(...)`.
 | `RingSize` | 1024 | SQ/CQ depth; power of two, maximum 32768. |
 | `BufferRingSize` | 0 (auto) | Provided receive buffers per ring; power of two, or 0 to size from the connections the ring is expected to serve (`MaxConnections`, or its even share per ring with `ThreadCount` > 1; 1024-4096). Keep it at least the number of concurrent connections per ring: with fewer buffers, receives hit `ENOBUFS` and are re-armed as buffers are recycled, which costs throughput and can time out under thousands of simultaneously active connections. |
 | `ReceiveBufferSize` | 2048 | Bytes per receive buffer. |
-| `MaxConnections` | 16384 | Simultaneous connection limit for the listener, shared by all of its rings (one admission count, so the kernel's `SO_REUSEPORT` hashing cannot make one ring refuse connections while another has room). |
+| `MaxConnections` | 16384 | Simultaneous connection limit for the listener, shared by all of its rings (one admission count, so an uneven spread of connections cannot make one ring refuse connections while another has room). |
 | `AcceptQueueCapacity` | 1024 | Accepted connections waiting for Kestrel. When it is full the transport pauses accepting (clients wait in the listen backlog) instead of aborting connections. |
-| `ThreadCount` | 1 | Rings/listener threads. More than 1 binds one `SO_REUSEPORT` socket per ring; an explicit port is first checked with an exclusive bind, so a second instance fails with Kestrel's "address already in use" like the default single-ring listener. Any process running as the same user can still join the `SO_REUSEPORT` group later and receive connections, so keep the default where untrusted code shares the service's user (see `docs/KNOWN-ISSUES.md`). |
-| `EnableMultishotAccept` | `true` | Multishot accept with kernel fallback. |
+| `ThreadCount` | 1 | Rings/listener threads. With more than 1, the rings accept from one exclusively bound socket (a second instance fails with Kestrel's "address already in use", and no other process can join the port); each ring keeps one single-shot accept queued on it, which spreads new connections over the rings. |
+| `EnableReusePort` | `false` | With `ThreadCount` > 1: give each ring its own `SO_REUSEPORT` socket instead, and let the kernel spread connections by hash (multishot accept per ring). An explicit port is first checked with an exclusive bind, but any process running as the same user can join the `SO_REUSEPORT` group later and receive connections, so use it only where no untrusted code shares the service's user (see `docs/KNOWN-ISSUES.md`). |
+| `EnableMultishotAccept` | `true` | Multishot accept with kernel fallback. Not used by the rings of a default multi-ring listener (see `ThreadCount`). |
 | `EnableBufferRing` | `true` | Provided-buffer multishot receive. |
 | `EnableRegisteredFiles` | `false` | Fixed-file table; adds synchronous updates on connection churn. |
 | `UnsafeInlineScheduling` | `true` | Runs Kestrel processing on the IO thread; disable for blocking middleware. |
